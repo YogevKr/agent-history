@@ -18,7 +18,7 @@ pub fn format_result(conv: &Conversation) -> String {
     )
 }
 
-fn format_relative_time(timestamp: DateTime<Local>) -> String {
+pub fn format_relative_time(timestamp: DateTime<Local>) -> String {
     let now = Local::now();
     let duration = now.signed_duration_since(timestamp);
     let secs = duration.num_seconds();
@@ -37,7 +37,7 @@ fn format_relative_time(timestamp: DateTime<Local>) -> String {
     format!("{}w", secs / 604800)
 }
 
-fn format_model_short(model: Option<&str>) -> String {
+pub fn format_model_short(model: Option<&str>) -> String {
     match model {
         None => "?".to_string(),
         Some(m) => {
@@ -63,7 +63,7 @@ fn format_model_short(model: Option<&str>) -> String {
     }
 }
 
-fn get_display_title(conv: &Conversation) -> String {
+pub fn get_display_title(conv: &Conversation) -> String {
     conv.custom_title
         .as_deref()
         .or(conv.summary.as_deref())
@@ -71,7 +71,7 @@ fn get_display_title(conv: &Conversation) -> String {
         .to_string()
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }

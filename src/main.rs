@@ -11,6 +11,7 @@ mod history;
 mod path;
 mod resume;
 mod search;
+mod interactive;
 mod viewer;
 
 use crate::cli::{parse_duration_secs, Cli, SourceFilter};
@@ -61,7 +62,13 @@ fn run() -> error::Result<()> {
     // Apply filters
     let filtered = apply_filters(conversations, &args);
 
-    // Search or list
+    // Interactive mode: no query and no --list → fzf-style picker
+    let is_interactive = args.query.is_none() && !args.list;
+    if is_interactive && atty::is(atty::Stream::Stdout) {
+        return interactive::run(filtered);
+    }
+
+    // Non-interactive: search or list to stdout
     if let Some(ref query) = args.query {
         let searchable = precompute_search_text(&filtered);
         let results = search(&filtered, &searchable, query, Local::now());
