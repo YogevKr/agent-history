@@ -2,6 +2,12 @@ use crate::history::{Conversation, SessionSource};
 use chrono::{DateTime, Local};
 use colored::Colorize;
 
+/// Short session ID (first 8 chars)
+pub fn short_id(id: &str) -> &str {
+    let end = id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len());
+    &id[..end]
+}
+
 pub fn format_result(conv: &Conversation) -> String {
     let source_tag = match conv.source {
         SessionSource::Claude => "[claude]".blue().to_string(),
@@ -12,9 +18,10 @@ pub fn format_result(conv: &Conversation) -> String {
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
     let preview = truncate(&title, 60);
+    let sid = short_id(&conv.session_id).dimmed();
     format!(
-        " {} {:>6}  {:<20}  ({})  \"{}\"",
-        source_tag, age, project, model, preview
+        " {} {:>6}  {:<20}  ({})  {}  \"{}\"",
+        source_tag, age, project, model, sid, preview
     )
 }
 

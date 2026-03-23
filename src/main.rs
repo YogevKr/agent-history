@@ -43,6 +43,12 @@ fn run() -> error::Result<()> {
     // Sort all by timestamp descending
     conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
+    // Deduplicate by session_id (same session can appear in multiple project dirs)
+    {
+        let mut seen = std::collections::HashSet::new();
+        conversations.retain(|c| seen.insert(c.session_id.clone()));
+    }
+
     // Handle --show
     if let Some(ref id) = args.show {
         if let Some(conv) = conversations.iter().find(|c| c.session_id == *id) {

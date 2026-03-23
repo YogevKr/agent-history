@@ -1,6 +1,6 @@
 //! fzf-like interactive session picker.
 
-use crate::display::{format_model_short, format_relative_time, get_display_title, truncate};
+use crate::display::{format_model_short, format_relative_time, get_display_title, short_id, truncate};
 use crate::history::{Conversation, SessionSource};
 use crate::search::{precompute_search_text, search};
 use crate::viewer;
@@ -260,9 +260,11 @@ fn draw_session_line(
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
 
+    let sid = short_id(&conv.session_id);
+
     // Calculate available space for preview
-    // " [claude]  2h ago  project-name          (model)  "title""
-    let fixed_len = 1 + 8 + 1 + 6 + 2 + 20 + 2 + model.len() + 2 + 3; // approx
+    // " [claude]  2h ago  project-name          (model)  sid       "title""
+    let fixed_len = 1 + 8 + 1 + 6 + 2 + 20 + 2 + model.len() + 4 + sid.len() + 2 + 3;
     let preview_max = max_width.saturating_sub(fixed_len);
     let preview = truncate(&title, preview_max.max(10));
 
@@ -307,13 +309,24 @@ fn draw_session_line(
         execute!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
+    // Short session ID
+    execute!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("  {} ", sid)),
+        ResetColor,
+    )?;
+    if is_selected {
+        execute!(stdout, SetAttribute(Attribute::Reverse))?;
+    }
+
     // Preview — replace newlines with spaces for single-line display
     let clean_preview: String = preview.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
     execute!(stdout, Print(format!("\"{}\"", clean_preview)))?;
 
     // Pad rest of line for reverse video
     if is_selected {
-        let line_so_far = 1 + 8 + 1 + 5 + 2 + 20 + 2 + model.len() + 4 + clean_preview.len() + 2;
+        let line_so_far = 1 + 8 + 1 + 5 + 2 + 20 + 2 + model.len() + 4 + sid.len() + 2 + clean_preview.len() + 2;
         let padding = max_width.saturating_sub(line_so_far);
         if padding > 0 {
             execute!(stdout, Print(" ".repeat(padding)))?;
