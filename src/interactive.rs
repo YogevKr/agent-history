@@ -61,9 +61,7 @@ fn main_loop(
     loop {
         match picker_loop(stdout, conversations, searchable, state) {
             PickerAction::ViewSession(idx) => {
-                // Build session lines and show pager
-                let lines = viewer::build_session_lines(&conversations[idx])?;
-                pager_loop(stdout, &lines)?;
+                pager_loop(stdout, &conversations[idx])?;
                 // Returns here → back to picker with same state
             }
             PickerAction::Quit => return Ok(()),
@@ -236,7 +234,9 @@ fn draw_session_line(
     let title = get_display_title(conv);
     let sid = short_id(&conv.session_id);
 
-    let fixed_len = 1 + 8 + 1 + 6 + 2 + 20 + 2 + model.len() + 4 + sid.len() + 2 + 3;
+    let model_display = format!("({:<12})", model);
+    // fixed columns: " " + 8 (source) + " " + 5 (age) + "  " + 20 (project) + "  " + 14 (model) + "  " + 8 (sid) + " " + 2 (quotes)
+    let fixed_len = 1 + 8 + 1 + 5 + 2 + 20 + 2 + model_display.len() + 2 + 8 + 1 + 2;
     let preview_max = max_width.saturating_sub(fixed_len);
     let preview = truncate(&title, preview_max.max(10));
 
@@ -244,7 +244,7 @@ fn draw_session_line(
         stdout,
         Print(" "),
         SetForegroundColor(source_color),
-        Print(format!("[{}]", source_tag)),
+        Print(format!("{:<8}", format!("[{}]", source_tag))),
         ResetColor,
     )?;
     if is_selected {
@@ -267,7 +267,7 @@ fn draw_session_line(
     execute!(
         stdout,
         SetForegroundColor(Color::DarkGrey),
-        Print(format!("  ({})  ", model)),
+        Print(format!("  {}", model_display)),
         ResetColor,
     )?;
     if is_selected {
@@ -288,7 +288,7 @@ fn draw_session_line(
     execute!(stdout, Print(format!("\"{}\"", clean_preview)))?;
 
     if is_selected {
-        let line_so_far = 1 + 8 + 1 + 5 + 2 + 20 + 2 + model.len() + 4 + sid.len() + 2 + clean_preview.len() + 2;
+        let line_so_far = 1 + 8 + 1 + 5 + 2 + 20 + 2 + model_display.len() + 2 + 8 + 1 + clean_preview.len() + 2;
         let padding = max_width.saturating_sub(line_so_far);
         if padding > 0 {
             execute!(stdout, Print(" ".repeat(padding)))?;
@@ -302,12 +302,15 @@ fn draw_session_line(
 
 fn pager_loop(
     stdout: &mut io::Stdout,
-    lines: &[StyledLine],
+    conv: &Conversation,
 ) -> crate::error::Result<()> {
-    let mut scroll: usize = 0;
+    let mut lines = viewer::build_session_lines(conv)?;
+    let (_, rows) = terminal::size().unwrap_or((80, 24));
+    let visible = (rows as usize).saturating_sub(1);
+    let mut scroll: usize = lines.len().saturating_sub(visible);
 
     loop {
-        if let Err(e) = draw_pager(stdout, lines, scroll) {
+        if let Err(e) = draw_pager(stdout, &lines, scroll, conv) {
             return Err(crate::error::AppError::Io(e));
         }
 
@@ -329,6 +332,19 @@ fn pager_loop(
             }
             Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) => {
                 return Ok(());
+            }
+            // Refresh
+            Event::Key(KeyEvent { code: KeyCode::Char('r'), modifiers: KeyModifiers::NONE, .. }) => {
+                let old_len = lines.len();
+                lines = viewer::build_session_lines(conv)?;
+                // If new content appeared and we were at the bottom, follow the tail
+                let was_at_bottom = scroll >= old_len.saturating_sub(visible);
+                let new_max = lines.len().saturating_sub(visible);
+                if was_at_bottom && lines.len() > old_len {
+                    scroll = new_max;
+                } else if scroll > new_max {
+                    scroll = new_max;
+                }
             }
             // Scroll
             Event::Key(KeyEvent { code: KeyCode::Up, .. })
@@ -365,6 +381,7 @@ fn draw_pager(
     stdout: &mut io::Stdout,
     lines: &[StyledLine],
     scroll: usize,
+    conv: &Conversation,
 ) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
     let cols = cols as usize;
@@ -383,16 +400,20 @@ fn draw_pager(
         render_styled_line(stdout, &lines[line_idx], cols)?;
     }
 
-    // Status bar at bottom
+    // Status bar: session details on left, keys + progress on right
     let progress = if lines.is_empty() {
         100
     } else {
         ((scroll + content_rows).min(lines.len()) * 100) / lines.len()
     };
-    let status = format!(
-        " ↑↓/jk scroll  PgUp/PgDn half-page  g/G top/bottom  q/Esc back  ─ {}% ",
-        progress
-    );
+    let project = conv.project_name.as_deref().unwrap_or("unknown");
+    let model = format_model_short(conv.model.as_deref());
+    let age = format_relative_time(conv.timestamp);
+    let sid = short_id(&conv.session_id);
+    let left = format!(" {} ({}) {} {}", project, model, age, sid);
+    let right = format!("jk/↑↓  PgUp/Dn  g/G  r:refresh  q:back  {}% ", progress);
+    let gap = cols.saturating_sub(left.len() + right.len());
+    let status = format!("{}{}{}", left, " ".repeat(gap), right);
     execute!(
         stdout,
         cursor::MoveTo(0, (rows - 1) as u16),
@@ -413,8 +434,8 @@ fn render_styled_line(stdout: &mut io::Stdout, spans: &[Span], _max_width: usize
         if span.dim {
             execute!(stdout, SetAttribute(Attribute::Dim))?;
         }
-        if let Some(fg) = span.fg {
-            execute!(stdout, SetForegroundColor(fg))?;
+        if let Some((r, g, b)) = span.fg {
+            execute!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
         }
         execute!(stdout, Print(&span.text))?;
         execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;

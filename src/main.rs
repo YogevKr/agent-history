@@ -12,6 +12,8 @@ mod path;
 mod resume;
 mod search;
 mod interactive;
+mod syntax;
+mod theme;
 mod viewer;
 
 use crate::cli::{parse_duration_secs, Cli, SourceFilter};
