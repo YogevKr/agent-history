@@ -1,15 +1,15 @@
-//! fzf-like interactive session picker.
+//! fzf-like interactive session picker with in-TUI session viewer.
 
 use crate::display::{format_model_short, format_relative_time, get_display_title, short_id, truncate};
 use crate::history::{Conversation, SessionSource};
-use crate::search::{precompute_search_text, search};
-use crate::viewer;
+use crate::search::{precompute_search_text, search, SearchableConversation};
+use crate::viewer::{self, Span, StyledLine};
 use chrono::Local;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    style::{self, Attribute, Color, Print, SetAttribute, SetForegroundColor, ResetColor},
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{self, ClearType},
 };
 use std::io::{self, Write};
@@ -23,129 +23,109 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
 
     let searchable = precompute_search_text(&conversations);
 
-    let mut query = String::new();
-    let mut selected: usize = 0;
-    let mut filtered_indices: Vec<usize> = (0..conversations.len()).collect();
+    let mut state = PickerState {
+        query: String::new(),
+        selected: 0,
+        filtered_indices: (0..conversations.len()).collect(),
+    };
 
-    terminal::enable_raw_mode().map_err(|e| crate::error::AppError::Io(e))?;
+    terminal::enable_raw_mode().map_err(crate::error::AppError::Io)?;
     let mut stdout = io::stdout();
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)
-        .map_err(|e| crate::error::AppError::Io(e))?;
+        .map_err(crate::error::AppError::Io)?;
 
-    let result = run_loop(
-        &mut stdout,
-        &conversations,
-        &searchable,
-        &mut query,
-        &mut selected,
-        &mut filtered_indices,
-    );
+    let result = main_loop(&mut stdout, &conversations, &searchable, &mut state);
 
     // Always restore terminal
     let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
 
-    match result {
-        LoopResult::Selected(idx) => {
-            viewer::review_session(&conversations[idx])?;
-        }
-        LoopResult::Cancelled => {}
-        LoopResult::Error(e) => return Err(e),
+    if let Err(e) = result {
+        return Err(e);
     }
-
     Ok(())
 }
 
-enum LoopResult {
-    Selected(usize),
-    Cancelled,
-    Error(crate::error::AppError),
+struct PickerState {
+    query: String,
+    selected: usize,
+    filtered_indices: Vec<usize>,
 }
 
-fn run_loop(
+fn main_loop(
     stdout: &mut io::Stdout,
     conversations: &[Conversation],
-    searchable: &[crate::search::SearchableConversation],
-    query: &mut String,
-    selected: &mut usize,
-    filtered_indices: &mut Vec<usize>,
-) -> LoopResult {
+    searchable: &[SearchableConversation],
+    state: &mut PickerState,
+) -> crate::error::Result<()> {
     loop {
-        // Draw
-        if let Err(e) = draw(stdout, conversations, filtered_indices, query, *selected) {
-            return LoopResult::Error(crate::error::AppError::Io(e));
+        match picker_loop(stdout, conversations, searchable, state) {
+            PickerAction::ViewSession(idx) => {
+                // Build session lines and show pager
+                let lines = viewer::build_session_lines(&conversations[idx])?;
+                pager_loop(stdout, &lines)?;
+                // Returns here → back to picker with same state
+            }
+            PickerAction::Quit => return Ok(()),
+        }
+    }
+}
+
+enum PickerAction {
+    ViewSession(usize),
+    Quit,
+}
+
+// ── Picker (list view) ────────────────────────────────
+
+fn picker_loop(
+    stdout: &mut io::Stdout,
+    conversations: &[Conversation],
+    searchable: &[SearchableConversation],
+    state: &mut PickerState,
+) -> PickerAction {
+    loop {
+        if let Err(_) = draw_picker(stdout, conversations, &state.filtered_indices, &state.query, state.selected) {
+            return PickerAction::Quit;
         }
 
-        // Wait for event
         let evt = match event::read() {
             Ok(e) => e,
-            Err(e) => return LoopResult::Error(crate::error::AppError::Io(e)),
+            Err(_) => return PickerAction::Quit,
         };
 
         match evt {
-            Event::Key(KeyEvent {
-                code: KeyCode::Esc, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
-                return LoopResult::Cancelled;
+            Event::Key(KeyEvent { code: KeyCode::Esc, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                return PickerAction::Quit;
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                ..
-            }) => {
-                if !filtered_indices.is_empty() {
-                    let idx = filtered_indices[*selected];
-                    return LoopResult::Selected(idx);
+            Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                if !state.filtered_indices.is_empty() {
+                    let idx = state.filtered_indices[state.selected];
+                    return PickerAction::ViewSession(idx);
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Up, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
-                if *selected > 0 {
-                    *selected -= 1;
+            Event::Key(KeyEvent { code: KeyCode::Up, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('k'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                if state.selected > 0 {
+                    state.selected -= 1;
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Down,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
-                if *selected + 1 < filtered_indices.len() {
-                    *selected += 1;
+            Event::Key(KeyEvent { code: KeyCode::Down, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('j'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                if state.selected + 1 < state.filtered_indices.len() {
+                    state.selected += 1;
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            }) => {
-                query.pop();
-                refilter(conversations, searchable, query, filtered_indices, selected);
+            Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+                state.query.pop();
+                refilter(conversations, searchable, state);
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            }) => {
+            Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers, .. }) => {
                 if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT {
-                    query.push(c);
-                    refilter(conversations, searchable, query, filtered_indices, selected);
+                    state.query.push(c);
+                    refilter(conversations, searchable, state);
                 }
-            }
-            Event::Resize(_, _) => {
-                // Redraw on resize
             }
             _ => {}
         }
@@ -154,22 +134,20 @@ fn run_loop(
 
 fn refilter(
     conversations: &[Conversation],
-    searchable: &[crate::search::SearchableConversation],
-    query: &str,
-    filtered_indices: &mut Vec<usize>,
-    selected: &mut usize,
+    searchable: &[SearchableConversation],
+    state: &mut PickerState,
 ) {
-    if query.is_empty() {
-        *filtered_indices = (0..conversations.len()).collect();
+    if state.query.is_empty() {
+        state.filtered_indices = (0..conversations.len()).collect();
     } else {
-        *filtered_indices = search(conversations, searchable, query, Local::now());
+        state.filtered_indices = search(conversations, searchable, &state.query, Local::now());
     }
-    if *selected >= filtered_indices.len() {
-        *selected = filtered_indices.len().saturating_sub(1);
+    if state.selected >= state.filtered_indices.len() {
+        state.selected = state.filtered_indices.len().saturating_sub(1);
     }
 }
 
-fn draw(
+fn draw_picker(
     stdout: &mut io::Stdout,
     conversations: &[Conversation],
     filtered_indices: &[usize],
@@ -205,7 +183,6 @@ fn draw(
     let list_start = 2usize;
     let visible = rows.saturating_sub(list_start);
 
-    // Scroll offset: keep selected visible
     let scroll = if selected >= visible {
         selected - visible + 1
     } else {
@@ -233,10 +210,8 @@ fn draw(
         }
     }
 
-    // Put cursor after query text
     execute!(stdout, cursor::MoveTo((2 + query.len()) as u16, 0))?;
     stdout.flush()?;
-
     Ok(())
 }
 
@@ -259,16 +234,12 @@ fn draw_session_line(
     let project = conv.project_name.as_deref().unwrap_or("unknown");
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
-
     let sid = short_id(&conv.session_id);
 
-    // Calculate available space for preview
-    // " [claude]  2h ago  project-name          (model)  sid       "title""
     let fixed_len = 1 + 8 + 1 + 6 + 2 + 20 + 2 + model.len() + 4 + sid.len() + 2 + 3;
     let preview_max = max_width.saturating_sub(fixed_len);
     let preview = truncate(&title, preview_max.max(10));
 
-    // Source tag colored
     execute!(
         stdout,
         Print(" "),
@@ -280,13 +251,8 @@ fn draw_session_line(
         execute!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    // Age
-    execute!(
-        stdout,
-        Print(format!(" {:>5}  ", age)),
-    )?;
+    execute!(stdout, Print(format!(" {:>5}  ", age)))?;
 
-    // Project (truncated to 20)
     let proj_display: String = project.chars().take(20).collect();
     execute!(
         stdout,
@@ -298,7 +264,6 @@ fn draw_session_line(
         execute!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    // Model
     execute!(
         stdout,
         SetForegroundColor(Color::DarkGrey),
@@ -309,7 +274,6 @@ fn draw_session_line(
         execute!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    // Short session ID
     execute!(
         stdout,
         SetForegroundColor(Color::DarkGrey),
@@ -320,11 +284,9 @@ fn draw_session_line(
         execute!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    // Preview — replace newlines with spaces for single-line display
     let clean_preview: String = preview.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
     execute!(stdout, Print(format!("\"{}\"", clean_preview)))?;
 
-    // Pad rest of line for reverse video
     if is_selected {
         let line_so_far = 1 + 8 + 1 + 5 + 2 + 20 + 2 + model.len() + 4 + sid.len() + 2 + clean_preview.len() + 2;
         let padding = max_width.saturating_sub(line_so_far);
@@ -333,5 +295,129 @@ fn draw_session_line(
         }
     }
 
+    Ok(())
+}
+
+// ── Pager (session viewer) ────────────────────────────
+
+fn pager_loop(
+    stdout: &mut io::Stdout,
+    lines: &[StyledLine],
+) -> crate::error::Result<()> {
+    let mut scroll: usize = 0;
+
+    loop {
+        if let Err(e) = draw_pager(stdout, lines, scroll) {
+            return Err(crate::error::AppError::Io(e));
+        }
+
+        let evt = match event::read() {
+            Ok(e) => e,
+            Err(e) => return Err(crate::error::AppError::Io(e)),
+        };
+
+        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        let visible = (rows as usize).saturating_sub(1); // reserve 1 for status bar
+        let max_scroll = lines.len().saturating_sub(visible);
+
+        match evt {
+            // Back to list
+            Event::Key(KeyEvent { code: KeyCode::Esc, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+                return Ok(());
+            }
+            Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                return Ok(());
+            }
+            // Scroll
+            Event::Key(KeyEvent { code: KeyCode::Up, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('k'), modifiers: KeyModifiers::NONE, .. }) => {
+                scroll = scroll.saturating_sub(1);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Down, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('j'), modifiers: KeyModifiers::NONE, .. }) => {
+                if scroll < max_scroll { scroll += 1; }
+            }
+            Event::Key(KeyEvent { code: KeyCode::PageUp, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('u'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                scroll = scroll.saturating_sub(visible / 2);
+            }
+            Event::Key(KeyEvent { code: KeyCode::PageDown, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('d'), modifiers: KeyModifiers::CONTROL, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char(' '), .. }) => {
+                scroll = (scroll + visible / 2).min(max_scroll);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Home, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('g'), modifiers: KeyModifiers::NONE, .. }) => {
+                scroll = 0;
+            }
+            Event::Key(KeyEvent { code: KeyCode::End, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('G'), modifiers: KeyModifiers::SHIFT, .. }) => {
+                scroll = max_scroll;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn draw_pager(
+    stdout: &mut io::Stdout,
+    lines: &[StyledLine],
+    scroll: usize,
+) -> io::Result<()> {
+    let (cols, rows) = terminal::size()?;
+    let cols = cols as usize;
+    let rows = rows as usize;
+    let content_rows = rows.saturating_sub(1); // reserve last row for status
+
+    execute!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+
+    for i in 0..content_rows {
+        let line_idx = scroll + i;
+        if line_idx >= lines.len() {
+            break;
+        }
+
+        execute!(stdout, cursor::MoveTo(0, i as u16))?;
+        render_styled_line(stdout, &lines[line_idx], cols)?;
+    }
+
+    // Status bar at bottom
+    let progress = if lines.is_empty() {
+        100
+    } else {
+        ((scroll + content_rows).min(lines.len()) * 100) / lines.len()
+    };
+    let status = format!(
+        " ↑↓/jk scroll  PgUp/PgDn half-page  g/G top/bottom  q/Esc back  ─ {}% ",
+        progress
+    );
+    execute!(
+        stdout,
+        cursor::MoveTo(0, (rows - 1) as u16),
+        SetAttribute(Attribute::Reverse),
+        Print(format!("{:<width$}", status, width = cols)),
+        SetAttribute(Attribute::NoReverse),
+    )?;
+
+    stdout.flush()?;
+    Ok(())
+}
+
+fn render_styled_line(stdout: &mut io::Stdout, spans: &[Span], _max_width: usize) -> io::Result<()> {
+    for span in spans {
+        if span.bold {
+            execute!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        if span.dim {
+            execute!(stdout, SetAttribute(Attribute::Dim))?;
+        }
+        if let Some(fg) = span.fg {
+            execute!(stdout, SetForegroundColor(fg))?;
+        }
+        execute!(stdout, Print(&span.text))?;
+        execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    }
     Ok(())
 }
