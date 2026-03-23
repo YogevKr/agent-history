@@ -11,9 +11,10 @@ mod history;
 mod path;
 mod resume;
 mod search;
+mod viewer;
 
 use crate::cli::{parse_duration_secs, Cli, SourceFilter};
-use crate::display::{format_result, show_session};
+use crate::display::format_result;
 use crate::history::{Conversation, SessionSource};
 use crate::search::{precompute_search_text, search};
 use chrono::Local;
@@ -44,8 +45,7 @@ fn run() -> error::Result<()> {
     // Handle --show
     if let Some(ref id) = args.show {
         if let Some(conv) = conversations.iter().find(|c| c.session_id == *id) {
-            show_session(conv);
-            return Ok(());
+            return viewer::review_session(conv);
         }
         return Err(error::AppError::SessionNotFound(id.clone()));
     }
