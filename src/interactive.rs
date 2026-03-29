@@ -13,6 +13,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use std::io::{self, Write};
+use std::process::{Command, Stdio};
 
 /// Run interactive session picker. Returns Ok(()) on clean exit.
 pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
@@ -27,6 +28,7 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
         query: String::new(),
         selected: 0,
         filtered_indices: (0..conversations.len()).collect(),
+        flash: None,
     };
 
     terminal::enable_raw_mode().map_err(crate::error::AppError::Io)?;
@@ -50,6 +52,7 @@ struct PickerState {
     query: String,
     selected: usize,
     filtered_indices: Vec<usize>,
+    flash: Option<String>,
 }
 
 fn main_loop(
@@ -64,6 +67,11 @@ fn main_loop(
                 pager_loop(stdout, &conversations[idx])?;
                 // Returns here → back to picker with same state
             }
+            PickerAction::CopyId(idx) => {
+                let id = &conversations[idx].session_id;
+                let _ = copy_to_clipboard(id);
+                state.flash = Some(format!("Copied: {}", id));
+            }
             PickerAction::Quit => return Ok(()),
         }
     }
@@ -71,6 +79,7 @@ fn main_loop(
 
 enum PickerAction {
     ViewSession(usize),
+    CopyId(usize),
     Quit,
 }
 
@@ -83,9 +92,10 @@ fn picker_loop(
     state: &mut PickerState,
 ) -> PickerAction {
     loop {
-        if let Err(_) = draw_picker(stdout, conversations, &state.filtered_indices, &state.query, state.selected) {
+        if let Err(_) = draw_picker(stdout, conversations, &state.filtered_indices, &state.query, state.selected, state.flash.as_deref()) {
             return PickerAction::Quit;
         }
+        state.flash = None;
 
         let evt = match event::read() {
             Ok(e) => e,
@@ -119,6 +129,12 @@ fn picker_loop(
                 state.query.pop();
                 refilter(conversations, searchable, state);
             }
+            Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                if !state.filtered_indices.is_empty() {
+                    let idx = state.filtered_indices[state.selected];
+                    return PickerAction::CopyId(idx);
+                }
+            }
             Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers, .. }) => {
                 if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT {
                     state.query.push(c);
@@ -151,6 +167,7 @@ fn draw_picker(
     filtered_indices: &[usize],
     query: &str,
     selected: usize,
+    flash: Option<&str>,
 ) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
     let cols = cols as usize;
@@ -168,14 +185,28 @@ fn draw_picker(
         Print(query),
     )?;
 
-    // Line 1: match count
+    // Line 1: match count + hint + flash
+    let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
+    let hint = "  Ctrl-y: copy ID";
+    let flash_text = flash.unwrap_or("");
+    let gap = cols.saturating_sub(count.len() + hint.len() + flash_text.len() + 2);
     execute!(
         stdout,
         cursor::MoveTo(0, 1),
         SetForegroundColor(Color::DarkGrey),
-        Print(format!("  {}/{}", filtered_indices.len(), conversations.len())),
+        Print(&count),
+        Print(hint),
         ResetColor,
     )?;
+    if !flash_text.is_empty() {
+        execute!(
+            stdout,
+            Print(" ".repeat(gap)),
+            SetForegroundColor(Color::Green),
+            Print(flash_text),
+            ResetColor,
+        )?;
+    }
 
     // Lines 2..rows: session list
     let list_start = 2usize;
@@ -295,6 +326,17 @@ fn draw_session_line(
         }
     }
 
+    Ok(())
+}
+
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    child.wait()?;
     Ok(())
 }
 
