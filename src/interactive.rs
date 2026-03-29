@@ -7,7 +7,7 @@ use crate::viewer::{self, Span, StyledLine};
 use chrono::Local;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{self, ClearType},
@@ -62,24 +62,36 @@ fn main_loop(
     state: &mut PickerState,
 ) -> crate::error::Result<()> {
     loop {
-        match picker_loop(stdout, conversations, searchable, state) {
+        let idx = match picker_loop(stdout, conversations, searchable, state) {
             PickerAction::ViewSession(idx) => {
-                pager_loop(stdout, &conversations[idx])?;
-                // Returns here → back to picker with same state
+                match pager_loop(stdout, &conversations[idx])? {
+                    PagerAction::Back => continue,
+                    PagerAction::CopyId => idx,
+                    PagerAction::Resume => {
+                        let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
+                        let _ = terminal::disable_raw_mode();
+                        return crate::resume::resume_session(&conversations[idx]);
+                    }
+                }
             }
-            PickerAction::CopyId(idx) => {
-                let id = &conversations[idx].session_id;
-                let _ = copy_to_clipboard(id);
-                state.flash = Some(format!("Copied: {}", id));
+            PickerAction::CopyId(idx) => idx,
+            PickerAction::ResumeSession(idx) => {
+                let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
+                let _ = terminal::disable_raw_mode();
+                return crate::resume::resume_session(&conversations[idx]);
             }
             PickerAction::Quit => return Ok(()),
-        }
+        };
+        let id = &conversations[idx].session_id;
+        let _ = copy_to_clipboard(id);
+        state.flash = Some(format!("Copied: {}", id));
     }
 }
 
 enum PickerAction {
     ViewSession(usize),
     CopyId(usize),
+    ResumeSession(usize),
     Quit,
 }
 
@@ -101,6 +113,11 @@ fn picker_loop(
             Ok(e) => e,
             Err(_) => return PickerAction::Quit,
         };
+
+        // Only handle key press events (not release/repeat)
+        if matches!(&evt, Event::Key(ke) if ke.kind != KeyEventKind::Press) {
+            continue;
+        }
 
         match evt {
             Event::Key(KeyEvent { code: KeyCode::Esc, .. })
@@ -129,10 +146,16 @@ fn picker_loop(
                 state.query.pop();
                 refilter(conversations, searchable, state);
             }
-            Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::CONTROL, .. }) => {
+            Event::Key(KeyEvent { code: KeyCode::Left, .. }) => {
                 if !state.filtered_indices.is_empty() {
                     let idx = state.filtered_indices[state.selected];
                     return PickerAction::CopyId(idx);
+                }
+            }
+            Event::Key(KeyEvent { code: KeyCode::Right, .. }) => {
+                if !state.filtered_indices.is_empty() {
+                    let idx = state.filtered_indices[state.selected];
+                    return PickerAction::ResumeSession(idx);
                 }
             }
             Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers, .. }) => {
@@ -187,7 +210,7 @@ fn draw_picker(
 
     // Line 1: match count + hint + flash
     let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
-    let hint = "  Ctrl-y: copy ID";
+    let hint = "  \u{2190}: copy ID  \u{2192}: resume";
     let flash_text = flash.unwrap_or("");
     let gap = cols.saturating_sub(count.len() + hint.len() + flash_text.len() + 2);
     execute!(
@@ -342,10 +365,16 @@ fn copy_to_clipboard(text: &str) -> io::Result<()> {
 
 // ── Pager (session viewer) ────────────────────────────
 
+enum PagerAction {
+    Back,
+    CopyId,
+    Resume,
+}
+
 fn pager_loop(
     stdout: &mut io::Stdout,
     conv: &Conversation,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<PagerAction> {
     let mut lines = viewer::build_session_lines(conv)?;
     let (_, rows) = terminal::size().unwrap_or((80, 24));
     let visible = (rows as usize).saturating_sub(1);
@@ -361,6 +390,11 @@ fn pager_loop(
             Err(e) => return Err(crate::error::AppError::Io(e)),
         };
 
+        // Only handle key press events (not release/repeat)
+        if matches!(&evt, Event::Key(ke) if ke.kind != KeyEventKind::Press) {
+            continue;
+        }
+
         let (_, rows) = terminal::size().unwrap_or((80, 24));
         let visible = (rows as usize).saturating_sub(1); // reserve 1 for status bar
         let max_scroll = lines.len().saturating_sub(visible);
@@ -370,10 +404,18 @@ fn pager_loop(
             Event::Key(KeyEvent { code: KeyCode::Esc, .. })
             | Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE, .. })
             | Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
-                return Ok(());
+                return Ok(PagerAction::Back);
             }
             Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) => {
-                return Ok(());
+                return Ok(PagerAction::Back);
+            }
+            // Copy session ID
+            Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::NONE, .. }) => {
+                return Ok(PagerAction::CopyId);
+            }
+            // Resume session
+            Event::Key(KeyEvent { code: KeyCode::Char('o'), modifiers: KeyModifiers::NONE, .. }) => {
+                return Ok(PagerAction::Resume);
             }
             // Refresh
             Event::Key(KeyEvent { code: KeyCode::Char('r'), modifiers: KeyModifiers::NONE, .. }) => {
@@ -453,7 +495,7 @@ fn draw_pager(
     let age = format_relative_time(conv.timestamp);
     let sid = short_id(&conv.session_id);
     let left = format!(" {} ({}) {} {}", project, model, age, sid);
-    let right = format!("jk/↑↓  PgUp/Dn  g/G  r:refresh  q:back  {}% ", progress);
+    let right = format!("jk/\u{2191}\u{2193}  g/G  y:copy  o:resume  r:refresh  q:back  {}% ", progress);
     let gap = cols.saturating_sub(left.len() + right.len());
     let status = format!("{}{}{}", left, " ".repeat(gap), right);
     execute!(
