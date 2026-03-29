@@ -37,7 +37,11 @@ fn append_text(full_text: &mut String, text: &str) {
     if text.len() <= remaining {
         full_text.push_str(text);
     } else {
-        full_text.push_str(&text[..remaining]);
+        let mut end = remaining;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        full_text.push_str(&text[..end]);
     }
 }
 

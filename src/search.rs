@@ -10,14 +10,14 @@ pub struct SearchableConversation {
     pub index: usize,
 }
 
-/// Normalize text for search: lowercase, replace separators with spaces
+/// Normalize text for search: lowercase, replace non-alphanumeric chars with spaces
 fn normalize_for_search(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if ch == '_' || ch == '-' || ch == '/' {
-            out.push(' ');
-        } else {
+        if ch.is_alphanumeric() || ch == '.' {
             out.extend(ch.to_lowercase());
+        } else {
+            out.push(' ');
         }
     }
     out
