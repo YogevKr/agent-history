@@ -135,10 +135,10 @@ pub fn review_session(conv: &Conversation) -> Result<()> {
 
 // ── Line builders (for TUI) ───────────────────────────
 
-fn push_role(lines: &mut Vec<StyledLine>, _role: &str, text: &str, is_user: bool) {
+fn push_role(lines: &mut Vec<StyledLine>, role: &str, text: &str, is_user: bool) {
     let t = theme();
     let color = if is_user { t.user_color } else { t.assistant_color };
-    let label = if is_user { "You" } else { "Claude" };
+    let label = if is_user { "User" } else { role };
     let cw = content_width();
 
     if is_user {
@@ -428,7 +428,7 @@ fn build_claude_lines(path: &std::path::Path, lines: &mut Vec<StyledLine>) -> Re
                 if parent_tool_use_id.is_some() { continue; }
                 let text = extract_text_from_user(&message);
                 if !text.is_empty() {
-                    push_role(lines, "You", &text, true);
+                    push_role(lines, "User", &text, true);
                 }
             }
             LogEntry::Assistant { message, parent_tool_use_id, .. } => {
@@ -456,7 +456,7 @@ fn build_claude_lines(path: &std::path::Path, lines: &mut Vec<StyledLine>) -> Re
 
                 let combined = text_parts.join("\n");
                 if !combined.is_empty() {
-                    push_role(lines, "Assistant", &combined, false);
+                    push_role(lines, "Claude", &combined, false);
                 }
                 for (name, input) in &tool_calls {
                     push_tool(lines, name, input);
@@ -492,12 +492,12 @@ fn build_codex_lines(path: &std::path::Path, lines: &mut Vec<StyledLine>) -> Res
                     match evt.event_type.as_str() {
                         "user_message" => {
                             if let Some(msg) = &evt.message {
-                                if !msg.is_empty() { push_role(lines, "You", msg, true); }
+                                if !msg.is_empty() { push_role(lines, "User", msg, true); }
                             }
                         }
                         "agent_message" => {
                             if let Some(msg) = &evt.message {
-                                if !msg.is_empty() { push_role(lines, "Assistant", msg, false); }
+                                if !msg.is_empty() { push_role(lines, "Codex", msg, false); }
                             }
                         }
                         _ => {}
@@ -539,7 +539,7 @@ fn print_claude(path: &std::path::Path) -> Result<()> {
             LogEntry::User { message, parent_tool_use_id, .. } => {
                 if parent_tool_use_id.is_some() { continue; }
                 let text = extract_text_from_user(&message);
-                if !text.is_empty() { print_role_stdout("You", &text, true); }
+                if !text.is_empty() { print_role_stdout("User", &text, true); }
             }
             LogEntry::Assistant { message, parent_tool_use_id, .. } => {
                 if parent_tool_use_id.is_some() { continue; }
@@ -559,7 +559,7 @@ fn print_claude(path: &std::path::Path) -> Result<()> {
                     }
                 }
                 let combined = text_parts.join("\n");
-                if !combined.is_empty() { print_role_stdout("Assistant", &combined, false); }
+                if !combined.is_empty() { print_role_stdout("Claude", &combined, false); }
                 for (name, input) in &tool_calls { print_tool_stdout(name, input); }
                 if !combined.is_empty() || !tool_calls.is_empty() { println!(); }
             }
@@ -586,12 +586,12 @@ fn print_codex(path: &std::path::Path) -> Result<()> {
                     match evt.event_type.as_str() {
                         "user_message" => {
                             if let Some(msg) = &evt.message {
-                                if !msg.is_empty() { print_role_stdout("You", msg, true); }
+                                if !msg.is_empty() { print_role_stdout("User", msg, true); }
                             }
                         }
                         "agent_message" => {
                             if let Some(msg) = &evt.message {
-                                if !msg.is_empty() { print_role_stdout("Assistant", msg, false); }
+                                if !msg.is_empty() { print_role_stdout("Codex", msg, false); }
                             }
                         }
                         _ => {}
@@ -623,11 +623,11 @@ fn print_codex(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn print_role_stdout(_role: &str, text: &str, is_user: bool) {
+fn print_role_stdout(role: &str, text: &str, is_user: bool) {
     use colored::{Colorize, CustomColor};
     let t = theme();
     let (r, g, b) = if is_user { t.user_color } else { t.assistant_color };
-    let label = if is_user { "You" } else { "Claude" };
+    let label = if is_user { "User" } else { role };
     let ledger_label = format!("{:>NAME_WIDTH$} │ ", label);
     print!("{}", ledger_label.custom_color(CustomColor::new(r, g, b)).bold());
     if is_user {

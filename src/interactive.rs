@@ -72,6 +72,37 @@ fn main_loop(
                         let _ = terminal::disable_raw_mode();
                         return crate::resume::resume_session(&conversations[idx]);
                     }
+                    PagerAction::CopyConversation => {
+                        match crate::export::to_markdown(&conversations[idx]) {
+                            Ok(md) => {
+                                if crate::export::copy_to_clipboard(&md).is_ok() {
+                                    state.flash = Some("Copied conversation to clipboard".to_string());
+                                } else {
+                                    state.flash = Some("Failed to copy to clipboard".to_string());
+                                }
+                            }
+                            Err(_) => {
+                                state.flash = Some("Failed to export conversation".to_string());
+                            }
+                        }
+                        continue;
+                    }
+                    PagerAction::ExportFile => {
+                        match crate::export::to_markdown(&conversations[idx]) {
+                            Ok(md) => match crate::export::export_to_file(&conversations[idx], &md) {
+                                Ok(filename) => {
+                                    state.flash = Some(format!("Exported to ./{}", filename));
+                                }
+                                Err(_) => {
+                                    state.flash = Some("Failed to write file".to_string());
+                                }
+                            },
+                            Err(_) => {
+                                state.flash = Some("Failed to export conversation".to_string());
+                            }
+                        }
+                        continue;
+                    }
                 }
             }
             PickerAction::CopyId(idx) => idx,
@@ -369,6 +400,8 @@ enum PagerAction {
     Back,
     CopyId,
     Resume,
+    CopyConversation,
+    ExportFile,
 }
 
 fn pager_loop(
@@ -409,9 +442,18 @@ fn pager_loop(
             Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) => {
                 return Ok(PagerAction::Back);
             }
+            // Copy full conversation to clipboard (Shift-Y) — must be before lowercase y
+            Event::Key(KeyEvent { code: KeyCode::Char('Y'), .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::SHIFT, .. }) => {
+                return Ok(PagerAction::CopyConversation);
+            }
             // Copy session ID
             Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::NONE, .. }) => {
                 return Ok(PagerAction::CopyId);
+            }
+            // Export conversation to file
+            Event::Key(KeyEvent { code: KeyCode::Char('e'), modifiers: KeyModifiers::NONE, .. }) => {
+                return Ok(PagerAction::ExportFile);
             }
             // Resume session
             Event::Key(KeyEvent { code: KeyCode::Char('o'), modifiers: KeyModifiers::NONE, .. }) => {
@@ -453,7 +495,8 @@ fn pager_loop(
                 scroll = 0;
             }
             Event::Key(KeyEvent { code: KeyCode::End, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('G'), modifiers: KeyModifiers::SHIFT, .. }) => {
+            | Event::Key(KeyEvent { code: KeyCode::Char('G'), .. })
+            | Event::Key(KeyEvent { code: KeyCode::Char('g'), modifiers: KeyModifiers::SHIFT, .. }) => {
                 scroll = max_scroll;
             }
             _ => {}
@@ -495,7 +538,7 @@ fn draw_pager(
     let age = format_relative_time(conv.timestamp);
     let sid = short_id(&conv.session_id);
     let left = format!(" {} ({}) {} {}", project, model, age, sid);
-    let right = format!("jk/\u{2191}\u{2193}  g/G  y:copy  o:resume  r:refresh  q:back  {}% ", progress);
+    let right = format!("jk/\u{2191}\u{2193}  g/G  y:id Y:copy e:export  o:resume  r:refresh  q:back  {}% ", progress);
     let gap = cols.saturating_sub(left.len() + right.len());
     let status = format!("{}{}{}", left, " ".repeat(gap), right);
     execute!(
