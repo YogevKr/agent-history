@@ -1,11 +1,12 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local, TimeZone};
 
-use crate::codex::{CodexLine, EventMsg, ResponseItem, SessionMeta, TurnContext};
+use crate::codex::{CodexLine, EventMsg, SessionMeta, TurnContext};
+use crate::codex_items::{codex_items, read_codex_lines, CodexItem, CodexRole};
 use crate::error::Result;
 use crate::history::{Conversation, SessionSource};
 
@@ -58,24 +59,20 @@ pub fn process_codex_file(
     let mut model: Option<String> = None;
     let mut git_branch: Option<String> = None;
     let mut preview = String::new();
-    let mut preview_from_event = false; // event_msg/user_message is preferred
     let mut full_text = String::new();
     let mut message_count: usize = 0;
     let mut total_tokens: u64 = 0;
     let mut first_timestamp: Option<String> = None;
     let mut session_timestamp: Option<String> = None;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    let lines = read_codex_lines(reader);
 
+    for line in &lines {
         if line.trim().is_empty() {
             continue;
         }
 
-        let codex_line: CodexLine = match serde_json::from_str(&line) {
+        let codex_line: CodexLine = match serde_json::from_str(line) {
             Ok(cl) => cl,
             Err(_) => continue,
         };
@@ -109,26 +106,6 @@ pub fn process_codex_file(
             "event_msg" => {
                 if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
                     match evt.event_type.as_str() {
-                        "user_message" => {
-                            if let Some(msg) = &evt.message {
-                                message_count += 1;
-                                if !preview_from_event && !msg.is_empty() {
-                                    preview = msg.chars().take(200).collect();
-                                    preview_from_event = true;
-                                }
-                                append_text(&mut full_text, "User: ");
-                                append_text(&mut full_text, msg);
-                                append_text(&mut full_text, "\n\n");
-                            }
-                        }
-                        "agent_message" => {
-                            if let Some(msg) = &evt.message {
-                                message_count += 1;
-                                append_text(&mut full_text, "Assistant: ");
-                                append_text(&mut full_text, msg);
-                                append_text(&mut full_text, "\n\n");
-                            }
-                        }
                         "token_count" => {
                             if let Some(info) = evt.info {
                                 if let Some(usage) = info.total_token_usage {
@@ -136,68 +113,46 @@ pub fn process_codex_file(
                                 }
                             }
                         }
-                        _ => {} // skip task_started, task_complete, etc.
-                    }
-                }
-            }
-            "response_item" => {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(codex_line.payload) {
-                    match item.item_type.as_str() {
-                        "message" => {
-                            let role = item.role.as_deref().unwrap_or("");
-                            if role == "developer" {
-                                continue;
-                            }
-                            if let Some(parts) = &item.content {
-                                for part in parts {
-                                    if let Some(text) = &part.text {
-                                        if !text.is_empty() {
-                                            message_count += 1;
-                                            let label = match role {
-                                                "user" => "User: ",
-                                                "assistant" => "Assistant: ",
-                                                _ => "",
-                                            };
-                                            if !label.is_empty() {
-                                                append_text(&mut full_text, label);
-                                            }
-                                            if !preview_from_event && preview.is_empty() && role == "user" {
-                                                preview = text.chars().take(200).collect();
-                                            }
-                                            append_text(&mut full_text, text);
-                                            append_text(&mut full_text, "\n\n");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        "function_call" => {
-                            if let Some(name) = &item.name {
-                                append_text(&mut full_text, &format!("[Tool: {}]\n\n", name));
-                            }
-                        }
-                        "function_call_output" => {
-                            if let Some(output) = &item.output {
-                                let truncated = if output.len() > MAX_OUTPUT_PER_ITEM {
-                                    let mut end = MAX_OUTPUT_PER_ITEM;
-                                    while end > 0 && !output.is_char_boundary(end) {
-                                        end -= 1;
-                                    }
-                                    &output[..end]
-                                } else {
-                                    output.as_str()
-                                };
-                                append_text(
-                                    &mut full_text,
-                                    &format!("[Tool Output]\n{}\n\n", truncated),
-                                );
-                            }
-                        }
-                        _ => {} // skip "reasoning", etc.
+                        _ => {}
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    for item in codex_items(&lines) {
+        match item {
+            CodexItem::Message { role, text } => {
+                message_count += 1;
+                let label = match role {
+                    CodexRole::User => {
+                        if preview.is_empty() {
+                            preview = text.chars().take(200).collect();
+                        }
+                        "User: "
+                    }
+                    CodexRole::Assistant => "Assistant: ",
+                };
+                append_text(&mut full_text, label);
+                append_text(&mut full_text, &text);
+                append_text(&mut full_text, "\n\n");
+            }
+            CodexItem::ToolCall { name } => {
+                append_text(&mut full_text, &format!("[Tool: {}]\n\n", name));
+            }
+            CodexItem::ToolOutput { output } => {
+                let truncated = if output.len() > MAX_OUTPUT_PER_ITEM {
+                    let mut end = MAX_OUTPUT_PER_ITEM;
+                    while end > 0 && !output.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &output[..end]
+                } else {
+                    output.as_str()
+                };
+                append_text(&mut full_text, &format!("[Tool Output]\n{}\n\n", truncated));
+            }
         }
     }
 
@@ -343,6 +298,49 @@ mod tests {
         assert!(!conv.full_text.contains("system prompt"));
         // 2 messages (user + assistant content parts)
         assert_eq!(conv.message_count, 2);
+    }
+
+    #[test]
+    fn dual_source_dedup_prefers_event_msg() {
+        // When both event_msg and response_item contain the same messages,
+        // only event_msg should be counted (not double-counted).
+        let lines = &[
+            r#"{"timestamp":"2026-03-19T14:28:54Z","type":"session_meta","payload":{"id":"dedup-test"}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi there"}]}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:02Z","type":"event_msg","payload":{"type":"user_message","message":"Hello"}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Hi there"}}"#,
+        ];
+        let f = make_jsonl(lines);
+        let conv = process_codex_file(f.path().to_path_buf(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(conv.session_id, "dedup-test");
+        // Should only count 2 messages (from event_msg), not 4
+        assert_eq!(conv.message_count, 2);
+    }
+
+    #[test]
+    fn mixed_sources_keep_response_messages_missing_from_events() {
+        let lines = &[
+            r#"{"timestamp":"2026-03-19T14:28:54Z","type":"session_meta","payload":{"id":"mixed-test"}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Response-only question"}]}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Response-only answer"}]}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Duplicated question"}]}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:03Z","type":"event_msg","payload":{"type":"user_message","message":"Duplicated question"}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:04Z","type":"event_msg","payload":{"type":"agent_message","message":"Event-only answer"}}"#,
+        ];
+        let f = make_jsonl(lines);
+        let conv = process_codex_file(f.path().to_path_buf(), None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(conv.message_count, 4);
+        assert!(conv.full_text.contains("User: Response-only question"));
+        assert!(conv.full_text.contains("Assistant: Response-only answer"));
+        assert!(conv.full_text.contains("User: Duplicated question"));
+        assert!(conv.full_text.contains("Assistant: Event-only answer"));
+        assert_eq!(conv.full_text.matches("Duplicated question").count(), 1);
     }
 
     #[test]

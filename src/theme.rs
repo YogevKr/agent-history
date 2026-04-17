@@ -41,16 +41,16 @@ fn is_light_terminal() -> bool {
 
 fn dark_theme() -> Theme {
     Theme {
-        accent: (78, 201, 176),        // teal
+        accent: (78, 201, 176), // teal
         text_primary: (212, 212, 212),
         text_secondary: (160, 160, 160),
         text_muted: (100, 100, 100),
-        heading: (180, 190, 220),       // pale blue
-        code_inline: (147, 161, 199),   // purple-blue
+        heading: (180, 190, 220),     // pale blue
+        code_inline: (147, 161, 199), // purple-blue
         code_block_fg: (147, 161, 199),
-        tool_color: (206, 172, 105),    // warm yellow
+        tool_color: (206, 172, 105), // warm yellow
         border: (70, 70, 70),
-        user_color: (80, 200, 120),     // green
+        user_color: (80, 200, 120),      // green
         assistant_color: (78, 201, 176), // teal
         diff_add: (80, 200, 120),
         diff_remove: (220, 80, 80),

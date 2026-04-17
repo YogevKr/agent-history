@@ -2,9 +2,9 @@
 
 use crate::theme::theme;
 use std::sync::OnceLock;
-use syntect::highlighting::{ThemeSet, Style};
-use syntect::parsing::SyntaxSet;
 use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style, ThemeSet};
+use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 struct SyntectState {
@@ -46,7 +46,10 @@ fn normalize_lang(lang: &str) -> Option<&'static str> {
     }
 }
 
-fn find_syntax<'a>(st: &'a SyntectState, lang: &str) -> Option<&'a syntect::parsing::SyntaxReference> {
+fn find_syntax<'a>(
+    st: &'a SyntectState,
+    lang: &str,
+) -> Option<&'a syntect::parsing::SyntaxReference> {
     if let Some(normalized) = normalize_lang(lang) {
         if let Some(syn) = st.syntax_set.find_syntax_by_token(normalized) {
             return Some(syn);
@@ -101,7 +104,10 @@ pub fn highlight_code_ansi(code: &str, lang: &str) -> Option<String> {
         let ranges: Vec<(Style, &str)> = highlighter.highlight_line(line, &st.syntax_set).ok()?;
         for (style, text) in ranges {
             let fg = style.foreground;
-            output.push_str(&format!("\x1b[38;2;{};{};{}m{}\x1b[0m", fg.r, fg.g, fg.b, text));
+            output.push_str(&format!(
+                "\x1b[38;2;{};{};{}m{}\x1b[0m",
+                fg.r, fg.g, fg.b, text
+            ));
         }
     }
 

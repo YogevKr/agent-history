@@ -1,7 +1,7 @@
 //! Readable session viewer — re-parses JSONL and builds styled lines.
 
 use crate::claude::{extract_text_from_user, ContentBlock, LogEntry};
-use crate::codex::{CodexLine, EventMsg, ResponseItem};
+use crate::codex_items::{codex_items, read_codex_lines, CodexItem, CodexRole};
 use crate::error::Result;
 use crate::history::{Conversation, SessionSource};
 use crate::syntax;
@@ -28,19 +28,44 @@ pub struct Span {
 
 impl Span {
     fn plain(text: &str) -> Self {
-        Self { text: text.to_string(), fg: None, bold: false, dim: false }
+        Self {
+            text: text.to_string(),
+            fg: None,
+            bold: false,
+            dim: false,
+        }
     }
     fn rgb(text: &str, fg: (u8, u8, u8)) -> Self {
-        Self { text: text.to_string(), fg: Some(fg), bold: false, dim: false }
+        Self {
+            text: text.to_string(),
+            fg: Some(fg),
+            bold: false,
+            dim: false,
+        }
     }
     fn bold_rgb(text: &str, fg: (u8, u8, u8)) -> Self {
-        Self { text: text.to_string(), fg: Some(fg), bold: true, dim: false }
+        Self {
+            text: text.to_string(),
+            fg: Some(fg),
+            bold: true,
+            dim: false,
+        }
     }
     fn bold(text: &str) -> Self {
-        Self { text: text.to_string(), fg: None, bold: true, dim: false }
+        Self {
+            text: text.to_string(),
+            fg: None,
+            bold: true,
+            dim: false,
+        }
     }
     fn dim(text: &str) -> Self {
-        Self { text: text.to_string(), fg: None, bold: false, dim: true }
+        Self {
+            text: text.to_string(),
+            fg: None,
+            bold: false,
+            dim: true,
+        }
     }
 }
 
@@ -49,7 +74,9 @@ pub type StyledLine = Vec<Span>;
 
 /// Get terminal width (fallback 80)
 fn term_width() -> usize {
-    crossterm::terminal::size().map(|(c, _)| c as usize).unwrap_or(80)
+    crossterm::terminal::size()
+        .map(|(c, _)| c as usize)
+        .unwrap_or(80)
 }
 
 /// Content width available after ledger gutter
@@ -77,20 +104,36 @@ pub fn build_session_lines(conv: &Conversation) -> Result<Vec<StyledLine>> {
     let t = theme();
 
     // Header
-    lines.push(vec![Span::bold("Session: "), Span::plain(&conv.session_id), Span::dim(&format!(" ({})", conv.source))]);
-    lines.push(vec![Span::bold("Project: "), Span::plain(conv.project_name.as_deref().unwrap_or("unknown"))]);
+    lines.push(vec![
+        Span::bold("Session: "),
+        Span::plain(&conv.session_id),
+        Span::dim(&format!(" ({})", conv.source)),
+    ]);
+    lines.push(vec![
+        Span::bold("Project: "),
+        Span::plain(conv.project_name.as_deref().unwrap_or("unknown")),
+    ]);
     if let Some(ref model) = conv.model {
         lines.push(vec![Span::bold("Model: "), Span::plain(model)]);
     }
     if let Some(ref branch) = conv.git_branch {
         lines.push(vec![Span::bold("Branch: "), Span::plain(branch)]);
     }
-    lines.push(vec![Span::bold("Messages: "), Span::plain(&conv.message_count.to_string())]);
+    lines.push(vec![
+        Span::bold("Messages: "),
+        Span::plain(&conv.message_count.to_string()),
+    ]);
     if conv.total_tokens > 0 {
-        lines.push(vec![Span::bold("Tokens: "), Span::plain(&conv.total_tokens.to_string())]);
+        lines.push(vec![
+            Span::bold("Tokens: "),
+            Span::plain(&conv.total_tokens.to_string()),
+        ]);
     }
     if let Some(dur) = conv.duration_minutes {
-        lines.push(vec![Span::bold("Duration: "), Span::plain(&format!("{}m", dur))]);
+        lines.push(vec![
+            Span::bold("Duration: "),
+            Span::plain(&format!("{}m", dur)),
+        ]);
     }
     lines.push(vec![Span::rgb(SEPARATOR, t.border)]);
     lines.push(vec![]);
@@ -108,8 +151,17 @@ pub fn build_session_lines(conv: &Conversation) -> Result<Vec<StyledLine>> {
 pub fn review_session(conv: &Conversation) -> Result<()> {
     use colored::Colorize;
 
-    println!("{} {} ({})", "Session:".bold(), conv.session_id, conv.source.to_string().dimmed());
-    println!("{} {}", "Project:".bold(), conv.project_name.as_deref().unwrap_or("unknown"));
+    println!(
+        "{} {} ({})",
+        "Session:".bold(),
+        conv.session_id,
+        conv.source.to_string().dimmed()
+    );
+    println!(
+        "{} {}",
+        "Project:".bold(),
+        conv.project_name.as_deref().unwrap_or("unknown")
+    );
     if let Some(ref model) = conv.model {
         println!("{} {}", "Model:".bold(), model);
     }
@@ -137,7 +189,11 @@ pub fn review_session(conv: &Conversation) -> Result<()> {
 
 fn push_role(lines: &mut Vec<StyledLine>, role: &str, text: &str, is_user: bool) {
     let t = theme();
-    let color = if is_user { t.user_color } else { t.assistant_color };
+    let color = if is_user {
+        t.user_color
+    } else {
+        t.assistant_color
+    };
     let label = if is_user { "User" } else { role };
     let cw = content_width();
 
@@ -158,12 +214,16 @@ fn push_role(lines: &mut Vec<StyledLine>, role: &str, text: &str, is_user: bool)
             if md_line.is_empty() {
                 lines.push(vec![Span::rgb(&ledger_blank(), t.border)]);
             } else if first {
-                let mut out: StyledLine = vec![Span::bold_rgb(&format!("{:>NAME_WIDTH$}{}", label, SEP), color)];
+                let mut out: StyledLine = vec![Span::bold_rgb(
+                    &format!("{:>NAME_WIDTH$}{}", label, SEP),
+                    color,
+                )];
                 out.extend(md_line);
                 lines.push(out);
                 first = false;
             } else {
-                let mut out: StyledLine = vec![Span::rgb(&format!("{:>NAME_WIDTH$}{}", "", SEP), t.border)];
+                let mut out: StyledLine =
+                    vec![Span::rgb(&format!("{:>NAME_WIDTH$}{}", "", SEP), t.border)];
                 out.extend(md_line);
                 lines.push(out);
             }
@@ -217,7 +277,12 @@ fn markdown_to_lines(text: &str, max_width: usize) -> Vec<StyledLine> {
                     for tokens in highlighted {
                         let mut line: StyledLine = vec![Span::plain("  ")];
                         for tok in tokens {
-                            line.push(Span { text: tok.text, fg: Some(tok.fg), bold: tok.bold, dim: false });
+                            line.push(Span {
+                                text: tok.text,
+                                fg: Some(tok.fg),
+                                bold: tok.bold,
+                                dim: false,
+                            });
                         }
                         result.push(line);
                     }
@@ -323,7 +388,12 @@ fn markdown_to_lines(text: &str, max_width: usize) -> Vec<StyledLine> {
 }
 
 /// Wrap a paragraph string to max_width and push as styled lines.
-fn flush_wrapped_paragraph(result: &mut Vec<StyledLine>, text: &str, max_width: usize, _fg: (u8, u8, u8)) {
+fn flush_wrapped_paragraph(
+    result: &mut Vec<StyledLine>,
+    text: &str,
+    max_width: usize,
+    _fg: (u8, u8, u8),
+) {
     let t = theme();
     let width = if max_width > 4 { max_width } else { 80 };
     let wrapped = textwrap::wrap(text, width);
@@ -360,14 +430,38 @@ fn parse_inline_code(text: &str, t: &crate::theme::Theme) -> StyledLine {
 /// Extract the key argument from a tool call's input JSON.
 fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {
     let detail = match name {
-        "Bash" => input.get("command").and_then(|v| v.as_str()).map(|s| truncate_str(s, 80)),
-        "Read" => input.get("file_path").and_then(|v| v.as_str()).map(String::from),
-        "Edit" => input.get("file_path").and_then(|v| v.as_str()).map(String::from),
-        "Write" => input.get("file_path").and_then(|v| v.as_str()).map(String::from),
-        "Grep" => input.get("pattern").and_then(|v| v.as_str()).map(|s| format!("\"{}\"", s)),
-        "Glob" => input.get("pattern").and_then(|v| v.as_str()).map(String::from),
-        "WebFetch" => input.get("url").and_then(|v| v.as_str()).map(|s| truncate_str(s, 80)),
-        "Agent" | "Task" => input.get("description").and_then(|v| v.as_str()).map(String::from),
+        "Bash" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_str(s, 80)),
+        "Read" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        "Edit" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        "Write" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        "Grep" => input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("\"{}\"", s)),
+        "Glob" => input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        "WebFetch" => input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_str(s, 80)),
+        "Agent" | "Task" => input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         _ => None,
     };
     match detail {
@@ -381,7 +475,9 @@ fn truncate_str(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
         format!("{}...", &s[..end])
     }
 }
@@ -419,20 +515,40 @@ fn build_claude_lines(path: &std::path::Path, lines: &mut Vec<StyledLine>) -> Re
     let reader = BufReader::new(file);
 
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => continue };
-        if line.trim().is_empty() { continue; }
-        let entry: LogEntry = match serde_json::from_str(&line) { Ok(e) => e, Err(_) => continue };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: LogEntry = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
         match entry {
-            LogEntry::User { message, parent_tool_use_id, .. } => {
-                if parent_tool_use_id.is_some() { continue; }
+            LogEntry::User {
+                message,
+                parent_tool_use_id,
+                ..
+            } => {
+                if parent_tool_use_id.is_some() {
+                    continue;
+                }
                 let text = extract_text_from_user(&message);
                 if !text.is_empty() {
                     push_role(lines, "User", &text, true);
                 }
             }
-            LogEntry::Assistant { message, parent_tool_use_id, .. } => {
-                if parent_tool_use_id.is_some() { continue; }
+            LogEntry::Assistant {
+                message,
+                parent_tool_use_id,
+                ..
+            } => {
+                if parent_tool_use_id.is_some() {
+                    continue;
+                }
                 let mut text_parts = Vec::new();
                 let mut tool_calls: Vec<(&str, &serde_json::Value)> = Vec::new();
 
@@ -444,7 +560,10 @@ fn build_claude_lines(path: &std::path::Path, lines: &mut Vec<StyledLine>) -> Re
                         ContentBlock::ToolUse { name, input, .. } => {
                             tool_calls.push((name.as_str(), input));
                         }
-                        ContentBlock::ToolResult { content: Some(content), .. } => {
+                        ContentBlock::ToolResult {
+                            content: Some(content),
+                            ..
+                        } => {
                             let text = tool_result_text(content);
                             if !text.is_empty() {
                                 push_tool_output(lines, &text);
@@ -467,7 +586,10 @@ fn build_claude_lines(path: &std::path::Path, lines: &mut Vec<StyledLine>) -> Re
             }
             LogEntry::Summary { summary } => {
                 let t = theme();
-                lines.push(vec![Span::bold_rgb("Summary: ", t.accent), Span::rgb(&summary, t.accent)]);
+                lines.push(vec![
+                    Span::bold_rgb("Summary: ", t.accent),
+                    Span::rgb(&summary, t.accent),
+                ]);
                 lines.push(vec![]);
             }
             _ => {}
@@ -479,47 +601,21 @@ fn build_claude_lines(path: &std::path::Path, lines: &mut Vec<StyledLine>) -> Re
 fn build_codex_lines(path: &std::path::Path, lines: &mut Vec<StyledLine>) -> Result<()> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let empty_input = serde_json::Value::Null;
 
-    for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => continue };
-        if line.trim().is_empty() { continue; }
-        let codex_line: CodexLine = match serde_json::from_str(&line) { Ok(l) => l, Err(_) => continue };
-
-        match codex_line.line_type.as_str() {
-            "event_msg" => {
-                if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
-                    match evt.event_type.as_str() {
-                        "user_message" => {
-                            if let Some(msg) = &evt.message {
-                                if !msg.is_empty() { push_role(lines, "User", msg, true); }
-                            }
-                        }
-                        "agent_message" => {
-                            if let Some(msg) = &evt.message {
-                                if !msg.is_empty() { push_role(lines, "Codex", msg, false); }
-                            }
-                        }
-                        _ => {}
-                    }
+    for item in codex_items(&read_codex_lines(reader)) {
+        match item {
+            CodexItem::Message { role, text } => match role {
+                CodexRole::User => push_role(lines, "User", &text, true),
+                CodexRole::Assistant => push_role(lines, "Codex", &text, false),
+            },
+            CodexItem::ToolCall { name } => {
+                push_tool(lines, &name, &serde_json::Value::Null);
+            }
+            CodexItem::ToolOutput { output } => {
+                if !output.is_empty() {
+                    push_tool_output(lines, &output);
                 }
             }
-            "response_item" => {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(codex_line.payload) {
-                    match item.item_type.as_str() {
-                        "function_call" => {
-                            if let Some(name) = &item.name { push_tool(lines, name, &empty_input); }
-                        }
-                        "function_call_output" => {
-                            if let Some(output) = &item.output {
-                                if !output.is_empty() { push_tool_output(lines, output); }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -532,24 +628,53 @@ fn print_claude(path: &std::path::Path) -> Result<()> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => continue };
-        if line.trim().is_empty() { continue; }
-        let entry: LogEntry = match serde_json::from_str(&line) { Ok(e) => e, Err(_) => continue };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: LogEntry = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
         match entry {
-            LogEntry::User { message, parent_tool_use_id, .. } => {
-                if parent_tool_use_id.is_some() { continue; }
+            LogEntry::User {
+                message,
+                parent_tool_use_id,
+                ..
+            } => {
+                if parent_tool_use_id.is_some() {
+                    continue;
+                }
                 let text = extract_text_from_user(&message);
-                if !text.is_empty() { print_role_stdout("User", &text, true); }
+                if !text.is_empty() {
+                    print_role_stdout("User", &text, true);
+                }
             }
-            LogEntry::Assistant { message, parent_tool_use_id, .. } => {
-                if parent_tool_use_id.is_some() { continue; }
+            LogEntry::Assistant {
+                message,
+                parent_tool_use_id,
+                ..
+            } => {
+                if parent_tool_use_id.is_some() {
+                    continue;
+                }
                 let mut text_parts = Vec::new();
                 let mut tool_calls: Vec<(&str, &serde_json::Value)> = Vec::new();
                 for block in &message.content {
                     match block {
-                        ContentBlock::Text { text } if !text.is_empty() => text_parts.push(text.as_str()),
-                        ContentBlock::ToolUse { name, input, .. } => tool_calls.push((name.as_str(), input)),
-                        ContentBlock::ToolResult { content: Some(content), .. } => {
+                        ContentBlock::Text { text } if !text.is_empty() => {
+                            text_parts.push(text.as_str())
+                        }
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            tool_calls.push((name.as_str(), input))
+                        }
+                        ContentBlock::ToolResult {
+                            content: Some(content),
+                            ..
+                        } => {
                             let text = tool_result_text(content);
                             if !text.is_empty() {
                                 print_tool_output_stdout(&text);
@@ -559,9 +684,15 @@ fn print_claude(path: &std::path::Path) -> Result<()> {
                     }
                 }
                 let combined = text_parts.join("\n");
-                if !combined.is_empty() { print_role_stdout("Claude", &combined, false); }
-                for (name, input) in &tool_calls { print_tool_stdout(name, input); }
-                if !combined.is_empty() || !tool_calls.is_empty() { println!(); }
+                if !combined.is_empty() {
+                    print_role_stdout("Claude", &combined, false);
+                }
+                for (name, input) in &tool_calls {
+                    print_tool_stdout(name, input);
+                }
+                if !combined.is_empty() || !tool_calls.is_empty() {
+                    println!();
+                }
             }
             LogEntry::Summary { summary } => {
                 println!("{} {}\n", "Summary:".bold().cyan(), summary.cyan());
@@ -575,49 +706,20 @@ fn print_claude(path: &std::path::Path) -> Result<()> {
 fn print_codex(path: &std::path::Path) -> Result<()> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let empty_input = serde_json::Value::Null;
-    for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => continue };
-        if line.trim().is_empty() { continue; }
-        let codex_line: CodexLine = match serde_json::from_str(&line) { Ok(l) => l, Err(_) => continue };
-        match codex_line.line_type.as_str() {
-            "event_msg" => {
-                if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
-                    match evt.event_type.as_str() {
-                        "user_message" => {
-                            if let Some(msg) = &evt.message {
-                                if !msg.is_empty() { print_role_stdout("User", msg, true); }
-                            }
-                        }
-                        "agent_message" => {
-                            if let Some(msg) = &evt.message {
-                                if !msg.is_empty() { print_role_stdout("Codex", msg, false); }
-                            }
-                        }
-                        _ => {}
-                    }
+    for item in codex_items(&read_codex_lines(reader)) {
+        match item {
+            CodexItem::Message { role, text } => match role {
+                CodexRole::User => print_role_stdout("User", &text, true),
+                CodexRole::Assistant => print_role_stdout("Codex", &text, false),
+            },
+            CodexItem::ToolCall { name } => {
+                print_tool_stdout(&name, &serde_json::Value::Null);
+            }
+            CodexItem::ToolOutput { output } => {
+                if !output.is_empty() {
+                    print_tool_output_stdout(&output);
                 }
             }
-            "response_item" => {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(codex_line.payload) {
-                    match item.item_type.as_str() {
-                        "function_call" => {
-                            if let Some(name) = &item.name {
-                                print_tool_stdout(name, &empty_input);
-                            }
-                        }
-                        "function_call_output" => {
-                            if let Some(output) = &item.output {
-                                if !output.is_empty() {
-                                    print_tool_output_stdout(output);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -626,10 +728,17 @@ fn print_codex(path: &std::path::Path) -> Result<()> {
 fn print_role_stdout(role: &str, text: &str, is_user: bool) {
     use colored::{Colorize, CustomColor};
     let t = theme();
-    let (r, g, b) = if is_user { t.user_color } else { t.assistant_color };
+    let (r, g, b) = if is_user {
+        t.user_color
+    } else {
+        t.assistant_color
+    };
     let label = if is_user { "User" } else { role };
     let ledger_label = format!("{:>NAME_WIDTH$} │ ", label);
-    print!("{}", ledger_label.custom_color(CustomColor::new(r, g, b)).bold());
+    print!(
+        "{}",
+        ledger_label.custom_color(CustomColor::new(r, g, b)).bold()
+    );
     if is_user {
         let mut first = true;
         for line in text.lines() {
@@ -656,7 +765,11 @@ fn print_tool_stdout(name: &str, input: &serde_json::Value) {
     let (r, g, b) = t.tool_color;
     let summary = tool_call_summary(name, input);
     let gutter = format!("{:>NAME_WIDTH$} │ ", "");
-    println!("{}{}", gutter, format!("▸ {}", summary).custom_color(CustomColor::new(r, g, b)));
+    println!(
+        "{}{}",
+        gutter,
+        format!("▸ {}", summary).custom_color(CustomColor::new(r, g, b))
+    );
 }
 
 fn print_tool_output_stdout(output: &str) {
@@ -705,7 +818,11 @@ fn print_markdown_stdout(text: &str) {
                 heading = false;
                 if !line_buf.is_empty() {
                     let (r, g, b) = t.heading;
-                    println!("{}{}", gutter, line_buf.custom_color(CustomColor::new(r, g, b)).bold());
+                    println!(
+                        "{}{}",
+                        gutter,
+                        line_buf.custom_color(CustomColor::new(r, g, b)).bold()
+                    );
                     line_buf.clear();
                 }
             }
@@ -727,7 +844,11 @@ fn print_markdown_stdout(text: &str) {
                 } else {
                     let (r, g, b) = t.code_block_fg;
                     for line in code_buf.lines() {
-                        println!("{}  {}", gutter, line.custom_color(CustomColor::new(r, g, b)));
+                        println!(
+                            "{}  {}",
+                            gutter,
+                            line.custom_color(CustomColor::new(r, g, b))
+                        );
                     }
                 }
                 code_block = false;
@@ -771,7 +892,11 @@ fn print_markdown_stdout(text: &str) {
             }
             MdEvent::Code(code) => {
                 let (r, g, b) = t.code_inline;
-                line_buf.push_str(&format!("`{}`", code).custom_color(CustomColor::new(r, g, b)).to_string());
+                line_buf.push_str(
+                    &format!("`{}`", code)
+                        .custom_color(CustomColor::new(r, g, b))
+                        .to_string(),
+                );
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {
                 line_buf.push(' ');
@@ -800,7 +925,9 @@ fn truncate_tool_output(s: &str) -> String {
         }
     } else if first_line.len() > 120 {
         let mut end = 120;
-        while end > 0 && !first_line.is_char_boundary(end) { end -= 1; }
+        while end > 0 && !first_line.is_char_boundary(end) {
+            end -= 1;
+        }
         format!("{}...", &first_line[..end])
     } else {
         let line_count = s.lines().count();
@@ -811,15 +938,81 @@ fn truncate_tool_output(s: &str) -> String {
 fn tool_result_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(items) => {
-            items.iter().filter_map(|item| {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
                 if let serde_json::Value::Object(map) = item {
                     map.get("text").and_then(|v| v.as_str()).map(String::from)
                 } else if let serde_json::Value::String(s) = item {
                     Some(s.clone())
-                } else { None }
-            }).collect::<Vec<_>>().join("\n")
-        }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Local;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn make_jsonl(lines: &[&str]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+        f
+    }
+
+    fn codex_conversation(path: &std::path::Path) -> Conversation {
+        Conversation {
+            path: path.to_path_buf(),
+            source: SessionSource::Codex,
+            session_id: "test-session".to_string(),
+            timestamp: Local::now(),
+            preview: String::new(),
+            full_text: String::new(),
+            project_name: Some("project".to_string()),
+            cwd: None,
+            message_count: 0,
+            model: None,
+            total_tokens: 0,
+            duration_minutes: None,
+            summary: None,
+            custom_title: None,
+            git_branch: None,
+        }
+    }
+
+    fn plain_text(lines: &[StyledLine]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn viewer_renders_response_item_only_codex_messages() {
+        let file = make_jsonl(&[
+            r#"{"timestamp":"2026-03-19T14:29:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"What changed?"}]}}"#,
+            r#"{"timestamp":"2026-03-19T14:29:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Codex answer"}]}}"#,
+        ]);
+
+        let lines = build_session_lines(&codex_conversation(file.path())).unwrap();
+        let rendered = plain_text(&lines);
+
+        assert!(rendered.contains("What changed?"));
+        assert!(rendered.contains("Codex answer"));
     }
 }

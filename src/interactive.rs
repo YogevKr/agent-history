@@ -1,6 +1,8 @@
 //! fzf-like interactive session picker with in-TUI session viewer.
 
-use crate::display::{format_model_short, format_relative_time, get_display_title, short_id, truncate};
+use crate::display::{
+    format_model_short, format_relative_time, get_display_title, short_id, truncate,
+};
 use crate::history::{Conversation, SessionSource};
 use crate::search::{precompute_search_text, search, SearchableConversation};
 use crate::viewer::{self, Span, StyledLine};
@@ -63,48 +65,46 @@ fn main_loop(
 ) -> crate::error::Result<()> {
     loop {
         let idx = match picker_loop(stdout, conversations, searchable, state) {
-            PickerAction::ViewSession(idx) => {
-                match pager_loop(stdout, &conversations[idx])? {
-                    PagerAction::Back => continue,
-                    PagerAction::CopyId => idx,
-                    PagerAction::Resume => {
-                        let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
-                        let _ = terminal::disable_raw_mode();
-                        return crate::resume::resume_session(&conversations[idx]);
-                    }
-                    PagerAction::CopyConversation => {
-                        match crate::export::to_markdown(&conversations[idx]) {
-                            Ok(md) => {
-                                if crate::export::copy_to_clipboard(&md).is_ok() {
-                                    state.flash = Some("Copied conversation to clipboard".to_string());
-                                } else {
-                                    state.flash = Some("Failed to copy to clipboard".to_string());
-                                }
-                            }
-                            Err(_) => {
-                                state.flash = Some("Failed to export conversation".to_string());
-                            }
-                        }
-                        continue;
-                    }
-                    PagerAction::ExportFile => {
-                        match crate::export::to_markdown(&conversations[idx]) {
-                            Ok(md) => match crate::export::export_to_file(&conversations[idx], &md) {
-                                Ok(filename) => {
-                                    state.flash = Some(format!("Exported to ./{}", filename));
-                                }
-                                Err(_) => {
-                                    state.flash = Some("Failed to write file".to_string());
-                                }
-                            },
-                            Err(_) => {
-                                state.flash = Some("Failed to export conversation".to_string());
-                            }
-                        }
-                        continue;
-                    }
+            PickerAction::ViewSession(idx) => match pager_loop(stdout, &conversations[idx])? {
+                PagerAction::Back => continue,
+                PagerAction::CopyId => idx,
+                PagerAction::Resume => {
+                    let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
+                    let _ = terminal::disable_raw_mode();
+                    return crate::resume::resume_session(&conversations[idx]);
                 }
-            }
+                PagerAction::CopyConversation => {
+                    match crate::export::to_markdown(&conversations[idx]) {
+                        Ok(md) => {
+                            if crate::export::copy_to_clipboard(&md).is_ok() {
+                                state.flash = Some("Copied conversation to clipboard".to_string());
+                            } else {
+                                state.flash = Some("Failed to copy to clipboard".to_string());
+                            }
+                        }
+                        Err(_) => {
+                            state.flash = Some("Failed to export conversation".to_string());
+                        }
+                    }
+                    continue;
+                }
+                PagerAction::ExportFile => {
+                    match crate::export::to_markdown(&conversations[idx]) {
+                        Ok(md) => match crate::export::export_to_file(&conversations[idx], &md) {
+                            Ok(filename) => {
+                                state.flash = Some(format!("Exported to ./{}", filename));
+                            }
+                            Err(_) => {
+                                state.flash = Some("Failed to write file".to_string());
+                            }
+                        },
+                        Err(_) => {
+                            state.flash = Some("Failed to export conversation".to_string());
+                        }
+                    }
+                    continue;
+                }
+            },
             PickerAction::CopyId(idx) => idx,
             PickerAction::ResumeSession(idx) => {
                 let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
@@ -135,7 +135,14 @@ fn picker_loop(
     state: &mut PickerState,
 ) -> PickerAction {
     loop {
-        if let Err(_) = draw_picker(stdout, conversations, &state.filtered_indices, &state.query, state.selected, state.flash.as_deref()) {
+        if let Err(_) = draw_picker(
+            stdout,
+            conversations,
+            &state.filtered_indices,
+            &state.query,
+            state.selected,
+            state.flash.as_deref(),
+        ) {
             return PickerAction::Quit;
         }
         state.flash = None;
@@ -151,45 +158,80 @@ fn picker_loop(
         }
 
         match evt {
-            Event::Key(KeyEvent { code: KeyCode::Esc, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
                 return PickerAction::Quit;
             }
-            Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }) => {
                 if !state.filtered_indices.is_empty() {
                     let idx = state.filtered_indices[state.selected];
                     return PickerAction::ViewSession(idx);
                 }
             }
-            Event::Key(KeyEvent { code: KeyCode::Up, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('k'), modifiers: KeyModifiers::CONTROL, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
                 if state.selected > 0 {
                     state.selected -= 1;
                 }
             }
-            Event::Key(KeyEvent { code: KeyCode::Down, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('j'), modifiers: KeyModifiers::CONTROL, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
                 if state.selected + 1 < state.filtered_indices.len() {
                     state.selected += 1;
                 }
             }
-            Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
                 state.query.pop();
                 refilter(conversations, searchable, state);
             }
-            Event::Key(KeyEvent { code: KeyCode::Left, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }) => {
                 if !state.filtered_indices.is_empty() {
                     let idx = state.filtered_indices[state.selected];
                     return PickerAction::CopyId(idx);
                 }
             }
-            Event::Key(KeyEvent { code: KeyCode::Right, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }) => {
                 if !state.filtered_indices.is_empty() {
                     let idx = state.filtered_indices[state.selected];
                     return PickerAction::ResumeSession(idx);
                 }
             }
-            Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            }) => {
                 if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT {
                     state.query.push(c);
                     refilter(conversations, searchable, state);
@@ -227,7 +269,11 @@ fn draw_picker(
     let cols = cols as usize;
     let rows = rows as usize;
 
-    execute!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+    execute!(
+        stdout,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(ClearType::All)
+    )?;
 
     // Line 0: search prompt
     execute!(
@@ -369,11 +415,15 @@ fn draw_session_line(
         execute!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    let clean_preview: String = preview.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let clean_preview: String = preview
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     execute!(stdout, Print(format!("\"{}\"", clean_preview)))?;
 
     if is_selected {
-        let line_so_far = 1 + 8 + 1 + 5 + 2 + 20 + 2 + model_display.len() + 2 + 8 + 1 + clean_preview.len() + 2;
+        let line_so_far =
+            1 + 8 + 1 + 5 + 2 + 20 + 2 + model_display.len() + 2 + 8 + 1 + clean_preview.len() + 2;
         let padding = max_width.saturating_sub(line_so_far);
         if padding > 0 {
             execute!(stdout, Print(" ".repeat(padding)))?;
@@ -384,9 +434,7 @@ fn draw_session_line(
 }
 
 fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()?;
+    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(text.as_bytes())?;
     }
@@ -404,10 +452,7 @@ enum PagerAction {
     ExportFile,
 }
 
-fn pager_loop(
-    stdout: &mut io::Stdout,
-    conv: &Conversation,
-) -> crate::error::Result<PagerAction> {
+fn pager_loop(stdout: &mut io::Stdout, conv: &Conversation) -> crate::error::Result<PagerAction> {
     let mut lines = viewer::build_session_lines(conv)?;
     let (_, rows) = terminal::size().unwrap_or((80, 24));
     let visible = (rows as usize).saturating_sub(1);
@@ -434,33 +479,69 @@ fn pager_loop(
 
         match evt {
             // Back to list
-            Event::Key(KeyEvent { code: KeyCode::Esc, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
                 return Ok(PagerAction::Back);
             }
-            Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
                 return Ok(PagerAction::Back);
             }
             // Copy full conversation to clipboard (Shift-Y) — must be before lowercase y
-            Event::Key(KeyEvent { code: KeyCode::Char('Y'), .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::SHIFT, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('Y'),
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            }) => {
                 return Ok(PagerAction::CopyConversation);
             }
             // Copy session ID
-            Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::NONE, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
                 return Ok(PagerAction::CopyId);
             }
             // Export conversation to file
-            Event::Key(KeyEvent { code: KeyCode::Char('e'), modifiers: KeyModifiers::NONE, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
                 return Ok(PagerAction::ExportFile);
             }
             // Resume session
-            Event::Key(KeyEvent { code: KeyCode::Char('o'), modifiers: KeyModifiers::NONE, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
                 return Ok(PagerAction::Resume);
             }
             // Refresh
-            Event::Key(KeyEvent { code: KeyCode::Char('r'), modifiers: KeyModifiers::NONE, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
                 let old_len = lines.len();
                 lines = viewer::build_session_lines(conv)?;
                 // If new content appeared and we were at the bottom, follow the tail
@@ -473,30 +554,78 @@ fn pager_loop(
                 }
             }
             // Scroll
-            Event::Key(KeyEvent { code: KeyCode::Up, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('k'), modifiers: KeyModifiers::NONE, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
                 scroll = scroll.saturating_sub(1);
             }
-            Event::Key(KeyEvent { code: KeyCode::Down, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('j'), modifiers: KeyModifiers::NONE, .. }) => {
-                if scroll < max_scroll { scroll += 1; }
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
+                if scroll < max_scroll {
+                    scroll += 1;
+                }
             }
-            Event::Key(KeyEvent { code: KeyCode::PageUp, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('u'), modifiers: KeyModifiers::CONTROL, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
                 scroll = scroll.saturating_sub(visible / 2);
             }
-            Event::Key(KeyEvent { code: KeyCode::PageDown, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('d'), modifiers: KeyModifiers::CONTROL, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char(' '), .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char(' '),
+                ..
+            }) => {
                 scroll = (scroll + visible / 2).min(max_scroll);
             }
-            Event::Key(KeyEvent { code: KeyCode::Home, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('g'), modifiers: KeyModifiers::NONE, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Home,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
                 scroll = 0;
             }
-            Event::Key(KeyEvent { code: KeyCode::End, .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('G'), .. })
-            | Event::Key(KeyEvent { code: KeyCode::Char('g'), modifiers: KeyModifiers::SHIFT, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::End, ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('G'),
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            }) => {
                 scroll = max_scroll;
             }
             _ => {}
@@ -515,7 +644,11 @@ fn draw_pager(
     let rows = rows as usize;
     let content_rows = rows.saturating_sub(1); // reserve last row for status
 
-    execute!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+    execute!(
+        stdout,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(ClearType::All)
+    )?;
 
     for i in 0..content_rows {
         let line_idx = scroll + i;
@@ -538,7 +671,10 @@ fn draw_pager(
     let age = format_relative_time(conv.timestamp);
     let sid = short_id(&conv.session_id);
     let left = format!(" {} ({}) {} {}", project, model, age, sid);
-    let right = format!("jk/\u{2191}\u{2193}  g/G  y:id Y:copy e:export  o:resume  r:refresh  q:back  {}% ", progress);
+    let right = format!(
+        "jk/\u{2191}\u{2193}  g/G  y:id Y:copy e:export  o:resume  r:refresh  q:back  {}% ",
+        progress
+    );
     let gap = cols.saturating_sub(left.len() + right.len());
     let status = format!("{}{}{}", left, " ".repeat(gap), right);
     execute!(
@@ -553,7 +689,11 @@ fn draw_pager(
     Ok(())
 }
 
-fn render_styled_line(stdout: &mut io::Stdout, spans: &[Span], _max_width: usize) -> io::Result<()> {
+fn render_styled_line(
+    stdout: &mut io::Stdout,
+    spans: &[Span],
+    _max_width: usize,
+) -> io::Result<()> {
     for span in spans {
         if span.bold {
             execute!(stdout, SetAttribute(Attribute::Bold))?;
