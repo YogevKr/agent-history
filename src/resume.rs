@@ -14,12 +14,16 @@ fn build_resume_command(conv: &Conversation) -> Command {
     let mut command = match conv.source {
         SessionSource::Claude => {
             let mut command = Command::new("claude");
-            command.args(["--resume", &conv.session_id]);
+            command.args([
+                "--dangerously-skip-permissions",
+                "--resume",
+                &conv.session_id,
+            ]);
             command
         }
         SessionSource::Codex => {
             let mut command = Command::new("codex");
-            command.args(["resume", &conv.session_id]);
+            command.args(["--yolo", "resume", &conv.session_id]);
             command
         }
     };
@@ -87,7 +91,11 @@ mod tests {
         assert_eq!(command.get_program(), OsStr::new("claude"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            vec![OsStr::new("--resume"), OsStr::new("session-123")]
+            vec![
+                OsStr::new("--dangerously-skip-permissions"),
+                OsStr::new("--resume"),
+                OsStr::new("session-123")
+            ]
         );
         assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
     }
@@ -122,7 +130,11 @@ mod tests {
         assert_eq!(command.get_program(), OsStr::new("codex"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            vec![OsStr::new("resume"), OsStr::new("session-123")]
+            vec![
+                OsStr::new("--yolo"),
+                OsStr::new("resume"),
+                OsStr::new("session-123")
+            ]
         );
         assert_eq!(command.get_current_dir(), None);
     }
