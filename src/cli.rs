@@ -33,11 +33,11 @@ pub struct Cli {
     #[arg(long)]
     pub list: bool,
 
-    /// Show full session content
+    /// Show full session content by full ID or unique prefix
     #[arg(long)]
     pub show: Option<String>,
 
-    /// Resume session in its CLI
+    /// Resume session in its CLI by full ID or unique prefix
     #[arg(long)]
     pub resume: Option<String>,
 

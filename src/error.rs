@@ -17,6 +17,9 @@ pub enum AppError {
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
+    #[error("Session id prefix is ambiguous: {0} (use more characters)")]
+    SessionIdAmbiguous(String),
+
     #[error("Failed to execute CLI: {0}")]
     CliExecutionError(String),
 }

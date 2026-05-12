@@ -55,18 +55,14 @@ fn run_inner() -> error::Result<()> {
 
     // Handle --show
     if let Some(ref id) = args.show {
-        if let Some(conv) = conversations.iter().find(|c| c.session_id == *id) {
-            return viewer::review_session(conv);
-        }
-        return Err(error::AppError::SessionNotFound(id.clone()));
+        let conv = resolve_session(&conversations, id)?;
+        return viewer::review_session(conv);
     }
 
     // Handle --resume
     if let Some(ref id) = args.resume {
-        if let Some(conv) = conversations.iter().find(|c| c.session_id == *id) {
-            return resume::resume_session(conv);
-        }
-        return Err(error::AppError::SessionNotFound(id.clone()));
+        let conv = resolve_session(&conversations, id)?;
+        return resume::resume_session(conv);
     }
 
     // Apply filters
@@ -153,4 +149,103 @@ fn apply_filters(conversations: Vec<Conversation>, args: &Cli) -> Vec<Conversati
             true
         })
         .collect()
+}
+
+fn resolve_session<'a>(
+    conversations: &'a [Conversation],
+    id_or_prefix: &str,
+) -> error::Result<&'a Conversation> {
+    let id_or_prefix = id_or_prefix.trim();
+    if id_or_prefix.is_empty() {
+        return Err(error::AppError::SessionNotFound(id_or_prefix.to_string()));
+    }
+
+    if let Some(conv) = conversations
+        .iter()
+        .find(|conv| conv.session_id == id_or_prefix)
+    {
+        return Ok(conv);
+    }
+
+    let mut matches = conversations
+        .iter()
+        .filter(|conv| conv.session_id.starts_with(id_or_prefix));
+
+    match (matches.next(), matches.next()) {
+        (Some(conv), None) => Ok(conv),
+        (None, _) => Err(error::AppError::SessionNotFound(id_or_prefix.to_string())),
+        (Some(_), Some(_)) => Err(error::AppError::SessionIdAmbiguous(
+            id_or_prefix.to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Local;
+    use std::path::PathBuf;
+
+    fn conversation(session_id: &str) -> Conversation {
+        Conversation {
+            path: PathBuf::from(format!("{session_id}.jsonl")),
+            source: SessionSource::Codex,
+            session_id: session_id.to_string(),
+            timestamp: Local::now(),
+            preview: String::new(),
+            full_text: String::new(),
+            project_name: None,
+            cwd: None,
+            message_count: 0,
+            model: None,
+            total_tokens: 0,
+            duration_minutes: None,
+            summary: None,
+            custom_title: None,
+            git_branch: None,
+        }
+    }
+
+    #[test]
+    fn resolve_session_accepts_exact_id() {
+        let conversations = vec![conversation("abc12345-full")];
+
+        let resolved = resolve_session(&conversations, "abc12345-full").unwrap();
+
+        assert_eq!(resolved.session_id, "abc12345-full");
+    }
+
+    #[test]
+    fn resolve_session_accepts_unique_short_prefix() {
+        let conversations = vec![conversation("abc12345-full"), conversation("def67890-full")];
+
+        let resolved = resolve_session(&conversations, "abc12345").unwrap();
+
+        assert_eq!(resolved.session_id, "abc12345-full");
+    }
+
+    #[test]
+    fn resolve_session_rejects_missing_prefix() {
+        let conversations = vec![conversation("abc12345-full")];
+
+        match resolve_session(&conversations, "missing") {
+            Err(error::AppError::SessionNotFound(id)) => assert_eq!(id, "missing"),
+            Err(err) => panic!("unexpected error: {err}"),
+            Ok(conv) => panic!("unexpected session: {}", conv.session_id),
+        }
+    }
+
+    #[test]
+    fn resolve_session_rejects_ambiguous_prefix() {
+        let conversations = vec![
+            conversation("abc12345-full"),
+            conversation("abc12345-other"),
+        ];
+
+        match resolve_session(&conversations, "abc12345") {
+            Err(error::AppError::SessionIdAmbiguous(id)) => assert_eq!(id, "abc12345"),
+            Err(err) => panic!("unexpected error: {err}"),
+            Ok(conv) => panic!("unexpected session: {}", conv.session_id),
+        }
+    }
 }

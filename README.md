@@ -40,11 +40,11 @@ agent-history "auth flow"
 # Filter by source, project, or time
 agent-history --source claude --project my-app --since 7d
 
-# Show a specific session (non-interactive)
-agent-history --show <session-id>
+# Show a specific session (non-interactive; full ID or unique prefix)
+agent-history --show <session-id-or-prefix>
 
-# Resume a session in its CLI
-agent-history --resume <session-id>
+# Resume a session in its CLI (full ID or unique prefix)
+agent-history --resume <session-id-or-prefix>
 
 # Only sessions from current directory
 agent-history --local
