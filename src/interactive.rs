@@ -15,6 +15,7 @@ use crossterm::{
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{self, ClearType},
 };
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
@@ -27,10 +28,19 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
 
     let searchable = precompute_search_text(&conversations);
 
+    let expanded_tree_roots = HashSet::new();
+    let filtered_indices = collapse_visible_indices(
+        &conversations,
+        (0..conversations.len()).collect(),
+        &expanded_tree_roots,
+        true,
+    );
+
     let mut state = PickerState {
         query: String::new(),
         selected: 0,
-        filtered_indices: (0..conversations.len()).collect(),
+        filtered_indices,
+        expanded_tree_roots,
         flash: None,
     };
 
@@ -55,6 +65,7 @@ struct PickerState {
     query: String,
     selected: usize,
     filtered_indices: Vec<usize>,
+    expanded_tree_roots: HashSet<String>,
     flash: Option<String>,
 }
 
@@ -141,6 +152,7 @@ fn picker_loop(
             conversations,
             &state.filtered_indices,
             &state.query,
+            &state.expanded_tree_roots,
             state.selected,
             state.flash.as_deref(),
         ) {
@@ -211,6 +223,11 @@ fn picker_loop(
                 refilter(conversations, searchable, state);
             }
             Event::Key(KeyEvent {
+                code: KeyCode::Tab, ..
+            }) => {
+                toggle_tree_expansion(conversations, searchable, state);
+            }
+            Event::Key(KeyEvent {
                 code: KeyCode::Left,
                 ..
             }) => {
@@ -248,14 +265,108 @@ fn refilter(
     searchable: &[SearchableConversation],
     state: &mut PickerState,
 ) {
-    if state.query.is_empty() {
-        state.filtered_indices = (0..conversations.len()).collect();
+    let base_indices = if state.query.is_empty() {
+        (0..conversations.len()).collect()
     } else {
-        state.filtered_indices = search(conversations, searchable, &state.query, Local::now());
-    }
+        search(conversations, searchable, &state.query, Local::now())
+    };
+    state.filtered_indices = collapse_visible_indices(
+        conversations,
+        base_indices,
+        &state.expanded_tree_roots,
+        state.query.is_empty(),
+    );
     if state.selected >= state.filtered_indices.len() {
         state.selected = state.filtered_indices.len().saturating_sub(1);
     }
+}
+
+fn toggle_tree_expansion(
+    conversations: &[Conversation],
+    searchable: &[SearchableConversation],
+    state: &mut PickerState,
+) {
+    if state.filtered_indices.is_empty() {
+        return;
+    }
+
+    let selected_index = state.filtered_indices[state.selected];
+    let Some(root_id) = tree_root_id(conversations, selected_index) else {
+        state.flash = Some("No tree on this row".to_string());
+        return;
+    };
+
+    if !state.expanded_tree_roots.remove(&root_id) {
+        state.expanded_tree_roots.insert(root_id.clone());
+    }
+
+    let selected_session_id = conversations[selected_index].session_id.clone();
+    refilter(conversations, searchable, state);
+
+    if let Some(position) = state
+        .filtered_indices
+        .iter()
+        .position(|idx| conversations[*idx].session_id == selected_session_id)
+    {
+        state.selected = position;
+    } else if let Some(position) = state
+        .filtered_indices
+        .iter()
+        .position(|idx| conversations[*idx].session_id == root_id)
+    {
+        state.selected = position;
+    }
+}
+
+fn tree_root_id(conversations: &[Conversation], index: usize) -> Option<String> {
+    let conversation = conversations.get(index)?;
+    if conversation.hierarchy_depth == 0 {
+        return conversation
+            .hierarchy_has_children
+            .then(|| conversation.session_id.clone());
+    }
+
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        let candidate = &conversations[cursor];
+        if candidate.hierarchy_depth == 0 {
+            return candidate
+                .hierarchy_has_children
+                .then(|| candidate.session_id.clone());
+        }
+    }
+
+    None
+}
+
+fn collapse_visible_indices(
+    conversations: &[Conversation],
+    base_indices: Vec<usize>,
+    expanded_tree_roots: &HashSet<String>,
+    collapse_enabled: bool,
+) -> Vec<usize> {
+    if !collapse_enabled {
+        return base_indices;
+    }
+
+    let mut visible = Vec::with_capacity(base_indices.len());
+    let mut current_tree_expanded = false;
+    let mut current_tree_root = false;
+
+    for index in base_indices {
+        let conversation = &conversations[index];
+        if conversation.hierarchy_depth == 0 {
+            current_tree_root = conversation.hierarchy_has_children;
+            current_tree_expanded =
+                current_tree_root && expanded_tree_roots.contains(&conversation.session_id);
+            visible.push(index);
+        } else if current_tree_expanded || !current_tree_root {
+            visible.push(index);
+        }
+    }
+
+    visible
 }
 
 fn draw_picker(
@@ -263,6 +374,7 @@ fn draw_picker(
     conversations: &[Conversation],
     filtered_indices: &[usize],
     query: &str,
+    expanded_tree_roots: &HashSet<String>,
     selected: usize,
     flash: Option<&str>,
 ) -> io::Result<()> {
@@ -288,7 +400,7 @@ fn draw_picker(
 
     // Line 1: match count + hint + flash
     let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
-    let hint = "  \u{2190}: copy ID  \u{2192}: resume";
+    let hint = "  Tab: expand/collapse  \u{2190}: copy ID  \u{2192}: resume";
     let flash_text = flash.unwrap_or("");
     let gap = cols.saturating_sub(count.len() + hint.len() + flash_text.len() + 2);
     execute!(
@@ -333,7 +445,14 @@ fn draw_picker(
             execute!(stdout, SetAttribute(Attribute::Reverse))?;
         }
 
-        draw_session_line(stdout, conv, cols, is_selected)?;
+        draw_session_line(
+            stdout,
+            conv,
+            cols,
+            is_selected,
+            expanded_tree_roots,
+            query.is_empty(),
+        )?;
 
         if is_selected {
             execute!(stdout, SetAttribute(Attribute::NoReverse))?;
@@ -350,6 +469,8 @@ fn draw_session_line(
     conv: &Conversation,
     max_width: usize,
     is_selected: bool,
+    expanded_tree_roots: &HashSet<String>,
+    collapse_enabled: bool,
 ) -> io::Result<()> {
     let source_tag = match conv.source {
         SessionSource::Claude => "claude",
@@ -361,7 +482,7 @@ fn draw_session_line(
     };
 
     let age = format_relative_time(conv.timestamp);
-    let hierarchy = format_hierarchy_marker(conv);
+    let hierarchy = picker_hierarchy_marker(conv, expanded_tree_roots, collapse_enabled);
     let project = format_project_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
@@ -462,6 +583,22 @@ fn draw_session_line(
     Ok(())
 }
 
+fn picker_hierarchy_marker(
+    conv: &Conversation,
+    expanded_tree_roots: &HashSet<String>,
+    collapse_enabled: bool,
+) -> String {
+    if collapse_enabled && conv.hierarchy_depth == 0 && conv.hierarchy_has_children {
+        if expanded_tree_roots.contains(&conv.session_id) {
+            "▾─".to_string()
+        } else {
+            "▸─".to_string()
+        }
+    } else {
+        format_hierarchy_marker(conv)
+    }
+}
+
 fn copy_to_clipboard(text: &str) -> io::Result<()> {
     let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -469,6 +606,108 @@ fn copy_to_clipboard(text: &str) -> io::Result<()> {
     }
     child.wait()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Local;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn conversation(session_id: &str, depth: usize, has_children: bool) -> Conversation {
+        Conversation {
+            path: PathBuf::from(format!("{session_id}.jsonl")),
+            source: SessionSource::Codex,
+            session_id: session_id.to_string(),
+            timestamp: Local::now(),
+            preview: session_id.to_string(),
+            full_text: String::new(),
+            project_name: Some("project".to_string()),
+            cwd: None,
+            message_count: 1,
+            model: Some("gpt-5.5".to_string()),
+            total_tokens: 0,
+            duration_minutes: None,
+            summary: None,
+            custom_title: None,
+            git_branch: None,
+            subagent_name: (depth > 0).then(|| session_id.to_string()),
+            hierarchy_has_children: has_children,
+            hierarchy_has_next_sibling: false,
+            hierarchy_marker: None,
+            hierarchy_depth: depth,
+            hierarchy_order: 0,
+            hierarchy_sort_timestamp: Local::now(),
+        }
+    }
+
+    #[test]
+    fn collapses_tree_rows_by_default() {
+        let conversations = vec![
+            conversation("root", 0, true),
+            conversation("child", 1, false),
+            conversation("grandchild", 2, false),
+            conversation("plain", 0, false),
+        ];
+        let base_indices = vec![0, 1, 2, 3];
+        let expanded = HashSet::new();
+
+        let visible = collapse_visible_indices(&conversations, base_indices, &expanded, true);
+
+        assert_eq!(visible, vec![0, 3]);
+    }
+
+    #[test]
+    fn expanded_tree_rows_show_descendants() {
+        let conversations = vec![
+            conversation("root", 0, true),
+            conversation("child", 1, false),
+            conversation("grandchild", 2, false),
+            conversation("plain", 0, false),
+        ];
+        let base_indices = vec![0, 1, 2, 3];
+        let expanded = HashSet::from(["root".to_string()]);
+
+        let visible = collapse_visible_indices(&conversations, base_indices, &expanded, true);
+
+        assert_eq!(visible, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn search_results_ignore_collapsed_tree_state() {
+        let conversations = vec![
+            conversation("root", 0, true),
+            conversation("child", 1, false),
+        ];
+        let base_indices = vec![1];
+        let expanded = HashSet::new();
+
+        let visible = collapse_visible_indices(&conversations, base_indices, &expanded, false);
+
+        assert_eq!(visible, vec![1]);
+    }
+
+    #[test]
+    fn picker_hierarchy_marker_marks_collapsed_and_expanded_roots() {
+        let root = conversation("root", 0, true);
+        let child = conversation("child", 1, false);
+        let collapsed = HashSet::new();
+        let expanded = HashSet::from(["root".to_string()]);
+
+        assert_eq!(
+            picker_hierarchy_marker(&root, &collapsed, true),
+            "▸─".to_string()
+        );
+        assert_eq!(
+            picker_hierarchy_marker(&root, &expanded, true),
+            "▾─".to_string()
+        );
+        assert_eq!(
+            picker_hierarchy_marker(&child, &collapsed, true),
+            format_hierarchy_marker(&child)
+        );
+    }
 }
 
 // ── Pager (session viewer) ────────────────────────────
