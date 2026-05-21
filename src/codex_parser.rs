@@ -46,6 +46,22 @@ fn append_text(full_text: &mut String, text: &str) {
     }
 }
 
+fn subagent_dispatch_content(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let content = value.get("content")?.as_str()?.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    let recipient = value.get("recipient").and_then(|value| value.as_str());
+    let trigger_turn = value.get("trigger_turn").and_then(|value| value.as_bool());
+    if recipient.is_none() && trigger_turn != Some(true) {
+        return None;
+    }
+
+    Some(content.to_string())
+}
+
 /// Process a single Codex JSONL session file into a Conversation.
 pub fn process_codex_file(
     path: PathBuf,
@@ -132,7 +148,14 @@ pub fn process_codex_file(
                         }
                         "User: "
                     }
-                    CodexRole::Assistant => "Assistant: ",
+                    CodexRole::Assistant => {
+                        if preview.is_empty() {
+                            if let Some(content) = subagent_dispatch_content(&text) {
+                                preview = content.chars().take(200).collect();
+                            }
+                        }
+                        "Assistant: "
+                    }
                 };
                 append_text(&mut full_text, label);
                 append_text(&mut full_text, &text);
@@ -305,6 +328,25 @@ mod tests {
         assert!(!conv.full_text.contains("system prompt"));
         // 2 messages (user + assistant content parts)
         assert_eq!(conv.message_count, 2);
+    }
+
+    #[test]
+    fn subagent_dispatch_envelope_sets_preview_when_user_context_is_stripped() {
+        let lines = &[
+            r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"subagent-session","cwd":"/tmp/project","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","agent_nickname":"Hypatia"}}},"thread_source":"subagent","agent_nickname":"Hypatia"}}"#,
+            r##"{"timestamp":"2026-05-21T14:24:34Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nignore this context\n</INSTRUCTIONS>"}]}}"##,
+            r#"{"timestamp":"2026-05-21T14:24:35Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"author\":\"/root\",\"recipient\":\"/root/review_compaction_fix\",\"other_recipients\":[],\"content\":\"Review the local unstaged diff for compaction correctness.\",\"trigger_turn\":true}"}]}}"#,
+            r#"{"timestamp":"2026-05-21T14:24:36Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"No actionable findings."}]}}"#,
+        ];
+        let f = make_jsonl(lines);
+        let conv = process_codex_file(f.path().to_path_buf(), None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            conv.preview,
+            "Review the local unstaged diff for compaction correctness."
+        );
     }
 
     #[test]
