@@ -1,8 +1,8 @@
 //! fzf-like interactive session picker with in-TUI session viewer.
 
 use crate::display::{
-    format_model_short, format_project_label, format_relative_time, get_display_title, short_id,
-    truncate,
+    format_hierarchy_marker, format_model_short, format_project_label, format_relative_time,
+    get_display_title, short_id, truncate,
 };
 use crate::history::{Conversation, SessionSource};
 use crate::search::{precompute_search_text, search, SearchableConversation};
@@ -361,14 +361,15 @@ fn draw_session_line(
     };
 
     let age = format_relative_time(conv.timestamp);
+    let hierarchy = format_hierarchy_marker(conv);
     let project = format_project_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
     let sid = short_id(&conv.session_id);
 
     let model_display = format!("({:<12})", model);
-    // fixed columns: " " + 8 (source) + " " + 5 (age) + "  " + 20 (project) + "  " + 14 (model) + "  " + 8 (sid) + " " + 2 (quotes)
-    let fixed_len = 1 + 8 + 1 + 5 + 2 + 20 + 2 + model_display.len() + 2 + 8 + 1 + 2;
+    // fixed columns: " " + 8 (source) + " " + 5 (age) + "  " + 2 (hierarchy) + 20 (project) + "  " + 14 (model) + "  " + 8 (sid) + " " + 2 (quotes)
+    let fixed_len = 1 + 8 + 1 + 5 + 2 + 2 + 20 + 2 + model_display.len() + 2 + 8 + 1 + 2;
     let preview_max = max_width.saturating_sub(fixed_len);
     let preview = truncate(&title, preview_max.max(10));
 
@@ -384,6 +385,16 @@ fn draw_session_line(
     }
 
     execute!(stdout, Print(format!(" {:>5}  ", age)))?;
+
+    execute!(
+        stdout,
+        SetForegroundColor(Color::Cyan),
+        Print(format!("{} ", hierarchy)),
+        ResetColor,
+    )?;
+    if is_selected {
+        execute!(stdout, SetAttribute(Attribute::Reverse))?;
+    }
 
     let proj_display: String = project.chars().take(20).collect();
     execute!(

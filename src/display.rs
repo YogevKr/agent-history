@@ -14,28 +14,39 @@ pub fn format_result(conv: &Conversation) -> String {
         SessionSource::Codex => "[codex]".green().to_string(),
     };
     let age = format_relative_time(conv.timestamp);
+    let hierarchy = format_hierarchy_marker(conv);
     let project = format_project_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
     let preview = truncate(&title, 60);
     let sid = short_id(&conv.session_id).dimmed();
     format!(
-        " {} {:>6}  {:<20}  ({})  {}  \"{}\"",
-        source_tag, age, project, model, sid, preview
+        " {} {:>6}  {} {:<20}  ({})  {}  \"{}\"",
+        source_tag, age, hierarchy, project, model, sid, preview
     )
 }
 
 pub fn format_project_label(conv: &Conversation) -> String {
     if let Some(subagent_name) = conv.subagent_name.as_deref() {
-        return format!("└─ {}", subagent_name);
+        return subagent_name.to_string();
     }
 
-    let project = conv.project_name.as_deref().unwrap_or("unknown");
+    conv.project_name
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+pub fn format_hierarchy_marker(conv: &Conversation) -> &'static str {
+    if conv.subagent_name.is_some() {
+        return "└";
+    }
+
     if conv.hierarchy_has_children {
-        return format!("┬─ {}", project);
+        return "├";
     }
 
-    project.to_string()
+    " "
 }
 
 pub fn format_relative_time(timestamp: DateTime<Local>) -> String {
@@ -179,13 +190,13 @@ mod tests {
     fn format_result_labels_parent_rows_with_children() {
         let rendered = format_result(&parent_conversation());
 
-        assert!(rendered.contains("┬─ project"));
+        assert!(rendered.contains("├ project"));
     }
 
     #[test]
     fn format_result_labels_subagent_rows() {
         let rendered = format_result(&conversation());
 
-        assert!(rendered.contains("└─ review"));
+        assert!(rendered.contains("└ review"));
     }
 }
