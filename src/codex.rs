@@ -33,6 +33,8 @@ pub struct GitInfo {
 #[derive(Debug, Deserialize)]
 pub struct TurnContext {
     #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
@@ -42,6 +44,8 @@ pub struct TurnContext {
 pub struct EventMsg {
     #[serde(rename = "type")]
     pub event_type: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
