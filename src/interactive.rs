@@ -800,12 +800,14 @@ mod tests {
             pager_key_action(
                 &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
                 false,
+                false,
             ),
             PagerKeyAction::NextMatch
         );
         assert_eq!(
             pager_key_action(
                 &Event::Key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+                false,
                 false,
             ),
             PagerKeyAction::PreviousMatch
@@ -814,8 +816,37 @@ mod tests {
             pager_key_action(
                 &Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
                 false,
+                false,
             ),
             PagerKeyAction::StartSearch
+        );
+    }
+
+    #[test]
+    fn pager_arrows_move_between_matches_when_search_is_active() {
+        assert_eq!(
+            pager_key_action(
+                &Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                false,
+                true,
+            ),
+            PagerKeyAction::NextMatch
+        );
+        assert_eq!(
+            pager_key_action(
+                &Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                false,
+                true,
+            ),
+            PagerKeyAction::PreviousMatch
+        );
+        assert_eq!(
+            pager_key_action(
+                &Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                false,
+                true,
+            ),
+            PagerKeyAction::MoveDown
         );
     }
 
@@ -931,7 +962,11 @@ enum PagerKeyAction {
     Ignore,
 }
 
-fn pager_key_action(evt: &Event, search_input_mode: bool) -> PagerKeyAction {
+fn pager_key_action(
+    evt: &Event,
+    search_input_mode: bool,
+    search_has_matches: bool,
+) -> PagerKeyAction {
     let Event::Key(key) = evt else {
         return PagerKeyAction::Ignore;
     };
@@ -1030,6 +1065,13 @@ fn pager_key_action(evt: &Event, search_input_mode: bool) -> PagerKeyAction {
             modifiers: KeyModifiers::NONE,
             ..
         } => PagerKeyAction::StartSearch,
+        KeyEvent {
+            code: KeyCode::Up, ..
+        } if search_has_matches => PagerKeyAction::PreviousMatch,
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        } if search_has_matches => PagerKeyAction::NextMatch,
         KeyEvent {
             code: KeyCode::Up, ..
         }
@@ -1190,7 +1232,11 @@ fn pager_loop(
         let visible = (rows as usize).saturating_sub(1); // reserve 1 for status bar
         let max_scroll = lines.len().saturating_sub(visible);
 
-        match pager_key_action(&evt, search_input_mode) {
+        let search_has_matches = search
+            .as_ref()
+            .is_some_and(|search| !search.matches.is_empty());
+
+        match pager_key_action(&evt, search_input_mode, search_has_matches) {
             PagerKeyAction::Back => return Ok(PagerAction::Back),
             PagerKeyAction::CopyConversation => return Ok(PagerAction::CopyConversation),
             PagerKeyAction::CopyId => return Ok(PagerAction::CopyId),
@@ -1326,11 +1372,11 @@ fn draw_pager(
         format!(" /{} ", search_query)
     } else {
         search
-            .map(|search| format!(" n/N:{} /:search ", search.status_label()))
+            .map(|search| format!(" \u{2191}\u{2193}/nN:{} /:search ", search.status_label()))
             .unwrap_or_else(|| " /:search ".to_string())
     };
     let right = format!(
-        "jk/\u{2191}\u{2193}  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
+        "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
         search_status, progress
     );
     let gap = cols.saturating_sub(left.len() + right.len());
