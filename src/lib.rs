@@ -22,7 +22,7 @@ use crate::cli::{parse_duration_secs, Cli, SourceFilter};
 use crate::codex_loader::CodexLoadOptions;
 use crate::display::format_result;
 use crate::history::{compare_conversations, Conversation, SessionSource};
-use crate::search::{precompute_search_text, search};
+use crate::search::{precompute_full_search_text, search};
 use chrono::Local;
 use clap::Parser;
 
@@ -39,11 +39,11 @@ fn run_inner() -> error::Result<()> {
     let load_claude = !matches!(args.source, Some(SourceFilter::Codex));
     let load_codex = !matches!(args.source, Some(SourceFilter::Claude));
     let codex_options = CodexLoadOptions {
-        include_full_text: args.query.is_some(),
+        include_full_text: false,
     };
 
-    // Load requested sources in parallel. Codex list/TUI mode uses a lightweight
-    // index; query mode opts into full bodies for content search.
+    // Load requested sources in parallel. Codex rows stay lightweight here;
+    // query mode hydrates full bodies through the persistent search cache.
     let (claude_result, codex_result) = rayon::join(
         || {
             if load_claude {
@@ -100,7 +100,7 @@ fn run_inner() -> error::Result<()> {
 
     // Non-interactive: search or list to stdout
     if let Some(ref query) = args.query {
-        let searchable = precompute_search_text(&filtered);
+        let searchable = precompute_full_search_text(&filtered);
         let results = search(&filtered, &searchable, query, Local::now());
         for &idx in results.iter().take(args.limit) {
             println!("{}", format_result(&filtered[idx]));

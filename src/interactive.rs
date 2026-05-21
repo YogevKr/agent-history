@@ -5,7 +5,9 @@ use crate::display::{
     get_display_title, short_id, truncate, HIERARCHY_GUTTER_WIDTH,
 };
 use crate::history::{Conversation, SessionSource};
-use crate::search::{precompute_search_text, search, SearchableConversation};
+use crate::search::{
+    precompute_full_search_text, precompute_search_text, search, SearchableConversation,
+};
 use crate::viewer::{self, Span, StyledLine};
 use chrono::Local;
 use crossterm::{
@@ -26,8 +28,6 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
         return Ok(());
     }
 
-    let searchable = precompute_search_text(&conversations);
-
     let expanded_tree_roots = HashSet::new();
     let filtered_indices = collapse_visible_indices(
         &conversations,
@@ -40,6 +40,8 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
         query: String::new(),
         selected: 0,
         filtered_indices,
+        searchable: precompute_search_text(&conversations),
+        full_search_loaded: false,
         expanded_tree_roots,
         flash: None,
     };
@@ -49,7 +51,7 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)
         .map_err(crate::error::AppError::Io)?;
 
-    let result = main_loop(&mut stdout, &conversations, &searchable, &mut state);
+    let result = main_loop(&mut stdout, &conversations, &mut state);
 
     // Always restore terminal
     let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
@@ -65,6 +67,8 @@ struct PickerState {
     query: String,
     selected: usize,
     filtered_indices: Vec<usize>,
+    searchable: Vec<SearchableConversation>,
+    full_search_loaded: bool,
     expanded_tree_roots: HashSet<String>,
     flash: Option<String>,
 }
@@ -72,11 +76,10 @@ struct PickerState {
 fn main_loop(
     stdout: &mut io::Stdout,
     conversations: &[Conversation],
-    searchable: &[SearchableConversation],
     state: &mut PickerState,
 ) -> crate::error::Result<()> {
     loop {
-        let idx = match picker_loop(stdout, conversations, searchable, state) {
+        let idx = match picker_loop(stdout, conversations, state) {
             PickerAction::ViewSession(idx) => match pager_loop(stdout, &conversations[idx])? {
                 PagerAction::Back => continue,
                 PagerAction::CopyId => idx,
@@ -143,7 +146,6 @@ enum PickerAction {
 fn picker_loop(
     stdout: &mut io::Stdout,
     conversations: &[Conversation],
-    searchable: &[SearchableConversation],
     state: &mut PickerState,
 ) -> PickerAction {
     loop {
@@ -220,12 +222,12 @@ fn picker_loop(
                 ..
             }) => {
                 state.query.pop();
-                refilter(conversations, searchable, state);
+                refilter(conversations, state);
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Tab, ..
             }) => {
-                toggle_tree_expansion(conversations, searchable, state);
+                toggle_tree_expansion(conversations, state);
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Left,
@@ -252,7 +254,7 @@ fn picker_loop(
             }) => {
                 if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT {
                     state.query.push(c);
-                    refilter(conversations, searchable, state);
+                    refilter(conversations, state);
                 }
             }
             _ => {}
@@ -260,15 +262,17 @@ fn picker_loop(
     }
 }
 
-fn refilter(
-    conversations: &[Conversation],
-    searchable: &[SearchableConversation],
-    state: &mut PickerState,
-) {
+fn refilter(conversations: &[Conversation], state: &mut PickerState) {
+    if !state.query.is_empty() && !state.full_search_loaded {
+        state.searchable = precompute_full_search_text(conversations);
+        state.full_search_loaded = true;
+        state.flash = Some("Indexed full context".to_string());
+    }
+
     let base_indices = if state.query.is_empty() {
         (0..conversations.len()).collect()
     } else {
-        search(conversations, searchable, &state.query, Local::now())
+        search(conversations, &state.searchable, &state.query, Local::now())
     };
     state.filtered_indices = collapse_visible_indices(
         conversations,
@@ -281,11 +285,7 @@ fn refilter(
     }
 }
 
-fn toggle_tree_expansion(
-    conversations: &[Conversation],
-    searchable: &[SearchableConversation],
-    state: &mut PickerState,
-) {
+fn toggle_tree_expansion(conversations: &[Conversation], state: &mut PickerState) {
     if state.filtered_indices.is_empty() {
         return;
     }
@@ -301,7 +301,7 @@ fn toggle_tree_expansion(
     }
 
     let selected_session_id = conversations[selected_index].session_id.clone();
-    refilter(conversations, searchable, state);
+    refilter(conversations, state);
 
     if let Some(position) = state
         .filtered_indices
