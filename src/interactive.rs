@@ -23,6 +23,7 @@ use crossterm::{
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
+use unicode_width::UnicodeWidthChar;
 
 const PICKER_HINT: &str = "  Enter: view  Tab: expand/collapse  \u{2190}: copy ID";
 
@@ -850,6 +851,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_styled_line_clips_to_width_without_terminal_wrap() {
+        let mut output = Vec::new();
+        let spans = vec![test_span("abcdef")];
+
+        render_styled_line(&mut output, &spans, 4, None, 0).unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("abcd"));
+        assert!(!rendered.contains("e"));
+        assert!(!rendered.contains("f"));
+    }
+
     fn test_span(text: &str) -> Span {
         Span {
             text: text.to_string(),
@@ -1354,7 +1368,13 @@ fn draw_pager(
         }
 
         execute!(stdout, cursor::MoveTo(0, i as u16))?;
-        render_styled_line(stdout, &lines[line_idx], cols, search, line_idx)?;
+        render_styled_line(
+            stdout,
+            &lines[line_idx],
+            cols.saturating_sub(1),
+            search,
+            line_idx,
+        )?;
     }
 
     // Status bar: session details on left, keys + progress on right
@@ -1393,10 +1413,10 @@ fn draw_pager(
     Ok(())
 }
 
-fn render_styled_line(
-    stdout: &mut io::Stdout,
+fn render_styled_line<W: Write>(
+    stdout: &mut W,
     spans: &[Span],
-    _max_width: usize,
+    max_width: usize,
     search: Option<&ViewerSearch>,
     line_idx: usize,
 ) -> io::Result<()> {
@@ -1404,8 +1424,18 @@ fn render_styled_line(
         .map(|search| search.line_matches(line_idx))
         .unwrap_or_default();
     let mut line_offset = 0;
+    let mut remaining_width = max_width;
     for span in spans {
-        render_span_with_highlights(stdout, span, line_offset, &line_matches)?;
+        if remaining_width == 0 {
+            break;
+        }
+        render_span_with_highlights(
+            stdout,
+            span,
+            line_offset,
+            &line_matches,
+            &mut remaining_width,
+        )?;
         line_offset += span.text.len();
     }
     Ok(())
@@ -1422,16 +1452,20 @@ impl ViewerSearch {
     }
 }
 
-fn render_span_with_highlights(
-    stdout: &mut io::Stdout,
+fn render_span_with_highlights<W: Write>(
+    stdout: &mut W,
     span: &Span,
     span_start: usize,
     line_matches: &[(&ViewerMatch, bool)],
+    remaining_width: &mut usize,
 ) -> io::Result<()> {
     let span_end = span_start + span.text.len();
     let mut cursor = 0;
 
     for (matched, is_active) in line_matches {
+        if *remaining_width == 0 {
+            return Ok(());
+        }
         if matched.end <= span_start || matched.start >= span_end {
             continue;
         }
@@ -1441,22 +1475,41 @@ fn render_span_with_highlights(
             .min(span.text.len());
         let local_end = (matched.end.min(span_end) - span_start).min(span.text.len());
         if local_start > cursor {
-            print_span_segment(stdout, span, &span.text[cursor..local_start])?;
+            print_span_segment(
+                stdout,
+                span,
+                &span.text[cursor..local_start],
+                remaining_width,
+            )?;
         }
         if local_end > local_start {
-            print_highlight_segment(stdout, &span.text[local_start..local_end], *is_active)?;
+            print_highlight_segment(
+                stdout,
+                &span.text[local_start..local_end],
+                *is_active,
+                remaining_width,
+            )?;
         }
         cursor = local_end;
     }
 
     if cursor < span.text.len() {
-        print_span_segment(stdout, span, &span.text[cursor..])?;
+        print_span_segment(stdout, span, &span.text[cursor..], remaining_width)?;
     }
 
     Ok(())
 }
 
-fn print_span_segment(stdout: &mut io::Stdout, span: &Span, text: &str) -> io::Result<()> {
+fn print_span_segment<W: Write>(
+    stdout: &mut W,
+    span: &Span,
+    text: &str,
+    remaining_width: &mut usize,
+) -> io::Result<()> {
+    let (text, width) = display_width_prefix(text, *remaining_width);
+    if text.is_empty() {
+        return Ok(());
+    }
     if span.bold {
         execute!(stdout, SetAttribute(Attribute::Bold))?;
     }
@@ -1468,10 +1521,20 @@ fn print_span_segment(stdout: &mut io::Stdout, span: &Span, text: &str) -> io::R
     }
     execute!(stdout, Print(text))?;
     execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    *remaining_width = remaining_width.saturating_sub(width);
     Ok(())
 }
 
-fn print_highlight_segment(stdout: &mut io::Stdout, text: &str, active: bool) -> io::Result<()> {
+fn print_highlight_segment<W: Write>(
+    stdout: &mut W,
+    text: &str,
+    active: bool,
+    remaining_width: &mut usize,
+) -> io::Result<()> {
+    let (text, width) = display_width_prefix(text, *remaining_width);
+    if text.is_empty() {
+        return Ok(());
+    }
     if active {
         execute!(
             stdout,
@@ -1492,5 +1555,22 @@ fn print_highlight_segment(stdout: &mut io::Stdout, text: &str, active: bool) ->
             SetAttribute(Attribute::Reset)
         )?;
     }
+    *remaining_width = remaining_width.saturating_sub(width);
     Ok(())
+}
+
+fn display_width_prefix(text: &str, max_width: usize) -> (&str, usize) {
+    let mut used = 0;
+    let mut end = 0;
+
+    for (idx, ch) in text.char_indices() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > max_width {
+            break;
+        }
+        used += width;
+        end = idx + ch.len_utf8();
+    }
+
+    (&text[..end], used)
 }
