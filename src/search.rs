@@ -2,14 +2,13 @@ use crate::codex_parser::process_codex_file;
 use crate::history::{Conversation, SessionSource};
 use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use rusqlite::{params, Connection, OpenFlags};
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SEARCH_CACHE_FILE: &str = "search-index-v1.jsonl";
+const SEARCH_INDEX_FILE: &str = "search-index-v3.sqlite";
 
 /// Precomputed search data for a conversation
 pub struct SearchableConversation {
@@ -19,18 +18,15 @@ pub struct SearchableConversation {
     pub index: usize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct SearchCacheFingerprint {
-    size: u64,
-    modified_secs: u64,
-    modified_nanos: u32,
+/// Persistent full-context search index.
+pub enum FullSearchIndex {
+    Sqlite(SqliteSearchIndex),
+    InMemory(Vec<SearchableConversation>),
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct SearchCacheEntry {
-    path: String,
-    fingerprint: SearchCacheFingerprint,
-    text_lower: String,
+pub struct SqliteSearchIndex {
+    db_path: PathBuf,
+    rowid_to_index: HashMap<i64, usize>,
 }
 
 /// Normalize text for search: lowercase, replace non-alphanumeric chars with spaces
@@ -58,48 +54,23 @@ pub fn precompute_search_text(conversations: &[Conversation]) -> Vec<SearchableC
         .collect()
 }
 
-/// Precompute full-context search text, using a persistent cache for lightweight
-/// Codex rows so the expensive JSONL body parse is paid only when files change.
-pub fn precompute_full_search_text(conversations: &[Conversation]) -> Vec<SearchableConversation> {
-    if let Some(cache_path) = default_search_cache_path() {
-        return precompute_full_search_text_with_cache_path(conversations, &cache_path);
+/// Precompute full-context search as a persistent SQLite FTS5 index. Falls back
+/// to in-memory search when the index cannot be opened or updated.
+pub fn precompute_full_search_index(conversations: &[Conversation]) -> FullSearchIndex {
+    if let Some(db_path) = default_search_index_path() {
+        return precompute_full_search_index_with_db_path(conversations, &db_path);
     }
 
-    precompute_uncached_full_search_text(conversations)
+    FullSearchIndex::InMemory(precompute_uncached_full_search_text(conversations))
 }
 
-fn precompute_full_search_text_with_cache_path(
+fn precompute_full_search_index_with_db_path(
     conversations: &[Conversation],
-    cache_path: &Path,
-) -> Vec<SearchableConversation> {
-    let cache = read_search_cache(cache_path);
-    let built: Vec<(SearchableConversation, Option<SearchCacheEntry>)> = conversations
-        .par_iter()
-        .enumerate()
-        .map(|(idx, conv)| {
-            let (text_lower, cache_entry) = full_search_text_lower(conv, &cache);
-            (
-                SearchableConversation {
-                    text_lower,
-                    index: idx,
-                },
-                cache_entry,
-            )
-        })
-        .collect();
-
-    let next_cache: HashMap<String, SearchCacheEntry> = built
-        .iter()
-        .filter_map(|(_, entry)| entry.clone().map(|entry| (entry.path.clone(), entry)))
-        .collect();
-    if next_cache != cache {
-        write_search_cache(cache_path, &next_cache);
-    }
-
-    built
-        .into_iter()
-        .map(|(searchable, _)| searchable)
-        .collect()
+    db_path: &Path,
+) -> FullSearchIndex {
+    build_sqlite_search_index(conversations, db_path).unwrap_or_else(|_| {
+        FullSearchIndex::InMemory(precompute_uncached_full_search_text(conversations))
+    })
 }
 
 fn precompute_uncached_full_search_text(
@@ -113,38 +84,6 @@ fn precompute_uncached_full_search_text(
             index: idx,
         })
         .collect()
-}
-
-fn full_search_text_lower(
-    conv: &Conversation,
-    cache: &HashMap<String, SearchCacheEntry>,
-) -> (String, Option<SearchCacheEntry>) {
-    if conv.source != SessionSource::Codex || !conv.full_text.is_empty() {
-        return (conversation_search_text_lower(conv), None);
-    }
-
-    let path = conv.path.to_string_lossy().to_string();
-    let Some((fingerprint, modified)) = file_fingerprint(&conv.path) else {
-        return (conversation_search_text_lower(conv), None);
-    };
-
-    if let Some(entry) = cache.get(&path) {
-        if entry.fingerprint == fingerprint {
-            return (
-                cached_text_with_current_metadata(&entry.text_lower, conv),
-                Some(entry.clone()),
-            );
-        }
-    }
-
-    if let Some(entry) = build_codex_cache_entry(conv, path, fingerprint, modified) {
-        return (
-            cached_text_with_current_metadata(&entry.text_lower, conv),
-            Some(entry),
-        );
-    }
-
-    (conversation_search_text_lower(conv), None)
 }
 
 fn uncached_full_search_text_lower(conv: &Conversation) -> String {
@@ -162,29 +101,16 @@ fn uncached_full_search_text_lower(conv: &Conversation) -> String {
         .unwrap_or_else(|| conversation_search_text_lower(conv))
 }
 
-fn build_codex_cache_entry(
-    conv: &Conversation,
-    path: String,
-    fingerprint: SearchCacheFingerprint,
-    modified: SystemTime,
-) -> Option<SearchCacheEntry> {
-    let parsed = process_codex_file(conv.path.clone(), Some(modified))
-        .ok()
-        .flatten()?;
-    Some(SearchCacheEntry {
-        path,
-        fingerprint,
-        text_lower: conversation_search_text_lower(&parsed),
-    })
-}
-
-fn cached_text_with_current_metadata(cached_text_lower: &str, conv: &Conversation) -> String {
-    let metadata = conversation_metadata_text(conv);
-    if metadata.is_empty() {
-        cached_text_lower.to_string()
-    } else {
-        format!("{} {}", cached_text_lower, normalize_for_search(&metadata))
+fn full_search_text_lower_with_modified(conv: &Conversation, modified: SystemTime) -> String {
+    if conv.source != SessionSource::Codex || !conv.full_text.is_empty() {
+        return conversation_search_text_lower(conv);
     }
+
+    process_codex_file(conv.path.clone(), Some(modified))
+        .ok()
+        .flatten()
+        .map(|parsed| conversation_search_text_lower(&parsed))
+        .unwrap_or_else(|| conversation_search_text_lower(conv))
 }
 
 fn conversation_search_text_lower(conv: &Conversation) -> String {
@@ -217,74 +143,219 @@ fn conversation_metadata_text(conv: &Conversation) -> String {
     parts.join(" ")
 }
 
-fn default_search_cache_path() -> Option<PathBuf> {
+fn default_search_index_path() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("AGENT_HISTORY_CACHE_DIR") {
-        return Some(PathBuf::from(dir).join(SEARCH_CACHE_FILE));
+        return Some(PathBuf::from(dir).join(SEARCH_INDEX_FILE));
     }
     Some(
         home::home_dir()?
             .join(".cache")
             .join("agent-history")
-            .join(SEARCH_CACHE_FILE),
+            .join(SEARCH_INDEX_FILE),
     )
 }
 
-fn file_fingerprint(path: &Path) -> Option<(SearchCacheFingerprint, SystemTime)> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SearchFileFingerprint {
+    size: i64,
+    modified_secs: i64,
+    modified_nanos: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SearchMeta {
+    rowid: i64,
+    session_id: String,
+    fingerprint: SearchFileFingerprint,
+}
+
+struct IndexedSession {
+    path: String,
+    session_id: String,
+    fingerprint: SearchFileFingerprint,
+    body: String,
+}
+
+enum IndexChange {
+    Upsert(IndexedSession),
+    Delete(String),
+}
+
+type SearchIndexResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn file_fingerprint(path: &Path) -> Option<(SearchFileFingerprint, SystemTime)> {
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
     let duration = modified.duration_since(UNIX_EPOCH).ok()?;
     Some((
-        SearchCacheFingerprint {
-            size: metadata.len(),
-            modified_secs: duration.as_secs(),
-            modified_nanos: duration.subsec_nanos(),
+        SearchFileFingerprint {
+            size: metadata.len().try_into().ok()?,
+            modified_secs: duration.as_secs().try_into().ok()?,
+            modified_nanos: duration.subsec_nanos().into(),
         },
         modified,
     ))
 }
 
-fn read_search_cache(path: &Path) -> HashMap<String, SearchCacheEntry> {
-    let Ok(file) = File::open(path) else {
-        return HashMap::new();
-    };
-    BufReader::new(file)
-        .lines()
-        .map_while(|line| line.ok())
-        .filter_map(|line| serde_json::from_str::<SearchCacheEntry>(&line).ok())
-        .map(|entry| (entry.path.clone(), entry))
-        .collect()
+fn build_sqlite_search_index(
+    conversations: &[Conversation],
+    db_path: &Path,
+) -> SearchIndexResult<FullSearchIndex> {
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut conn = Connection::open(db_path)?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        CREATE TABLE IF NOT EXISTS session_meta (
+            path TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            modified_secs INTEGER NOT NULL,
+            modified_nanos INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(
+            body,
+            content = '',
+            contentless_delete = 1,
+            tokenize = 'unicode61'
+        );
+        ",
+    )?;
+
+    let meta = sync_sqlite_search_index(&mut conn, conversations)?;
+
+    let path_to_index: HashMap<String, usize> = conversations
+        .iter()
+        .enumerate()
+        .map(|(idx, conv)| (conv.path.to_string_lossy().to_string(), idx))
+        .collect();
+    let rowid_to_index = meta
+        .into_iter()
+        .filter_map(|(path, meta)| path_to_index.get(&path).map(|idx| (meta.rowid, *idx)))
+        .collect();
+
+    Ok(FullSearchIndex::Sqlite(SqliteSearchIndex {
+        db_path: db_path.to_path_buf(),
+        rowid_to_index,
+    }))
 }
 
-fn write_search_cache(path: &Path, entries: &HashMap<String, SearchCacheEntry>) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
+fn sync_sqlite_search_index(
+    conn: &mut Connection,
+    conversations: &[Conversation],
+) -> SearchIndexResult<HashMap<String, SearchMeta>> {
+    let existing = read_sqlite_meta(conn)?;
+    let current_paths: HashSet<String> = conversations
+        .iter()
+        .map(|conv| conv.path.to_string_lossy().to_string())
+        .collect();
+
+    let changes: Vec<IndexChange> = conversations
+        .par_iter()
+        .filter_map(|conv| {
+            let path = conv.path.to_string_lossy().to_string();
+            let Some((fingerprint, modified)) = file_fingerprint(&conv.path) else {
+                return Some(IndexChange::Delete(path));
+            };
+            if existing.get(&path).is_some_and(|meta| {
+                meta.session_id == conv.session_id && meta.fingerprint == fingerprint
+            }) {
+                return None;
+            }
+
+            Some(IndexChange::Upsert(IndexedSession {
+                path,
+                session_id: conv.session_id.clone(),
+                fingerprint,
+                body: full_search_text_lower_with_modified(conv, modified),
+            }))
+        })
+        .collect();
+
+    let stale_paths: Vec<String> = existing
+        .keys()
+        .filter(|path| !current_paths.contains(*path))
+        .cloned()
+        .collect();
+
+    if changes.is_empty() && stale_paths.is_empty() {
+        return Ok(existing);
     }
 
-    let tmp_path = path.with_extension("jsonl.tmp");
-    let Ok(mut file) = File::create(&tmp_path) else {
-        return;
-    };
-
-    let mut paths: Vec<&String> = entries.keys().collect();
-    paths.sort();
-    for path in paths {
-        let Some(entry) = entries.get(path) else {
-            continue;
-        };
-        if serde_json::to_writer(&mut file, entry).is_err() {
-            let _ = fs::remove_file(&tmp_path);
-            return;
-        }
-        if writeln!(file).is_err() {
-            let _ = fs::remove_file(&tmp_path);
-            return;
+    let tx = conn.transaction()?;
+    for path in stale_paths {
+        delete_indexed_path(&tx, &path)?;
+    }
+    for change in changes {
+        match change {
+            IndexChange::Upsert(session) => {
+                delete_indexed_path(&tx, &session.path)?;
+                tx.execute(
+                    "
+                    INSERT INTO session_meta(path, session_id, size, modified_secs, modified_nanos)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    ",
+                    params![
+                        session.path,
+                        session.session_id,
+                        session.fingerprint.size,
+                        session.fingerprint.modified_secs,
+                        session.fingerprint.modified_nanos
+                    ],
+                )?;
+                let rowid = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO session_fts(rowid, body) VALUES (?1, ?2)",
+                    params![rowid, session.body],
+                )?;
+            }
+            IndexChange::Delete(path) => {
+                delete_indexed_path(&tx, &path)?;
+            }
         }
     }
+    tx.commit()?;
+    Ok(read_sqlite_meta(conn)?)
+}
 
-    let _ = fs::rename(tmp_path, path);
+fn read_sqlite_meta(conn: &Connection) -> rusqlite::Result<HashMap<String, SearchMeta>> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, path, session_id, size, modified_secs, modified_nanos FROM session_meta",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(1)?,
+            SearchMeta {
+                rowid: row.get(0)?,
+                session_id: row.get(2)?,
+                fingerprint: SearchFileFingerprint {
+                    size: row.get(3)?,
+                    modified_secs: row.get(4)?,
+                    modified_nanos: row.get(5)?,
+                },
+            },
+        ))
+    })?;
+
+    let mut meta = HashMap::new();
+    for row in rows {
+        let (path, entry) = row?;
+        meta.insert(path, entry);
+    }
+    Ok(meta)
+}
+
+fn delete_indexed_path(conn: &Connection, path: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM session_fts WHERE rowid IN (SELECT rowid FROM session_meta WHERE path = ?1)",
+        params![path],
+    )?;
+    conn.execute("DELETE FROM session_meta WHERE path = ?1", params![path])?;
+    Ok(())
 }
 
 /// Filter and score conversations based on query.
@@ -331,6 +402,89 @@ pub fn search(
     });
 
     scored.into_iter().map(|(idx, _, _)| idx).collect()
+}
+
+/// Search conversations through the full-context index.
+pub fn search_full(
+    conversations: &[Conversation],
+    index: &FullSearchIndex,
+    query: &str,
+    now: DateTime<Local>,
+) -> Vec<usize> {
+    match index {
+        FullSearchIndex::Sqlite(index) => search_sqlite(conversations, index, query)
+            .unwrap_or_else(|_| {
+                let searchable = precompute_uncached_full_search_text(conversations);
+                search(conversations, &searchable, query, now)
+            }),
+        FullSearchIndex::InMemory(searchable) => search(conversations, searchable, query, now),
+    }
+}
+
+fn search_sqlite(
+    conversations: &[Conversation],
+    index: &SqliteSearchIndex,
+    query: &str,
+) -> rusqlite::Result<Vec<usize>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok((0..conversations.len()).collect());
+    }
+
+    let Some(match_query) = fts_match_query(query) else {
+        return Ok((0..conversations.len()).collect());
+    };
+
+    let conn = Connection::open_with_flags(&index.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(
+        "
+        SELECT rowid, bm25(session_fts) AS rank
+        FROM session_fts
+        WHERE session_fts MATCH ?1
+        ORDER BY rank
+        ",
+    )?;
+    let rows = stmt.query_map(params![match_query], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+    })?;
+
+    let mut scored = Vec::new();
+    for row in rows {
+        let (rowid, rank) = row?;
+        let Some(&idx) = index.rowid_to_index.get(&rowid) else {
+            continue;
+        };
+        scored.push((idx, rank, conversations[idx].timestamp));
+    }
+
+    scored.sort_unstable_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+    });
+
+    Ok(scored.into_iter().map(|(idx, _, _)| idx).collect())
+}
+
+fn fts_match_query(query: &str) -> Option<String> {
+    let mut normalized = String::with_capacity(query.len());
+    for ch in query.chars() {
+        if ch.is_alphanumeric() {
+            normalized.extend(ch.to_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+
+    let terms: Vec<String> = normalized
+        .split_whitespace()
+        .map(|term| format!("{term}*"))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" AND "))
+    }
 }
 
 /// Score a conversation based on word prefix matching and recency.
@@ -394,6 +548,7 @@ fn recency_multiplier(timestamp: DateTime<Local>, now: DateTime<Local>) -> f64 {
 mod tests {
     use super::*;
     use crate::history::{Conversation, SessionSource};
+    use std::io::Seek;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::{tempdir, NamedTempFile};
@@ -431,11 +586,18 @@ mod tests {
         }
     }
 
-    fn codex_jsonl(lines: &[&str]) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
+    fn write_codex_jsonl(file: &mut NamedTempFile, lines: &[&str]) {
+        file.as_file_mut().set_len(0).unwrap();
+        file.as_file_mut().rewind().unwrap();
         for line in lines {
             writeln!(file, "{line}").unwrap();
         }
+        file.as_file_mut().sync_all().unwrap();
+    }
+
+    fn codex_jsonl(lines: &[&str]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        write_codex_jsonl(&mut file, lines);
         file
     }
 
@@ -455,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn full_search_text_indexes_codex_body_and_writes_cache() {
+    fn full_search_index_finds_codex_body_terms_with_sqlite_fts() {
         let file = codex_jsonl(&[
             r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible preview"}}"#,
@@ -468,23 +630,21 @@ mod tests {
             "",
         )];
         let cache_dir = tempdir().unwrap();
-        let cache_path = cache_dir.path().join("search-index.jsonl");
+        let index_path = cache_dir.path().join("search-index.sqlite");
 
-        let searchable = precompute_full_search_text_with_cache_path(&conversations, &cache_path);
-        let results = search(&conversations, &searchable, "needle", Local::now());
+        let index = precompute_full_search_index_with_db_path(&conversations, &index_path);
+        let results = search_full(&conversations, &index, "needle", Local::now());
 
         assert_eq!(results, vec![0]);
-        assert!(cache_path.exists());
-        assert!(std::fs::read_to_string(cache_path)
-            .unwrap()
-            .contains("needle"));
+        assert!(index_path.exists());
     }
 
     #[test]
-    fn full_search_text_reuses_matching_cache_entry() {
-        let file = codex_jsonl(&[
+    fn full_search_index_reindexes_changed_files() {
+        let mut file = codex_jsonl(&[
             r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible preview"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"First needle context"}}"#,
         ]);
         let conversations = vec![conversation(
             SessionSource::Codex,
@@ -493,18 +653,29 @@ mod tests {
             "",
         )];
         let cache_dir = tempdir().unwrap();
-        let cache_path = cache_dir.path().join("search-index.jsonl");
-        let (fingerprint, _) = file_fingerprint(file.path()).unwrap();
-        let entry = SearchCacheEntry {
-            path: file.path().to_string_lossy().to_string(),
-            fingerprint,
-            text_lower: "cachedonly".to_string(),
-        };
-        write_search_cache(&cache_path, &HashMap::from([(entry.path.clone(), entry)]));
+        let index_path = cache_dir.path().join("search-index.sqlite");
 
-        let searchable = precompute_full_search_text_with_cache_path(&conversations, &cache_path);
-        let results = search(&conversations, &searchable, "cachedonly", Local::now());
+        let index = precompute_full_search_index_with_db_path(&conversations, &index_path);
+        assert_eq!(
+            search_full(&conversations, &index, "first needle", Local::now()),
+            vec![0]
+        );
 
-        assert_eq!(results, vec![0]);
+        write_codex_jsonl(
+            &mut file,
+            &[
+                r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible preview"}}"#,
+                r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Second needle context with more bytes"}}"#,
+            ],
+        );
+
+        let index = precompute_full_search_index_with_db_path(&conversations, &index_path);
+
+        assert_eq!(
+            search_full(&conversations, &index, "second needle", Local::now()),
+            vec![0]
+        );
+        assert!(search_full(&conversations, &index, "first needle", Local::now()).is_empty());
     }
 }

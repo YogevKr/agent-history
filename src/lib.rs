@@ -22,7 +22,7 @@ use crate::cli::{parse_duration_secs, Cli, SourceFilter};
 use crate::codex_loader::CodexLoadOptions;
 use crate::display::format_result;
 use crate::history::{compare_conversations, Conversation, SessionSource};
-use crate::search::{precompute_full_search_text, search};
+use crate::search::{precompute_full_search_index, search_full};
 use chrono::Local;
 use clap::Parser;
 
@@ -100,8 +100,8 @@ fn run_inner() -> error::Result<()> {
 
     // Non-interactive: search or list to stdout
     if let Some(ref query) = args.query {
-        let searchable = precompute_full_search_text(&filtered);
-        let results = search(&filtered, &searchable, query, Local::now());
+        let index = precompute_full_search_index(&filtered);
+        let results = search_full(&filtered, &index, query, Local::now());
         for &idx in results.iter().take(args.limit) {
             println!("{}", format_result(&filtered[idx]));
         }

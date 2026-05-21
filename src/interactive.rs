@@ -6,7 +6,8 @@ use crate::display::{
 };
 use crate::history::{Conversation, SessionSource};
 use crate::search::{
-    precompute_full_search_text, precompute_search_text, search, SearchableConversation,
+    precompute_full_search_index, precompute_search_text, search, search_full, FullSearchIndex,
+    SearchableConversation,
 };
 use crate::viewer::{self, Span, StyledLine};
 use chrono::Local;
@@ -41,7 +42,7 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
         selected: 0,
         filtered_indices,
         searchable: precompute_search_text(&conversations),
-        full_search_loaded: false,
+        full_search_index: None,
         expanded_tree_roots,
         flash: None,
     };
@@ -68,7 +69,7 @@ struct PickerState {
     selected: usize,
     filtered_indices: Vec<usize>,
     searchable: Vec<SearchableConversation>,
-    full_search_loaded: bool,
+    full_search_index: Option<FullSearchIndex>,
     expanded_tree_roots: HashSet<String>,
     flash: Option<String>,
 }
@@ -263,14 +264,15 @@ fn picker_loop(
 }
 
 fn refilter(conversations: &[Conversation], state: &mut PickerState) {
-    if !state.query.is_empty() && !state.full_search_loaded {
-        state.searchable = precompute_full_search_text(conversations);
-        state.full_search_loaded = true;
+    if !state.query.is_empty() && state.full_search_index.is_none() {
+        state.full_search_index = Some(precompute_full_search_index(conversations));
         state.flash = Some("Indexed full context".to_string());
     }
 
     let base_indices = if state.query.is_empty() {
         (0..conversations.len()).collect()
+    } else if let Some(index) = state.full_search_index.as_ref() {
+        search_full(conversations, index, &state.query, Local::now())
     } else {
         search(conversations, &state.searchable, &state.query, Local::now())
     };
