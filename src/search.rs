@@ -30,6 +30,10 @@ pub fn precompute_search_text(conversations: &[Conversation]) -> Vec<SearchableC
         .enumerate()
         .map(|(idx, conv)| {
             let mut text = conv.full_text.clone();
+            if !conv.preview.is_empty() {
+                text.push(' ');
+                text.push_str(&conv.preview);
+            }
             if let Some(ref name) = conv.project_name {
                 text.push(' ');
                 text.push_str(name);
@@ -142,5 +146,50 @@ fn recency_multiplier(timestamp: DateTime<Local>, now: DateTime<Local>) -> f64 {
         1.5
     } else {
         1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::{Conversation, SessionSource};
+    use std::path::PathBuf;
+
+    fn conversation(preview: &str, full_text: &str) -> Conversation {
+        let timestamp = Local::now();
+        Conversation {
+            path: PathBuf::from("session.jsonl"),
+            source: SessionSource::Codex,
+            session_id: "session-id".to_string(),
+            timestamp,
+            preview: preview.to_string(),
+            full_text: full_text.to_string(),
+            project_name: Some("project".to_string()),
+            cwd: None,
+            message_count: 1,
+            model: None,
+            total_tokens: 0,
+            duration_minutes: None,
+            summary: None,
+            custom_title: None,
+            git_branch: None,
+            subagent_name: None,
+            hierarchy_has_children: false,
+            hierarchy_has_next_sibling: false,
+            hierarchy_marker: None,
+            hierarchy_depth: 0,
+            hierarchy_order: 0,
+            hierarchy_sort_timestamp: timestamp,
+        }
+    }
+
+    #[test]
+    fn precompute_search_text_includes_preview_for_lightweight_rows() {
+        let conversations = vec![conversation("Visible preview text", "")];
+        let searchable = precompute_search_text(&conversations);
+
+        let results = search(&conversations, &searchable, "visible", Local::now());
+
+        assert_eq!(results, vec![0]);
     }
 }

@@ -19,6 +19,7 @@ mod theme;
 mod viewer;
 
 use crate::cli::{parse_duration_secs, Cli, SourceFilter};
+use crate::codex_loader::CodexLoadOptions;
 use crate::display::format_result;
 use crate::history::{compare_conversations, Conversation, SessionSource};
 use crate::search::{precompute_search_text, search};
@@ -35,10 +36,33 @@ pub fn run() {
 fn run_inner() -> error::Result<()> {
     let args = Cli::parse();
 
-    // Load from both sources in parallel
+    let load_claude = !matches!(args.source, Some(SourceFilter::Codex));
+    let load_codex = !matches!(args.source, Some(SourceFilter::Claude));
+    let codex_options = CodexLoadOptions {
+        include_full_text: args.query.is_some(),
+    };
+
+    // Load requested sources in parallel. Codex list/TUI mode uses a lightweight
+    // index; query mode opts into full bodies for content search.
     let (claude_result, codex_result) = rayon::join(
-        || claude_loader::load_claude_sessions(),
-        || codex_loader::load_codex_sessions(),
+        || {
+            if load_claude {
+                claude_loader::load_claude_sessions()
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        || {
+            if load_codex {
+                if codex_options.include_full_text {
+                    codex_loader::load_codex_sessions_with_options(codex_options)
+                } else {
+                    codex_loader::load_codex_sessions()
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        },
     );
 
     let mut conversations = claude_result.unwrap_or_default();

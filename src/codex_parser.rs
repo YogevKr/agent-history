@@ -19,7 +19,7 @@ const MAX_OUTPUT_PER_ITEM: usize = 16 * 1024; // 16KB cap per function_call_outp
 /// The ULID is the last 4 hyphen-separated segments.
 /// E.g. `rollout-2026-03-19T14-28-54-019d0611-f81c-7403-9bbb-20856d019138.jsonl`
 ///       -> `019d0611-f81c-7403-9bbb-20856d019138`
-fn session_id_from_filename(path: &Path) -> Option<String> {
+pub(crate) fn session_id_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() < 5 {
@@ -46,7 +46,7 @@ fn append_text(full_text: &mut String, text: &str) {
     }
 }
 
-fn subagent_dispatch_content(text: &str) -> Option<String> {
+pub(crate) fn subagent_dispatch_content(text: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
     let content = value.get("content")?.as_str()?.trim();
     if content.is_empty() {

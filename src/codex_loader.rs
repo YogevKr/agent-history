@@ -1,16 +1,26 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, TimeZone};
 use rayon::prelude::*;
 
-use crate::codex::{CodexLine, EventMsg, SessionMeta, TurnContext};
-use crate::codex_items::read_codex_lines;
-use crate::codex_parser::process_codex_file;
+use crate::codex::{CodexLine, EventMsg, ResponseItem, SessionMeta, TurnContext};
+use crate::codex_items::clean_user_message;
+use crate::codex_parser::{
+    process_codex_file, session_id_from_filename, subagent_dispatch_content,
+};
 use crate::error::Result;
-use crate::history::{compare_conversations, Conversation};
+use crate::history::{compare_conversations, Conversation, SessionSource};
+
+const INDEX_SCAN_MIN_LINES: usize = 256;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CodexLoadOptions {
+    pub include_full_text: bool,
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TaskModelKey {
@@ -18,7 +28,7 @@ struct TaskModelKey {
     turn_id: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CodexFileMetadata {
     session_id: Option<String>,
     cwd: Option<String>,
@@ -63,29 +73,48 @@ fn collect_jsonl_files(dir: &PathBuf) -> Vec<PathBuf> {
     files
 }
 
-fn collect_file_metadata(path: &PathBuf) -> Option<(PathBuf, CodexFileMetadata)> {
+fn collect_file_index(
+    path: &PathBuf,
+) -> Option<(PathBuf, CodexFileMetadata, Option<Conversation>)> {
+    let modified = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
-    let lines = read_codex_lines(reader);
 
     let mut task_turn_id: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut model_candidates: Vec<(Option<String>, Option<String>, String)> = Vec::new();
+    let mut first_model: Option<String> = None;
     let mut session_id: Option<String> = None;
+    let mut git_branch: Option<String> = None;
     let mut subagent_name: Option<String> = None;
     let mut parent_session_id: Option<String> = None;
     let mut subagent_depth: Option<usize> = None;
     let mut is_exec_wrapper = false;
+    let mut preview = String::new();
+    let mut message_count: usize = 0;
+    let mut total_tokens: u64 = 0;
+    let mut first_timestamp: Option<String> = None;
+    let mut session_timestamp: Option<String> = None;
 
-    for line in &lines {
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
         if line.trim().is_empty() {
             continue;
         }
 
-        let codex_line: CodexLine = match serde_json::from_str(line) {
+        let codex_line: CodexLine = match serde_json::from_str(&line) {
             Ok(line) => line,
             Err(_) => continue,
         };
+
+        if first_timestamp.is_none() {
+            first_timestamp = Some(codex_line.timestamp.clone());
+        }
 
         match codex_line.line_type.as_str() {
             "session_meta" => {
@@ -93,8 +122,14 @@ fn collect_file_metadata(path: &PathBuf) -> Option<(PathBuf, CodexFileMetadata)>
                     if session_id.is_none() {
                         session_id = Some(meta.id);
                     }
+                    session_timestamp = Some(codex_line.timestamp);
                     if cwd.is_none() {
                         cwd = meta.cwd.clone();
+                    }
+                    if git_branch.is_none() {
+                        if let Some(git) = meta.git {
+                            git_branch = git.branch;
+                        }
                     }
                     if let Some(source) = meta.source {
                         if source.as_str() == Some("exec") {
@@ -137,7 +172,22 @@ fn collect_file_metadata(path: &PathBuf) -> Option<(PathBuf, CodexFileMetadata)>
             "event_msg" => {
                 if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
                     if evt.event_type == "task_started" && task_turn_id.is_none() {
-                        task_turn_id = evt.turn_id;
+                        task_turn_id = evt.turn_id.clone();
+                    }
+                    if evt.event_type == "token_count" {
+                        if let Some(info) = evt.info.as_ref() {
+                            if let Some(usage) = info.total_token_usage.as_ref() {
+                                total_tokens = usage.total_tokens;
+                            }
+                        }
+                    }
+                    if let Some((is_user, text)) = event_message_text(&evt) {
+                        message_count += 1;
+                        if preview.is_empty()
+                            && (is_user || subagent_dispatch_content(&text).is_some())
+                        {
+                            preview = preview_text(&text, is_user);
+                        }
                     }
                 }
             }
@@ -147,11 +197,35 @@ fn collect_file_metadata(path: &PathBuf) -> Option<(PathBuf, CodexFileMetadata)>
                         cwd = tc.cwd.clone();
                     }
                     if let Some(model) = tc.model {
+                        if first_model.is_none() {
+                            first_model = Some(model.clone());
+                        }
                         model_candidates.push((tc.turn_id, tc.cwd, model));
                     }
                 }
             }
+            "response_item" => {
+                if let Ok(item) = serde_json::from_value::<ResponseItem>(codex_line.payload) {
+                    if let Some((is_user, text)) = response_item_message_text(&item) {
+                        message_count += 1;
+                        if preview.is_empty()
+                            && (is_user || subagent_dispatch_content(&text).is_some())
+                        {
+                            preview = preview_text(&text, is_user);
+                        }
+                    }
+                }
+            }
             _ => {}
+        }
+
+        if index_scan_complete(
+            line_number + 1,
+            session_id.as_ref(),
+            &preview,
+            message_count,
+        ) {
+            break;
         }
     }
 
@@ -164,19 +238,147 @@ fn collect_file_metadata(path: &PathBuf) -> Option<(PathBuf, CodexFileMetadata)>
         })
         .collect();
 
-    Some((
-        path.clone(),
-        CodexFileMetadata {
+    let metadata = CodexFileMetadata {
+        session_id: session_id.clone(),
+        cwd: cwd.clone(),
+        task_turn_id,
+        turn_models,
+        subagent_name,
+        parent_session_id,
+        subagent_depth,
+        is_exec_wrapper,
+    };
+
+    let conversation = if message_count == 0 {
+        None
+    } else {
+        let session_id = session_id
+            .or_else(|| session_id_from_filename(path))
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
+        let timestamp = parse_conversation_timestamp(
+            session_timestamp.as_deref(),
+            first_timestamp.as_deref(),
+            modified,
+        );
+        let project_name = cwd.as_ref().and_then(|path| {
+            PathBuf::from(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(String::from)
+        });
+        let model =
+            first_model.or_else(|| metadata.turn_models.first().map(|(_, model)| model.clone()));
+
+        Some(Conversation {
+            path: path.clone(),
+            source: SessionSource::Codex,
             session_id,
-            cwd,
-            task_turn_id,
-            turn_models,
-            subagent_name,
-            parent_session_id,
-            subagent_depth,
-            is_exec_wrapper,
-        },
-    ))
+            timestamp,
+            preview,
+            full_text: String::new(),
+            project_name,
+            cwd: cwd.map(PathBuf::from),
+            message_count,
+            model,
+            total_tokens,
+            duration_minutes: None,
+            summary: None,
+            custom_title: None,
+            git_branch,
+            subagent_name: None,
+            hierarchy_has_children: false,
+            hierarchy_has_next_sibling: false,
+            hierarchy_marker: None,
+            hierarchy_depth: 0,
+            hierarchy_order: 0,
+            hierarchy_sort_timestamp: timestamp,
+        })
+    };
+
+    Some((path.clone(), metadata, conversation))
+}
+
+fn index_scan_complete(
+    line_count: usize,
+    session_id: Option<&String>,
+    preview: &str,
+    message_count: usize,
+) -> bool {
+    line_count >= INDEX_SCAN_MIN_LINES
+        && session_id.is_some()
+        && (!preview.is_empty() || message_count > 0)
+}
+
+fn event_message_text(evt: &EventMsg) -> Option<(bool, String)> {
+    match evt.event_type.as_str() {
+        "user_message" => Some((true, clean_user_message(evt.message.as_ref()?)?)),
+        "agent_message" => Some((false, evt.message.as_ref()?.to_string())),
+        _ => None,
+    }
+}
+
+fn response_item_message_text(item: &ResponseItem) -> Option<(bool, String)> {
+    let is_user = match item.role.as_deref()? {
+        "user" => true,
+        "assistant" => false,
+        _ => return None,
+    };
+    let parts = item
+        .content
+        .as_ref()?
+        .iter()
+        .filter_map(|part| part.text.as_deref())
+        .filter(|text| !text.is_empty());
+
+    let text = if is_user {
+        parts
+            .filter_map(clean_user_message)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else {
+        parts.collect::<Vec<_>>().join("\n\n")
+    };
+
+    if text.is_empty() {
+        None
+    } else {
+        Some((is_user, text))
+    }
+}
+
+fn preview_text(text: &str, is_user: bool) -> String {
+    let preview = if is_user {
+        text.to_string()
+    } else {
+        subagent_dispatch_content(text).unwrap_or_else(|| text.to_string())
+    };
+    preview.chars().take(200).collect()
+}
+
+fn parse_conversation_timestamp(
+    session_timestamp: Option<&str>,
+    first_timestamp: Option<&str>,
+    modified: Option<SystemTime>,
+) -> DateTime<Local> {
+    session_timestamp
+        .or(first_timestamp)
+        .and_then(|timestamp| {
+            DateTime::parse_from_rfc3339(timestamp)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Local))
+        })
+        .or_else(|| {
+            modified.and_then(|modified| {
+                let duration = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+                Local.timestamp_opt(duration.as_secs() as i64, 0).single()
+            })
+        })
+        .unwrap_or_else(Local::now)
 }
 
 struct SubagentMetadata {
@@ -594,6 +796,10 @@ fn subtree_latest(
 /// Checks CODEX_HOME env var, defaults to ~/.codex.
 /// Sessions live under {root}/sessions/ in YYYY/MM/DD/ subdirectories.
 pub fn load_codex_sessions() -> Result<Vec<Conversation>> {
+    load_codex_sessions_with_options(CodexLoadOptions::default())
+}
+
+pub fn load_codex_sessions_with_options(options: CodexLoadOptions) -> Result<Vec<Conversation>> {
     let root = match std::env::var("CODEX_HOME") {
         Ok(val) => PathBuf::from(val),
         Err(_) => {
@@ -608,16 +814,26 @@ pub fn load_codex_sessions() -> Result<Vec<Conversation>> {
     }
 
     let files = collect_jsonl_files(&sessions_dir);
-    let metadata_by_path: HashMap<PathBuf, CodexFileMetadata> =
-        files.par_iter().filter_map(collect_file_metadata).collect();
-
-    let mut conversations: Vec<Conversation> = files
-        .into_par_iter()
-        .filter_map(|path| {
-            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            process_codex_file(path, modified).ok().flatten()
-        })
+    let indexed: Vec<(PathBuf, CodexFileMetadata, Option<Conversation>)> =
+        files.par_iter().filter_map(collect_file_index).collect();
+    let metadata_by_path: HashMap<PathBuf, CodexFileMetadata> = indexed
+        .iter()
+        .map(|(path, metadata, _)| (path.clone(), metadata.clone()))
         .collect();
+    let mut conversations: Vec<Conversation> = if options.include_full_text {
+        files
+            .into_par_iter()
+            .filter_map(|path| {
+                let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                process_codex_file(path, modified).ok().flatten()
+            })
+            .collect()
+    } else {
+        indexed
+            .into_iter()
+            .filter_map(|(_, _, conversation)| conversation)
+            .collect()
+    };
 
     backfill_missing_models(&mut conversations, &metadata_by_path);
     annotate_hierarchy(&mut conversations, &metadata_by_path);
@@ -692,6 +908,75 @@ mod tests {
             .unwrap();
         assert_eq!(child.subagent_name.as_deref(), Some("review"));
         assert!(!child.hierarchy_has_children);
+    }
+
+    #[test]
+    fn load_codex_sessions_uses_lightweight_index_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+
+        write_session(
+            root.path(),
+            "rollout-2026-05-20T15-45-27-session.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Index preview"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:30Z","type":"event_msg","payload":{"type":"agent_message","message":"Body that should stay lazy"}}"#,
+            ],
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+        let sessions = load_codex_sessions().unwrap();
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        let session = sessions
+            .iter()
+            .find(|session| session.session_id == "session-id")
+            .unwrap();
+        assert_eq!(session.preview, "Index preview");
+        assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
+        assert!(session.full_text.is_empty());
+    }
+
+    #[test]
+    fn load_codex_sessions_can_include_full_text_for_search() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+
+        write_session(
+            root.path(),
+            "rollout-2026-05-20T15-45-27-session.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"user_message","message":"Searchable body"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"agent_message","message":"Searchable answer"}}"#,
+            ],
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions {
+            include_full_text: true,
+        })
+        .unwrap();
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        let session = sessions
+            .iter()
+            .find(|session| session.session_id == "session-id")
+            .unwrap();
+        assert!(session.full_text.contains("User: Searchable body"));
+        assert!(session.full_text.contains("Assistant: Searchable answer"));
     }
 
     #[test]
