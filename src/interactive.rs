@@ -1,7 +1,8 @@
 //! fzf-like interactive session picker with in-TUI session viewer.
 
 use crate::display::{
-    format_model_short, format_relative_time, get_display_title, short_id, truncate,
+    format_model_short, format_project_label, format_relative_time, get_display_title, short_id,
+    truncate,
 };
 use crate::history::{Conversation, SessionSource};
 use crate::search::{precompute_search_text, search, SearchableConversation};
@@ -360,7 +361,7 @@ fn draw_session_line(
     };
 
     let age = format_relative_time(conv.timestamp);
-    let project = conv.project_name.as_deref().unwrap_or("unknown");
+    let project = format_project_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
     let sid = short_id(&conv.session_id);
@@ -666,7 +667,7 @@ fn draw_pager(
     } else {
         ((scroll + content_rows).min(lines.len()) * 100) / lines.len()
     };
-    let project = conv.project_name.as_deref().unwrap_or("unknown");
+    let project = format_project_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let age = format_relative_time(conv.timestamp);
     let sid = short_id(&conv.session_id);

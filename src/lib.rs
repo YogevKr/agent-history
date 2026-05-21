@@ -20,7 +20,7 @@ mod viewer;
 
 use crate::cli::{parse_duration_secs, Cli, SourceFilter};
 use crate::display::format_result;
-use crate::history::{Conversation, SessionSource};
+use crate::history::{compare_conversations, Conversation, SessionSource};
 use crate::search::{precompute_search_text, search};
 use chrono::Local;
 use clap::Parser;
@@ -45,7 +45,7 @@ fn run_inner() -> error::Result<()> {
     conversations.extend(codex_result.unwrap_or_default());
 
     // Sort all by timestamp descending
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by(compare_conversations);
 
     // Deduplicate by session_id (same session can appear in multiple project dirs)
     {
@@ -203,6 +203,10 @@ mod tests {
             summary: None,
             custom_title: None,
             git_branch: None,
+            subagent_name: None,
+            hierarchy_depth: 0,
+            hierarchy_order: 0,
+            hierarchy_sort_timestamp: Local::now(),
         }
     }
 

@@ -14,7 +14,7 @@ pub fn format_result(conv: &Conversation) -> String {
         SessionSource::Codex => "[codex]".green().to_string(),
     };
     let age = format_relative_time(conv.timestamp);
-    let project = conv.project_name.as_deref().unwrap_or("unknown");
+    let project = format_project_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
     let preview = truncate(&title, 60);
@@ -23,6 +23,17 @@ pub fn format_result(conv: &Conversation) -> String {
         " {} {:>6}  {:<20}  ({})  {}  \"{}\"",
         source_tag, age, project, model, sid, preview
     )
+}
+
+pub fn format_project_label(conv: &Conversation) -> String {
+    if let Some(subagent_name) = conv.subagent_name.as_deref() {
+        return format!("  -> {}", subagent_name);
+    }
+
+    conv.project_name
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 pub fn format_relative_time(timestamp: DateTime<Local>) -> String {
@@ -102,4 +113,43 @@ pub fn show_session(conv: &Conversation) {
     println!("Messages: {}", conv.message_count);
     println!("---");
     println!("{}", conv.full_text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Local;
+    use std::path::PathBuf;
+
+    fn conversation() -> Conversation {
+        let timestamp = Local::now();
+        Conversation {
+            path: PathBuf::from("session.jsonl"),
+            source: SessionSource::Codex,
+            session_id: "session-id".to_string(),
+            timestamp,
+            preview: "Review this".to_string(),
+            full_text: String::new(),
+            project_name: Some("project".to_string()),
+            cwd: None,
+            message_count: 1,
+            model: Some("gpt-5.5".to_string()),
+            total_tokens: 0,
+            duration_minutes: None,
+            summary: None,
+            custom_title: None,
+            git_branch: None,
+            subagent_name: Some("review".to_string()),
+            hierarchy_depth: 1,
+            hierarchy_order: 1,
+            hierarchy_sort_timestamp: timestamp,
+        }
+    }
+
+    #[test]
+    fn format_result_labels_subagent_rows() {
+        let rendered = format_result(&conversation());
+
+        assert!(rendered.contains("  -> review"));
+    }
 }

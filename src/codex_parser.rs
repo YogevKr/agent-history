@@ -208,6 +208,10 @@ pub fn process_codex_file(
         summary: None,
         custom_title: None,
         git_branch,
+        subagent_name: None,
+        hierarchy_depth: 0,
+        hierarchy_order: 0,
+        hierarchy_sort_timestamp: timestamp,
     }))
 }
 

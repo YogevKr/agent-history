@@ -20,6 +20,8 @@ pub struct SessionMeta {
     pub git: Option<GitInfo>,
     #[serde(default)]
     pub model_provider: Option<String>,
+    #[serde(default)]
+    pub source: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

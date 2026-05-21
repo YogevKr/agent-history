@@ -9,7 +9,7 @@ use crate::codex::{CodexLine, EventMsg, SessionMeta, TurnContext};
 use crate::codex_items::read_codex_lines;
 use crate::codex_parser::process_codex_file;
 use crate::error::Result;
-use crate::history::Conversation;
+use crate::history::{compare_conversations, Conversation};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TaskModelKey {
@@ -22,6 +22,17 @@ struct CodexFileMetadata {
     cwd: Option<String>,
     task_turn_id: Option<String>,
     turn_models: Vec<(TaskModelKey, String)>,
+    subagent_name: Option<String>,
+    is_exec_wrapper: bool,
+}
+
+impl CodexFileMetadata {
+    fn task_key(&self) -> Option<TaskModelKey> {
+        Some(TaskModelKey {
+            cwd: self.cwd.clone()?,
+            turn_id: self.task_turn_id.clone()?,
+        })
+    }
 }
 
 /// Recursively collect all `rollout-*.jsonl` files under a directory.
@@ -56,6 +67,8 @@ fn collect_file_metadata(path: &PathBuf) -> Option<(PathBuf, CodexFileMetadata)>
     let mut task_turn_id: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut model_candidates: Vec<(Option<String>, Option<String>, String)> = Vec::new();
+    let mut subagent_name: Option<String> = None;
+    let mut is_exec_wrapper = false;
 
     for line in &lines {
         if line.trim().is_empty() {
@@ -71,7 +84,18 @@ fn collect_file_metadata(path: &PathBuf) -> Option<(PathBuf, CodexFileMetadata)>
             "session_meta" => {
                 if let Ok(meta) = serde_json::from_value::<SessionMeta>(codex_line.payload) {
                     if cwd.is_none() {
-                        cwd = meta.cwd;
+                        cwd = meta.cwd.clone();
+                    }
+                    if let Some(source) = meta.source {
+                        if source.as_str() == Some("exec") {
+                            is_exec_wrapper = true;
+                        }
+                        if subagent_name.is_none() {
+                            subagent_name = source
+                                .get("subagent")
+                                .and_then(|value| value.as_str())
+                                .map(String::from);
+                        }
                     }
                 }
             }
@@ -111,6 +135,8 @@ fn collect_file_metadata(path: &PathBuf) -> Option<(PathBuf, CodexFileMetadata)>
             cwd,
             task_turn_id,
             turn_models,
+            subagent_name,
+            is_exec_wrapper,
         },
     ))
 }
@@ -160,6 +186,52 @@ fn backfill_missing_models(
     }
 }
 
+fn annotate_hierarchy(
+    conversations: &mut [Conversation],
+    metadata_by_path: &HashMap<PathBuf, CodexFileMetadata>,
+) {
+    let mut group_timestamps = HashMap::new();
+
+    for conversation in conversations.iter() {
+        let Some(metadata) = metadata_by_path.get(&conversation.path) else {
+            continue;
+        };
+        let Some(key) = metadata.task_key() else {
+            continue;
+        };
+
+        group_timestamps
+            .entry(key)
+            .and_modify(|timestamp| {
+                if conversation.timestamp > *timestamp {
+                    *timestamp = conversation.timestamp;
+                }
+            })
+            .or_insert(conversation.timestamp);
+    }
+
+    for conversation in conversations {
+        let Some(metadata) = metadata_by_path.get(&conversation.path) else {
+            continue;
+        };
+        let Some(key) = metadata.task_key() else {
+            continue;
+        };
+
+        if let Some(timestamp) = group_timestamps.get(&key) {
+            conversation.hierarchy_sort_timestamp = *timestamp;
+        }
+        if let Some(subagent_name) = metadata.subagent_name.as_ref() {
+            conversation.subagent_name = Some(subagent_name.clone());
+            conversation.hierarchy_depth = 1;
+            conversation.hierarchy_order = 1;
+        } else if metadata.is_exec_wrapper {
+            conversation.hierarchy_depth = 0;
+            conversation.hierarchy_order = 0;
+        }
+    }
+}
+
 /// Load all Codex sessions from the default sessions directory.
 ///
 /// Checks CODEX_HOME env var, defaults to ~/.codex.
@@ -191,8 +263,9 @@ pub fn load_codex_sessions() -> Result<Vec<Conversation>> {
         .collect();
 
     backfill_missing_models(&mut conversations, &metadata_by_path);
+    annotate_hierarchy(&mut conversations, &metadata_by_path);
 
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by(compare_conversations);
 
     Ok(conversations)
 }
@@ -294,5 +367,50 @@ mod tests {
             .find(|session| session.session_id == "parent-session")
             .unwrap();
         assert_eq!(parent.model, None);
+    }
+
+    #[test]
+    fn orders_exec_wrapper_before_matching_subagent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+
+        write_session(
+            root.path(),
+            "rollout-2026-05-20T15-45-27-parent.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/project","originator":"codex_exec","source":"exec"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
+            ],
+        );
+        write_session(
+            root.path(),
+            "rollout-2026-05-20T15-45-28-child.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"session_meta","payload":{"id":"child-session","cwd":"/tmp/project","originator":"codex_exec","source":{"subagent":"review"}}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
+            ],
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+        let sessions = load_codex_sessions().unwrap();
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        let parent_position = sessions
+            .iter()
+            .position(|session| session.session_id == "parent-session")
+            .unwrap();
+        let child_position = sessions
+            .iter()
+            .position(|session| session.session_id == "child-session")
+            .unwrap();
+        assert!(parent_position < child_position);
     }
 }

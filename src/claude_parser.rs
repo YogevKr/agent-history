@@ -248,6 +248,10 @@ pub fn process_claude_file(
         summary: extracted_summary,
         custom_title: extracted_custom_title,
         git_branch: extracted_git_branch,
+        subagent_name: None,
+        hierarchy_depth: 0,
+        hierarchy_order: 0,
+        hierarchy_sort_timestamp: timestamp,
     }))
 }
 

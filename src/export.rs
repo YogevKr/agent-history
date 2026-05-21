@@ -182,6 +182,10 @@ mod tests {
             summary: None,
             custom_title: None,
             git_branch: None,
+            subagent_name: None,
+            hierarchy_depth: 0,
+            hierarchy_order: 0,
+            hierarchy_sort_timestamp: Local::now(),
         }
     }
 
