@@ -27,13 +27,15 @@ pub fn format_result(conv: &Conversation) -> String {
 
 pub fn format_project_label(conv: &Conversation) -> String {
     if let Some(subagent_name) = conv.subagent_name.as_deref() {
-        return format!("  -> {}", subagent_name);
+        return format!("└─ {}", subagent_name);
     }
 
-    conv.project_name
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_string()
+    let project = conv.project_name.as_deref().unwrap_or("unknown");
+    if conv.hierarchy_has_children {
+        return format!("┬─ {}", project);
+    }
+
+    project.to_string()
 }
 
 pub fn format_relative_time(timestamp: DateTime<Local>) -> String {
@@ -140,16 +142,50 @@ mod tests {
             custom_title: None,
             git_branch: None,
             subagent_name: Some("review".to_string()),
+            hierarchy_has_children: false,
             hierarchy_depth: 1,
             hierarchy_order: 1,
             hierarchy_sort_timestamp: timestamp,
         }
     }
 
+    fn parent_conversation() -> Conversation {
+        let timestamp = Local::now();
+        Conversation {
+            path: PathBuf::from("session.jsonl"),
+            source: SessionSource::Codex,
+            session_id: "session-id".to_string(),
+            timestamp,
+            preview: "Review this".to_string(),
+            full_text: String::new(),
+            project_name: Some("project".to_string()),
+            cwd: None,
+            message_count: 1,
+            model: Some("gpt-5.5".to_string()),
+            total_tokens: 0,
+            duration_minutes: None,
+            summary: None,
+            custom_title: None,
+            git_branch: None,
+            subagent_name: None,
+            hierarchy_has_children: true,
+            hierarchy_depth: 0,
+            hierarchy_order: 0,
+            hierarchy_sort_timestamp: timestamp,
+        }
+    }
+
+    #[test]
+    fn format_result_labels_parent_rows_with_children() {
+        let rendered = format_result(&parent_conversation());
+
+        assert!(rendered.contains("┬─ project"));
+    }
+
     #[test]
     fn format_result_labels_subagent_rows() {
         let rendered = format_result(&conversation());
 
-        assert!(rendered.contains("  -> review"));
+        assert!(rendered.contains("└─ review"));
     }
 }

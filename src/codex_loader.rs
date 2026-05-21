@@ -191,6 +191,7 @@ fn annotate_hierarchy(
     metadata_by_path: &HashMap<PathBuf, CodexFileMetadata>,
 ) {
     let mut group_timestamps = HashMap::new();
+    let mut subagent_counts: HashMap<TaskModelKey, usize> = HashMap::new();
 
     for conversation in conversations.iter() {
         let Some(metadata) = metadata_by_path.get(&conversation.path) else {
@@ -201,13 +202,17 @@ fn annotate_hierarchy(
         };
 
         group_timestamps
-            .entry(key)
+            .entry(key.clone())
             .and_modify(|timestamp| {
                 if conversation.timestamp > *timestamp {
                     *timestamp = conversation.timestamp;
                 }
             })
             .or_insert(conversation.timestamp);
+
+        if metadata.subagent_name.is_some() {
+            *subagent_counts.entry(key).or_insert(0) += 1;
+        }
     }
 
     for conversation in conversations {
@@ -221,8 +226,10 @@ fn annotate_hierarchy(
         if let Some(timestamp) = group_timestamps.get(&key) {
             conversation.hierarchy_sort_timestamp = *timestamp;
         }
+        conversation.hierarchy_has_children = subagent_counts.get(&key).copied().unwrap_or(0) > 0;
         if let Some(subagent_name) = metadata.subagent_name.as_ref() {
             conversation.subagent_name = Some(subagent_name.clone());
+            conversation.hierarchy_has_children = false;
             conversation.hierarchy_depth = 1;
             conversation.hierarchy_order = 1;
         } else if metadata.is_exec_wrapper {
@@ -326,6 +333,14 @@ mod tests {
             .find(|session| session.session_id == "parent-session")
             .unwrap();
         assert_eq!(parent.model.as_deref(), Some("gpt-5.5"));
+        assert!(parent.hierarchy_has_children);
+
+        let child = sessions
+            .iter()
+            .find(|session| session.session_id == "child-session")
+            .unwrap();
+        assert_eq!(child.subagent_name.as_deref(), Some("review"));
+        assert!(!child.hierarchy_has_children);
     }
 
     #[test]
