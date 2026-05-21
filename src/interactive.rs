@@ -15,7 +15,9 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{self, ClearType},
 };
 use std::collections::HashSet;
@@ -83,46 +85,51 @@ fn main_loop(
 ) -> crate::error::Result<()> {
     loop {
         let idx = match picker_loop(stdout, conversations, state) {
-            PickerAction::ViewSession(idx) => match pager_loop(stdout, &conversations[idx])? {
-                PagerAction::Back => continue,
-                PagerAction::CopyId => idx,
-                PagerAction::Resume => {
-                    let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
-                    let _ = terminal::disable_raw_mode();
-                    return crate::resume::resume_session(&conversations[idx]);
-                }
-                PagerAction::CopyConversation => {
-                    match crate::export::to_markdown(&conversations[idx]) {
-                        Ok(md) => {
-                            if crate::export::copy_to_clipboard(&md).is_ok() {
-                                state.flash = Some("Copied conversation to clipboard".to_string());
-                            } else {
-                                state.flash = Some("Failed to copy to clipboard".to_string());
-                            }
-                        }
-                        Err(_) => {
-                            state.flash = Some("Failed to export conversation".to_string());
-                        }
+            PickerAction::ViewSession(idx) => {
+                let viewer_query = state.query.clone();
+                match pager_loop(stdout, &conversations[idx], &viewer_query)? {
+                    PagerAction::Back => continue,
+                    PagerAction::CopyId => idx,
+                    PagerAction::Resume => {
+                        let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
+                        let _ = terminal::disable_raw_mode();
+                        return crate::resume::resume_session(&conversations[idx]);
                     }
-                    continue;
-                }
-                PagerAction::ExportFile => {
-                    match crate::export::to_markdown(&conversations[idx]) {
-                        Ok(md) => match crate::export::export_to_file(&conversations[idx], &md) {
-                            Ok(filename) => {
-                                state.flash = Some(format!("Exported to ./{}", filename));
+                    PagerAction::CopyConversation => {
+                        match crate::export::to_markdown(&conversations[idx]) {
+                            Ok(md) => {
+                                if crate::export::copy_to_clipboard(&md).is_ok() {
+                                    state.flash =
+                                        Some("Copied conversation to clipboard".to_string());
+                                } else {
+                                    state.flash = Some("Failed to copy to clipboard".to_string());
+                                }
                             }
                             Err(_) => {
-                                state.flash = Some("Failed to write file".to_string());
+                                state.flash = Some("Failed to export conversation".to_string());
                             }
-                        },
-                        Err(_) => {
-                            state.flash = Some("Failed to export conversation".to_string());
                         }
+                        continue;
                     }
-                    continue;
+                    PagerAction::ExportFile => {
+                        match crate::export::to_markdown(&conversations[idx]) {
+                            Ok(md) => match crate::export::export_to_file(&conversations[idx], &md)
+                            {
+                                Ok(filename) => {
+                                    state.flash = Some(format!("Exported to ./{}", filename));
+                                }
+                                Err(_) => {
+                                    state.flash = Some("Failed to write file".to_string());
+                                }
+                            },
+                            Err(_) => {
+                                state.flash = Some("Failed to export conversation".to_string());
+                            }
+                        }
+                        continue;
+                    }
                 }
-            },
+            }
             PickerAction::CopyId(idx) => idx,
             PickerAction::Quit => return Ok(()),
         };
@@ -734,6 +741,92 @@ mod tests {
         assert!(!PICKER_HINT.contains("resume"));
         assert!(!PICKER_HINT.contains("\u{2192}"));
     }
+
+    #[test]
+    fn viewer_search_terms_split_non_alphanumeric_query() {
+        assert_eq!(
+            viewer_search_terms("memory_limiter gpt-5.5"),
+            vec!["memory", "limiter", "gpt", "5"]
+        );
+    }
+
+    #[test]
+    fn viewer_search_finds_case_insensitive_matches() {
+        let lines = vec![
+            vec![test_span("User: Hidden Needle")],
+            vec![test_span("Assistant: another needle here")],
+        ];
+
+        let search = ViewerSearch::new("needle", &lines).unwrap();
+
+        assert_eq!(
+            search.matches,
+            vec![
+                ViewerMatch {
+                    line: 0,
+                    start: 13,
+                    end: 19,
+                },
+                ViewerMatch {
+                    line: 1,
+                    start: 19,
+                    end: 25,
+                },
+            ]
+        );
+        assert_eq!(search.status_label(), "match 1/2");
+    }
+
+    #[test]
+    fn viewer_search_navigation_wraps_between_matches() {
+        let lines = vec![
+            vec![test_span("first needle")],
+            vec![test_span("second needle")],
+        ];
+        let mut search = ViewerSearch::new("needle", &lines).unwrap();
+
+        assert_eq!(search.current_line(), Some(0));
+        search.next();
+        assert_eq!(search.current_line(), Some(1));
+        search.next();
+        assert_eq!(search.current_line(), Some(0));
+        search.previous();
+        assert_eq!(search.current_line(), Some(1));
+    }
+
+    #[test]
+    fn pager_keymap_uses_n_for_match_navigation_and_slash_for_search() {
+        assert_eq!(
+            pager_key_action(
+                &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+                false,
+            ),
+            PagerKeyAction::NextMatch
+        );
+        assert_eq!(
+            pager_key_action(
+                &Event::Key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+                false,
+            ),
+            PagerKeyAction::PreviousMatch
+        );
+        assert_eq!(
+            pager_key_action(
+                &Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+                false,
+            ),
+            PagerKeyAction::StartSearch
+        );
+    }
+
+    fn test_span(text: &str) -> Span {
+        Span {
+            text: text.to_string(),
+            fg: None,
+            bold: false,
+            dim: false,
+        }
+    }
 }
 
 // ── Pager (session viewer) ────────────────────────────
@@ -746,14 +839,345 @@ enum PagerAction {
     ExportFile,
 }
 
-fn pager_loop(stdout: &mut io::Stdout, conv: &Conversation) -> crate::error::Result<PagerAction> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ViewerMatch {
+    line: usize,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ViewerSearch {
+    query: String,
+    matches: Vec<ViewerMatch>,
+    current: usize,
+}
+
+impl ViewerSearch {
+    fn new(query: &str, lines: &[StyledLine]) -> Option<Self> {
+        let terms = viewer_search_terms(query);
+        if terms.is_empty() {
+            return None;
+        }
+
+        let mut matches = Vec::new();
+        for (line_idx, line) in lines.iter().enumerate() {
+            let text = styled_line_text(line);
+            matches.extend(find_viewer_matches(line_idx, &text, &terms));
+        }
+        matches.sort_by_key(|m| (m.line, m.start, m.end));
+
+        Some(Self {
+            query: query.trim().to_string(),
+            matches,
+            current: 0,
+        })
+    }
+
+    fn current_match(&self) -> Option<&ViewerMatch> {
+        self.matches.get(self.current)
+    }
+
+    fn current_line(&self) -> Option<usize> {
+        self.current_match().map(|m| m.line)
+    }
+
+    fn next(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = (self.current + 1) % self.matches.len();
+        }
+    }
+
+    fn previous(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = if self.current == 0 {
+                self.matches.len() - 1
+            } else {
+                self.current - 1
+            };
+        }
+    }
+
+    fn status_label(&self) -> String {
+        if self.matches.is_empty() {
+            format!("no matches for /{}", self.query)
+        } else {
+            format!("match {}/{}", self.current + 1, self.matches.len())
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PagerKeyAction {
+    Back,
+    CopyConversation,
+    CopyId,
+    ExportFile,
+    Resume,
+    Refresh,
+    MoveUp,
+    MoveDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    NextMatch,
+    PreviousMatch,
+    StartSearch,
+    CommitSearch,
+    CancelSearch,
+    BackspaceSearch,
+    TypeSearch(char),
+    Ignore,
+}
+
+fn pager_key_action(evt: &Event, search_input_mode: bool) -> PagerKeyAction {
+    let Event::Key(key) = evt else {
+        return PagerKeyAction::Ignore;
+    };
+
+    if key.kind != KeyEventKind::Press {
+        return PagerKeyAction::Ignore;
+    }
+
+    if search_input_mode {
+        return match *key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => PagerKeyAction::CancelSearch,
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => PagerKeyAction::CommitSearch,
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => PagerKeyAction::BackspaceSearch,
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                PagerKeyAction::TypeSearch(c)
+            }
+            _ => PagerKeyAction::Ignore,
+        };
+    }
+
+    match *key {
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => PagerKeyAction::Back,
+        KeyEvent {
+            code: KeyCode::Char('Y'),
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => PagerKeyAction::CopyConversation,
+        KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::CopyId,
+        KeyEvent {
+            code: KeyCode::Char('e'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::ExportFile,
+        KeyEvent {
+            code: KeyCode::Char('o'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::Resume,
+        KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::Refresh,
+        KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::NextMatch,
+        KeyEvent {
+            code: KeyCode::Char('N'),
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => PagerKeyAction::PreviousMatch,
+        KeyEvent {
+            code: KeyCode::Char('/'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::StartSearch,
+        KeyEvent {
+            code: KeyCode::Up, ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('k'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::MoveUp,
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::MoveDown,
+        KeyEvent {
+            code: KeyCode::PageUp,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('u'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => PagerKeyAction::PageUp,
+        KeyEvent {
+            code: KeyCode::PageDown,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char(' '),
+            ..
+        } => PagerKeyAction::PageDown,
+        KeyEvent {
+            code: KeyCode::Home,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('g'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PagerKeyAction::Home,
+        KeyEvent {
+            code: KeyCode::End, ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('G'),
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('g'),
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => PagerKeyAction::End,
+        _ => PagerKeyAction::Ignore,
+    }
+}
+
+fn viewer_search_terms(query: &str) -> Vec<String> {
+    let mut normalized = String::with_capacity(query.len());
+    for ch in query.chars() {
+        if ch.is_alphanumeric() {
+            normalized.extend(ch.to_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized
+        .split_whitespace()
+        .fold(Vec::new(), |mut terms, term| {
+            if !terms.iter().any(|existing| existing == term) {
+                terms.push(term.to_string());
+            }
+            terms
+        })
+}
+
+fn styled_line_text(line: &StyledLine) -> String {
+    line.iter().map(|span| span.text.as_str()).collect()
+}
+
+fn find_viewer_matches(line: usize, text: &str, terms: &[String]) -> Vec<ViewerMatch> {
+    let lower = text.to_ascii_lowercase();
+    let mut matches = Vec::new();
+    for term in terms {
+        let mut offset = 0;
+        while let Some(found) = lower[offset..].find(term) {
+            let start = offset + found;
+            let end = start + term.len();
+            matches.push(ViewerMatch { line, start, end });
+            offset = end;
+            if offset >= lower.len() {
+                break;
+            }
+        }
+    }
+    matches.sort_by_key(|m| (m.line, m.start, m.end));
+
+    let mut merged: Vec<ViewerMatch> = Vec::new();
+    for matched in matches {
+        if let Some(last) = merged.last_mut() {
+            if matched.start < last.end {
+                last.end = last.end.max(matched.end);
+                continue;
+            }
+        }
+        merged.push(matched);
+    }
+    merged
+}
+
+fn scroll_to_match(line: usize, visible: usize, max_scroll: usize) -> usize {
+    line.saturating_sub(visible / 3).min(max_scroll)
+}
+
+fn pager_loop(
+    stdout: &mut io::Stdout,
+    conv: &Conversation,
+    initial_query: &str,
+) -> crate::error::Result<PagerAction> {
     let mut lines = viewer::build_session_lines(conv)?;
     let (_, rows) = terminal::size().unwrap_or((80, 24));
     let visible = (rows as usize).saturating_sub(1);
-    let mut scroll: usize = lines.len().saturating_sub(visible);
+    let mut search_query = initial_query.trim().to_string();
+    let mut search_input_mode = false;
+    let mut search = ViewerSearch::new(&search_query, &lines);
+    let mut scroll = if let Some(line) = search.as_ref().and_then(ViewerSearch::current_line) {
+        scroll_to_match(line, visible, lines.len().saturating_sub(visible))
+    } else {
+        lines.len().saturating_sub(visible)
+    };
 
     loop {
-        if let Err(e) = draw_pager(stdout, &lines, scroll, conv) {
+        if let Err(e) = draw_pager(
+            stdout,
+            &lines,
+            scroll,
+            conv,
+            search.as_ref(),
+            search_input_mode,
+            &search_query,
+        ) {
             return Err(crate::error::AppError::Io(e));
         }
 
@@ -762,167 +1186,97 @@ fn pager_loop(stdout: &mut io::Stdout, conv: &Conversation) -> crate::error::Res
             Err(e) => return Err(crate::error::AppError::Io(e)),
         };
 
-        // Only handle key press events (not release/repeat)
-        if matches!(&evt, Event::Key(ke) if ke.kind != KeyEventKind::Press) {
-            continue;
-        }
-
         let (_, rows) = terminal::size().unwrap_or((80, 24));
         let visible = (rows as usize).saturating_sub(1); // reserve 1 for status bar
         let max_scroll = lines.len().saturating_sub(visible);
 
-        match evt {
-            // Back to list
-            Event::Key(KeyEvent {
-                code: KeyCode::Esc, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('q'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            }) => {
-                return Ok(PagerAction::Back);
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
-                return Ok(PagerAction::Back);
-            }
-            // Copy full conversation to clipboard (Shift-Y) — must be before lowercase y
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('Y'),
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('y'),
-                modifiers: KeyModifiers::SHIFT,
-                ..
-            }) => {
-                return Ok(PagerAction::CopyConversation);
-            }
-            // Copy session ID
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('y'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => {
-                return Ok(PagerAction::CopyId);
-            }
-            // Export conversation to file
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('e'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => {
-                return Ok(PagerAction::ExportFile);
-            }
-            // Resume session
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => {
-                return Ok(PagerAction::Resume);
-            }
-            // Refresh
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('r'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => {
+        match pager_key_action(&evt, search_input_mode) {
+            PagerKeyAction::Back => return Ok(PagerAction::Back),
+            PagerKeyAction::CopyConversation => return Ok(PagerAction::CopyConversation),
+            PagerKeyAction::CopyId => return Ok(PagerAction::CopyId),
+            PagerKeyAction::ExportFile => return Ok(PagerAction::ExportFile),
+            PagerKeyAction::Resume => return Ok(PagerAction::Resume),
+            PagerKeyAction::Refresh => {
                 let old_len = lines.len();
                 lines = viewer::build_session_lines(conv)?;
+                search = ViewerSearch::new(&search_query, &lines);
                 // If new content appeared and we were at the bottom, follow the tail
                 let was_at_bottom = scroll >= old_len.saturating_sub(visible);
                 let new_max = lines.len().saturating_sub(visible);
-                if was_at_bottom && lines.len() > old_len {
+                if let Some(line) = search.as_ref().and_then(ViewerSearch::current_line) {
+                    scroll = scroll_to_match(line, visible, new_max);
+                } else if was_at_bottom && lines.len() > old_len {
                     scroll = new_max;
                 } else if scroll > new_max {
                     scroll = new_max;
                 }
             }
-            // Scroll
-            Event::Key(KeyEvent {
-                code: KeyCode::Up, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => {
+            PagerKeyAction::NextMatch => {
+                if let Some(search) = search.as_mut() {
+                    search.next();
+                    if let Some(line) = search.current_line() {
+                        scroll = scroll_to_match(line, visible, max_scroll);
+                    }
+                }
+            }
+            PagerKeyAction::PreviousMatch => {
+                if let Some(search) = search.as_mut() {
+                    search.previous();
+                    if let Some(line) = search.current_line() {
+                        scroll = scroll_to_match(line, visible, max_scroll);
+                    }
+                }
+            }
+            PagerKeyAction::StartSearch => {
+                search_input_mode = true;
+                search_query.clear();
+                search = None;
+            }
+            PagerKeyAction::CommitSearch => {
+                search_input_mode = false;
+                search = ViewerSearch::new(&search_query, &lines);
+                if let Some(line) = search.as_ref().and_then(ViewerSearch::current_line) {
+                    scroll = scroll_to_match(line, visible, max_scroll);
+                }
+            }
+            PagerKeyAction::CancelSearch => {
+                search_input_mode = false;
+            }
+            PagerKeyAction::BackspaceSearch => {
+                search_query.pop();
+                search = ViewerSearch::new(&search_query, &lines);
+                if let Some(line) = search.as_ref().and_then(ViewerSearch::current_line) {
+                    scroll = scroll_to_match(line, visible, max_scroll);
+                }
+            }
+            PagerKeyAction::TypeSearch(c) => {
+                search_query.push(c);
+                search = ViewerSearch::new(&search_query, &lines);
+                if let Some(line) = search.as_ref().and_then(ViewerSearch::current_line) {
+                    scroll = scroll_to_match(line, visible, max_scroll);
+                }
+            }
+            PagerKeyAction::MoveUp => {
                 scroll = scroll.saturating_sub(1);
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Down,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => {
+            PagerKeyAction::MoveDown => {
                 if scroll < max_scroll {
                     scroll += 1;
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::PageUp,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('u'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
+            PagerKeyAction::PageUp => {
                 scroll = scroll.saturating_sub(visible / 2);
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::PageDown,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char(' '),
-                ..
-            }) => {
+            PagerKeyAction::PageDown => {
                 scroll = (scroll + visible / 2).min(max_scroll);
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Home,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('g'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => {
+            PagerKeyAction::Home => {
                 scroll = 0;
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::End, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('G'),
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('g'),
-                modifiers: KeyModifiers::SHIFT,
-                ..
-            }) => {
+            PagerKeyAction::End => {
                 scroll = max_scroll;
             }
-            _ => {}
+            PagerKeyAction::Ignore => {}
         }
     }
 }
@@ -932,6 +1286,9 @@ fn draw_pager(
     lines: &[StyledLine],
     scroll: usize,
     conv: &Conversation,
+    search: Option<&ViewerSearch>,
+    search_input_mode: bool,
+    search_query: &str,
 ) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
     let cols = cols as usize;
@@ -951,7 +1308,7 @@ fn draw_pager(
         }
 
         execute!(stdout, cursor::MoveTo(0, i as u16))?;
-        render_styled_line(stdout, &lines[line_idx], cols)?;
+        render_styled_line(stdout, &lines[line_idx], cols, search, line_idx)?;
     }
 
     // Status bar: session details on left, keys + progress on right
@@ -965,9 +1322,16 @@ fn draw_pager(
     let age = format_relative_time(conv.timestamp);
     let sid = short_id(&conv.session_id);
     let left = format!(" {} ({}) {} {}", project, model, age, sid);
+    let search_status = if search_input_mode {
+        format!(" /{} ", search_query)
+    } else {
+        search
+            .map(|search| format!(" n/N:{} /:search ", search.status_label()))
+            .unwrap_or_else(|| " /:search ".to_string())
+    };
     let right = format!(
-        "jk/\u{2191}\u{2193}  g/G  y:id Y:copy e:export  o:resume  r:refresh  q:back  {}% ",
-        progress
+        "jk/\u{2191}\u{2193}  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
+        search_status, progress
     );
     let gap = cols.saturating_sub(left.len() + right.len());
     let status = format!("{}{}{}", left, " ".repeat(gap), right);
@@ -987,19 +1351,100 @@ fn render_styled_line(
     stdout: &mut io::Stdout,
     spans: &[Span],
     _max_width: usize,
+    search: Option<&ViewerSearch>,
+    line_idx: usize,
 ) -> io::Result<()> {
+    let line_matches = search
+        .map(|search| search.line_matches(line_idx))
+        .unwrap_or_default();
+    let mut line_offset = 0;
     for span in spans {
-        if span.bold {
-            execute!(stdout, SetAttribute(Attribute::Bold))?;
+        render_span_with_highlights(stdout, span, line_offset, &line_matches)?;
+        line_offset += span.text.len();
+    }
+    Ok(())
+}
+
+impl ViewerSearch {
+    fn line_matches(&self, line_idx: usize) -> Vec<(&ViewerMatch, bool)> {
+        self.matches
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.line == line_idx)
+            .map(|(idx, m)| (m, idx == self.current))
+            .collect()
+    }
+}
+
+fn render_span_with_highlights(
+    stdout: &mut io::Stdout,
+    span: &Span,
+    span_start: usize,
+    line_matches: &[(&ViewerMatch, bool)],
+) -> io::Result<()> {
+    let span_end = span_start + span.text.len();
+    let mut cursor = 0;
+
+    for (matched, is_active) in line_matches {
+        if matched.end <= span_start || matched.start >= span_end {
+            continue;
         }
-        if span.dim {
-            execute!(stdout, SetAttribute(Attribute::Dim))?;
+        let local_start = matched
+            .start
+            .saturating_sub(span_start)
+            .min(span.text.len());
+        let local_end = (matched.end.min(span_end) - span_start).min(span.text.len());
+        if local_start > cursor {
+            print_span_segment(stdout, span, &span.text[cursor..local_start])?;
         }
-        if let Some((r, g, b)) = span.fg {
-            execute!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
+        if local_end > local_start {
+            print_highlight_segment(stdout, &span.text[local_start..local_end], *is_active)?;
         }
-        execute!(stdout, Print(&span.text))?;
-        execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+        cursor = local_end;
+    }
+
+    if cursor < span.text.len() {
+        print_span_segment(stdout, span, &span.text[cursor..])?;
+    }
+
+    Ok(())
+}
+
+fn print_span_segment(stdout: &mut io::Stdout, span: &Span, text: &str) -> io::Result<()> {
+    if span.bold {
+        execute!(stdout, SetAttribute(Attribute::Bold))?;
+    }
+    if span.dim {
+        execute!(stdout, SetAttribute(Attribute::Dim))?;
+    }
+    if let Some((r, g, b)) = span.fg {
+        execute!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
+    }
+    execute!(stdout, Print(text))?;
+    execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+fn print_highlight_segment(stdout: &mut io::Stdout, text: &str, active: bool) -> io::Result<()> {
+    if active {
+        execute!(
+            stdout,
+            SetForegroundColor(Color::Black),
+            SetBackgroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold),
+            Print(text),
+            ResetColor,
+            SetAttribute(Attribute::Reset)
+        )?;
+    } else {
+        execute!(
+            stdout,
+            SetForegroundColor(Color::Black),
+            SetBackgroundColor(Color::DarkYellow),
+            Print(text),
+            ResetColor,
+            SetAttribute(Attribute::Reset)
+        )?;
     }
     Ok(())
 }
