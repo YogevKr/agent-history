@@ -22,6 +22,8 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
+const PICKER_HINT: &str = "  Enter: view  Tab: expand/collapse  \u{2190}: copy ID";
+
 /// Run interactive session picker. Returns Ok(()) on clean exit.
 pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
     if conversations.is_empty() {
@@ -122,11 +124,6 @@ fn main_loop(
                 }
             },
             PickerAction::CopyId(idx) => idx,
-            PickerAction::ResumeSession(idx) => {
-                let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
-                let _ = terminal::disable_raw_mode();
-                return crate::resume::resume_session(&conversations[idx]);
-            }
             PickerAction::Quit => return Ok(()),
         };
         let id = &conversations[idx].session_id;
@@ -138,8 +135,79 @@ fn main_loop(
 enum PickerAction {
     ViewSession(usize),
     CopyId(usize),
-    ResumeSession(usize),
     Quit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PickerKeyAction {
+    Quit,
+    ViewSession,
+    MoveUp,
+    MoveDown,
+    Backspace,
+    ToggleTreeExpansion,
+    CopyId,
+    Type(char),
+    Ignore,
+}
+
+fn picker_key_action(evt: &Event) -> PickerKeyAction {
+    let Event::Key(key) = evt else {
+        return PickerKeyAction::Ignore;
+    };
+
+    if key.kind != KeyEventKind::Press {
+        return PickerKeyAction::Ignore;
+    }
+
+    match *key {
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => PickerKeyAction::Quit,
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } => PickerKeyAction::ViewSession,
+        KeyEvent {
+            code: KeyCode::Up, ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('k'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => PickerKeyAction::MoveUp,
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => PickerKeyAction::MoveDown,
+        KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        } => PickerKeyAction::Backspace,
+        KeyEvent {
+            code: KeyCode::Tab, ..
+        } => PickerKeyAction::ToggleTreeExpansion,
+        KeyEvent {
+            code: KeyCode::Left,
+            ..
+        } => PickerKeyAction::CopyId,
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers,
+            ..
+        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => PickerKeyAction::Type(c),
+        _ => PickerKeyAction::Ignore,
+    }
 }
 
 // ── Picker (list view) ────────────────────────────────
@@ -168,97 +236,40 @@ fn picker_loop(
             Err(_) => return PickerAction::Quit,
         };
 
-        // Only handle key press events (not release/repeat)
-        if matches!(&evt, Event::Key(ke) if ke.kind != KeyEventKind::Press) {
-            continue;
-        }
-
-        match evt {
-            Event::Key(KeyEvent {
-                code: KeyCode::Esc, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
-                return PickerAction::Quit;
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                ..
-            }) => {
+        match picker_key_action(&evt) {
+            PickerKeyAction::Quit => return PickerAction::Quit,
+            PickerKeyAction::ViewSession => {
                 if !state.filtered_indices.is_empty() {
                     let idx = state.filtered_indices[state.selected];
                     return PickerAction::ViewSession(idx);
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Up, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
+            PickerKeyAction::MoveUp => {
                 if state.selected > 0 {
                     state.selected -= 1;
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Down,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
+            PickerKeyAction::MoveDown => {
                 if state.selected + 1 < state.filtered_indices.len() {
                     state.selected += 1;
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            }) => {
+            PickerKeyAction::Backspace => {
                 state.query.pop();
                 refilter(conversations, state);
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Tab, ..
-            }) => {
-                toggle_tree_expansion(conversations, state);
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Left,
-                ..
-            }) => {
+            PickerKeyAction::ToggleTreeExpansion => toggle_tree_expansion(conversations, state),
+            PickerKeyAction::CopyId => {
                 if !state.filtered_indices.is_empty() {
                     let idx = state.filtered_indices[state.selected];
                     return PickerAction::CopyId(idx);
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Right,
-                ..
-            }) => {
-                if !state.filtered_indices.is_empty() {
-                    let idx = state.filtered_indices[state.selected];
-                    return PickerAction::ResumeSession(idx);
-                }
+            PickerKeyAction::Type(c) => {
+                state.query.push(c);
+                refilter(conversations, state);
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            }) => {
-                if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT {
-                    state.query.push(c);
-                    refilter(conversations, state);
-                }
-            }
-            _ => {}
+            PickerKeyAction::Ignore => {}
         }
     }
 }
@@ -402,7 +413,7 @@ fn draw_picker(
 
     // Line 1: match count + hint + flash
     let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
-    let hint = "  Tab: expand/collapse  \u{2190}: copy ID  \u{2192}: resume";
+    let hint = PICKER_HINT;
     let flash_text = flash.unwrap_or("");
     let gap = cols.saturating_sub(count.len() + hint.len() + flash_text.len() + 2);
     execute!(
@@ -709,6 +720,19 @@ mod tests {
             picker_hierarchy_marker(&child, &collapsed, true),
             format_hierarchy_marker(&child)
         );
+    }
+
+    #[test]
+    fn right_arrow_is_ignored_in_picker() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        assert_eq!(picker_key_action(&event), PickerKeyAction::Ignore);
+    }
+
+    #[test]
+    fn picker_hint_does_not_advertise_arrow_resume() {
+        assert!(!PICKER_HINT.contains("resume"));
+        assert!(!PICKER_HINT.contains("\u{2192}"));
     }
 }
 
