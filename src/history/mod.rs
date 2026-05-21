@@ -38,6 +38,8 @@ pub struct Conversation {
     pub git_branch: Option<String>,
     pub subagent_name: Option<String>,
     pub hierarchy_has_children: bool,
+    pub hierarchy_has_next_sibling: bool,
+    pub hierarchy_marker: Option<String>,
     pub hierarchy_depth: usize,
     pub hierarchy_order: usize,
     pub hierarchy_sort_timestamp: DateTime<Local>,

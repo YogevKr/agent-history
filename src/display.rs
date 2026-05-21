@@ -2,10 +2,40 @@ use crate::history::{Conversation, SessionSource};
 use chrono::{DateTime, Local};
 use colored::Colorize;
 
-/// Short session ID (first 8 chars)
+pub const HIERARCHY_GUTTER_WIDTH: usize = 10;
+
+/// Short session ID.
 pub fn short_id(id: &str) -> &str {
+    if is_uuid_like(id) {
+        let start = id.char_indices().rev().nth(7).map(|(i, _)| i).unwrap_or(0);
+        return &id[start..];
+    }
+
     let end = id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len());
     &id[..end]
+}
+
+fn is_uuid_like(id: &str) -> bool {
+    let mut parts = id.split('-');
+    matches!(
+        (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next()
+        ),
+        (Some(a), Some(b), Some(c), Some(d), Some(e), None)
+            if a.len() == 8
+                && b.len() == 4
+                && c.len() == 4
+                && d.len() == 4
+                && e.len() == 12
+                && [a, b, c, d, e]
+                    .iter()
+                    .all(|part| part.chars().all(|ch| ch.is_ascii_hexdigit()))
+    )
 }
 
 pub fn format_result(conv: &Conversation) -> String {
@@ -21,8 +51,15 @@ pub fn format_result(conv: &Conversation) -> String {
     let preview = truncate(&title, 60);
     let sid = short_id(&conv.session_id).dimmed();
     format!(
-        " {} {:>6}  {} {:<20}  ({})  {}  \"{}\"",
-        source_tag, age, hierarchy, project, model, sid, preview
+        " {} {:>6}  {:<gutter_width$}{:<20}  ({})  {}  \"{}\"",
+        source_tag,
+        age,
+        hierarchy,
+        project,
+        model,
+        sid,
+        preview,
+        gutter_width = HIERARCHY_GUTTER_WIDTH
     )
 }
 
@@ -37,16 +74,30 @@ pub fn format_project_label(conv: &Conversation) -> String {
         .to_string()
 }
 
-pub fn format_hierarchy_marker(conv: &Conversation) -> &'static str {
-    if conv.subagent_name.is_some() {
-        return "└";
+pub fn format_hierarchy_marker(conv: &Conversation) -> String {
+    if let Some(marker) = conv.hierarchy_marker.as_ref() {
+        return marker.clone();
+    }
+
+    if conv.hierarchy_depth > 0 {
+        let connector = if conv.hierarchy_has_next_sibling {
+            "├─"
+        } else {
+            "└─"
+        };
+        let mut marker = String::new();
+        for _ in 0..conv.hierarchy_depth {
+            marker.push_str("│ ");
+        }
+        marker.push_str(connector);
+        return marker;
     }
 
     if conv.hierarchy_has_children {
-        return "├";
+        return "┬─".to_string();
     }
 
-    " "
+    String::new()
 }
 
 pub fn format_relative_time(timestamp: DateTime<Local>) -> String {
@@ -154,6 +205,8 @@ mod tests {
             git_branch: None,
             subagent_name: Some("review".to_string()),
             hierarchy_has_children: false,
+            hierarchy_has_next_sibling: false,
+            hierarchy_marker: None,
             hierarchy_depth: 1,
             hierarchy_order: 1,
             hierarchy_sort_timestamp: timestamp,
@@ -180,6 +233,8 @@ mod tests {
             git_branch: None,
             subagent_name: None,
             hierarchy_has_children: true,
+            hierarchy_has_next_sibling: false,
+            hierarchy_marker: None,
             hierarchy_depth: 0,
             hierarchy_order: 0,
             hierarchy_sort_timestamp: timestamp,
@@ -190,13 +245,19 @@ mod tests {
     fn format_result_labels_parent_rows_with_children() {
         let rendered = format_result(&parent_conversation());
 
-        assert!(rendered.contains("├ project"));
+        assert!(rendered.contains("┬─        project"));
     }
 
     #[test]
     fn format_result_labels_subagent_rows() {
         let rendered = format_result(&conversation());
 
-        assert!(rendered.contains("└ review"));
+        assert!(rendered.contains("│ └─      review"));
+    }
+
+    #[test]
+    fn short_id_uses_uuid_suffix_to_avoid_ulid_prefix_collisions() {
+        assert_eq!(short_id("019e4aec-7d77-7783-9e57-0bb26a8d848a"), "6a8d848a");
+        assert_eq!(short_id("019e4aec-930e-7a52-8a49-b659df8fb813"), "df8fb813");
     }
 }
