@@ -15,8 +15,6 @@ use crate::codex_parser::{
 use crate::error::Result;
 use crate::history::{compare_conversations, Conversation, SessionSource};
 
-const INDEX_SCAN_MIN_LINES: usize = 256;
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexLoadOptions {
     pub include_full_text: bool,
@@ -98,7 +96,7 @@ fn collect_file_index(
     let mut first_timestamp: Option<String> = None;
     let mut session_timestamp: Option<String> = None;
 
-    for (line_number, line) in reader.lines().enumerate() {
+    for line in reader.lines() {
         let line = match line {
             Ok(line) => line,
             Err(_) => continue,
@@ -218,15 +216,6 @@ fn collect_file_index(
             }
             _ => {}
         }
-
-        if index_scan_complete(
-            line_number + 1,
-            session_id.as_ref(),
-            &preview,
-            message_count,
-        ) {
-            break;
-        }
     }
 
     let turn_models = model_candidates
@@ -301,17 +290,6 @@ fn collect_file_index(
     };
 
     Some((path.clone(), metadata, conversation))
-}
-
-fn index_scan_complete(
-    line_count: usize,
-    session_id: Option<&String>,
-    preview: &str,
-    message_count: usize,
-) -> bool {
-    line_count >= INDEX_SCAN_MIN_LINES
-        && session_id.is_some()
-        && (!preview.is_empty() || message_count > 0)
 }
 
 fn event_message_text(evt: &EventMsg) -> Option<(bool, String)> {
@@ -859,6 +837,12 @@ mod tests {
         fs::write(dir.join(name), lines.join("\n")).unwrap();
     }
 
+    fn write_session_strings(root: &std::path::Path, name: &str, lines: &[String]) {
+        let dir = root.join("sessions/2026/05/20");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(name), lines.join("\n")).unwrap();
+    }
+
     #[test]
     fn backfills_exec_wrapper_model_from_matching_turn_context() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -941,6 +925,47 @@ mod tests {
             .unwrap();
         assert_eq!(session.preview, "Index preview");
         assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
+        assert!(session.full_text.is_empty());
+    }
+
+    #[test]
+    fn load_codex_sessions_counts_messages_and_tokens_after_initial_scan_window() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+        let mut lines = vec![
+            r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"long-session","cwd":"/tmp/project","originator":"codex-tui"}}"#.to_string(),
+            r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"user_message","message":"Index preview"}}"#.to_string(),
+        ];
+        for i in 0..300 {
+            lines.push(format!(
+                r#"{{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{{"type":"agent_message","message":"Later answer {i}"}}}}"#
+            ));
+        }
+        lines.push(
+            r#"{"timestamp":"2026-05-20T22:45:30Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":400,"output_tokens":599,"total_tokens":999}}}}"#.to_string(),
+        );
+
+        write_session_strings(
+            root.path(),
+            "rollout-2026-05-20T15-45-27-long.jsonl",
+            &lines,
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+        let sessions = load_codex_sessions().unwrap();
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        let session = sessions
+            .iter()
+            .find(|session| session.session_id == "long-session")
+            .unwrap();
+        assert_eq!(session.message_count, 301);
+        assert_eq!(session.total_tokens, 999);
         assert!(session.full_text.is_empty());
     }
 

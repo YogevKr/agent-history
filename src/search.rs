@@ -3,7 +3,7 @@ use crate::history::{Conversation, SessionSource};
 use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -249,11 +249,6 @@ fn sync_sqlite_search_index(
     conversations: &[Conversation],
 ) -> SearchIndexResult<HashMap<String, SearchMeta>> {
     let existing = read_sqlite_meta(conn)?;
-    let current_paths: HashSet<String> = conversations
-        .iter()
-        .map(|conv| conv.path.to_string_lossy().to_string())
-        .collect();
-
     let changes: Vec<IndexChange> = conversations
         .par_iter()
         .filter_map(|conv| {
@@ -276,20 +271,11 @@ fn sync_sqlite_search_index(
         })
         .collect();
 
-    let stale_paths: Vec<String> = existing
-        .keys()
-        .filter(|path| !current_paths.contains(*path))
-        .cloned()
-        .collect();
-
-    if changes.is_empty() && stale_paths.is_empty() {
+    if changes.is_empty() {
         return Ok(existing);
     }
 
     let tx = conn.transaction()?;
-    for path in stale_paths {
-        delete_indexed_path(&tx, &path)?;
-    }
     for change in changes {
         match change {
             IndexChange::Upsert(session) => {
@@ -677,5 +663,44 @@ mod tests {
             vec![0]
         );
         assert!(search_full(&conversations, &index, "first needle", Local::now()).is_empty());
+    }
+
+    #[test]
+    fn full_search_index_keeps_rows_outside_current_filter_scope() {
+        let first = codex_jsonl(&[
+            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"first-session","cwd":"/tmp/project-a"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible first"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Alpha needle context"}}"#,
+        ]);
+        let second = codex_jsonl(&[
+            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"second-session","cwd":"/tmp/project-b"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible second"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Beta needle context"}}"#,
+        ]);
+        let all_conversations = vec![
+            conversation(
+                SessionSource::Codex,
+                first.path().to_path_buf(),
+                "Visible first",
+                "",
+            ),
+            conversation(
+                SessionSource::Codex,
+                second.path().to_path_buf(),
+                "Visible second",
+                "",
+            ),
+        ];
+        let filtered_conversations = vec![all_conversations[0].clone()];
+        let cache_dir = tempdir().unwrap();
+        let index_path = cache_dir.path().join("search-index.sqlite");
+
+        precompute_full_search_index_with_db_path(&all_conversations, &index_path);
+        precompute_full_search_index_with_db_path(&filtered_conversations, &index_path);
+
+        let conn = Connection::open(&index_path).unwrap();
+        let meta = read_sqlite_meta(&conn).unwrap();
+        assert!(meta.contains_key(&first.path().to_string_lossy().to_string()));
+        assert!(meta.contains_key(&second.path().to_string_lossy().to_string()));
     }
 }
