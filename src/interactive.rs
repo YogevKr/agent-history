@@ -864,6 +864,26 @@ mod tests {
         assert!(!rendered.contains("f"));
     }
 
+    #[test]
+    fn viewer_search_can_navigate_matches_after_soft_wrapping_long_rows() {
+        let raw_lines = vec![vec![test_span(
+            "first memory_limiter second memory_limiter",
+        )]];
+        let wrapped = wrap_styled_lines(&raw_lines, 20);
+        let wrapped_text: Vec<String> = wrapped.iter().map(styled_line_text).collect();
+
+        assert_eq!(wrapped.len(), 4);
+        assert_eq!(
+            wrapped_text,
+            vec!["first", "memory_limiter", "second", "memory_limiter"]
+        );
+
+        let mut search = ViewerSearch::new("memory_limiter", &wrapped).unwrap();
+        assert_eq!(search.current_line(), Some(1));
+        search.next();
+        assert_eq!(search.current_line(), Some(3));
+    }
+
     fn test_span(text: &str) -> Span {
         Span {
             text: text.to_string(),
@@ -928,19 +948,45 @@ impl ViewerSearch {
     }
 
     fn next(&mut self) {
-        if !self.matches.is_empty() {
-            self.current = (self.current + 1) % self.matches.len();
+        if self.matches.is_empty() {
+            return;
         }
+
+        let fallback = (self.current + 1) % self.matches.len();
+        let current_line = self.matches[self.current].line;
+        for step in 1..=self.matches.len() {
+            let candidate = (self.current + step) % self.matches.len();
+            if self.matches[candidate].line != current_line {
+                self.current = candidate;
+                return;
+            }
+        }
+        self.current = fallback;
     }
 
     fn previous(&mut self) {
-        if !self.matches.is_empty() {
-            self.current = if self.current == 0 {
-                self.matches.len() - 1
-            } else {
-                self.current - 1
-            };
+        if self.matches.is_empty() {
+            return;
         }
+
+        let fallback = if self.current == 0 {
+            self.matches.len() - 1
+        } else {
+            self.current - 1
+        };
+        let current_line = self.matches[self.current].line;
+        for step in 1..=self.matches.len() {
+            let candidate = if self.current >= step {
+                self.current - step
+            } else {
+                self.matches.len() + self.current - step
+            };
+            if self.matches[candidate].line != current_line {
+                self.current = candidate;
+                return;
+            }
+        }
+        self.current = fallback;
     }
 
     fn status_label(&self) -> String {
@@ -1207,13 +1253,133 @@ fn scroll_to_match(line: usize, visible: usize, max_scroll: usize) -> usize {
     line.saturating_sub(visible / 3).min(max_scroll)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SpanStyle {
+    fg: Option<(u8, u8, u8)>,
+    bold: bool,
+    dim: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StyledChar {
+    ch: char,
+    style: SpanStyle,
+}
+
+fn pager_body_width(cols: usize) -> usize {
+    cols.saturating_sub(1).max(1)
+}
+
+fn wrap_styled_lines(lines: &[StyledLine], max_width: usize) -> Vec<StyledLine> {
+    let max_width = max_width.max(1);
+    let mut wrapped = Vec::new();
+
+    for line in lines {
+        let mut current = Vec::new();
+        let mut current_width = 0;
+        let mut last_break = None;
+
+        for span in line {
+            let style = SpanStyle {
+                fg: span.fg,
+                bold: span.bold,
+                dim: span.dim,
+            };
+
+            for ch in span.text.chars() {
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                while current_width > 0 && current_width + ch_width > max_width {
+                    if let Some(break_idx) = last_break.filter(|idx| *idx > 0) {
+                        wrapped.push(styled_chars_to_line(&current[..break_idx]));
+                        current = current[(break_idx + 1)..].to_vec();
+                        trim_leading_whitespace(&mut current);
+                        current_width = styled_chars_width(&current);
+                    } else {
+                        wrapped.push(styled_chars_to_line(&current));
+                        current.clear();
+                        current_width = 0;
+                    }
+                    last_break = current.iter().rposition(|unit| unit.ch.is_whitespace());
+                }
+
+                if current.is_empty() && ch.is_whitespace() {
+                    continue;
+                }
+                current.push(StyledChar { ch, style });
+                current_width += ch_width;
+                if ch.is_whitespace() {
+                    last_break = Some(current.len() - 1);
+                }
+            }
+        }
+
+        wrapped.push(styled_chars_to_line(&current));
+    }
+
+    wrapped
+}
+
+fn trim_leading_whitespace(chars: &mut Vec<StyledChar>) {
+    let first_non_whitespace = chars
+        .iter()
+        .position(|unit| !unit.ch.is_whitespace())
+        .unwrap_or(chars.len());
+    if first_non_whitespace > 0 {
+        chars.drain(..first_non_whitespace);
+    }
+}
+
+fn styled_chars_width(chars: &[StyledChar]) -> usize {
+    chars
+        .iter()
+        .map(|unit| UnicodeWidthChar::width(unit.ch).unwrap_or(0))
+        .sum()
+}
+
+fn styled_chars_to_line(chars: &[StyledChar]) -> StyledLine {
+    let mut line = Vec::new();
+    let Some(first) = chars.first() else {
+        return line;
+    };
+
+    let mut style = first.style;
+    let mut text = String::new();
+
+    for unit in chars {
+        if unit.style != style {
+            line.push(Span {
+                text,
+                fg: style.fg,
+                bold: style.bold,
+                dim: style.dim,
+            });
+            style = unit.style;
+            text = String::new();
+        }
+        text.push(unit.ch);
+    }
+
+    if !text.is_empty() {
+        line.push(Span {
+            text,
+            fg: style.fg,
+            bold: style.bold,
+            dim: style.dim,
+        });
+    }
+
+    line
+}
+
 fn pager_loop(
     stdout: &mut io::Stdout,
     conv: &Conversation,
     initial_query: &str,
 ) -> crate::error::Result<PagerAction> {
-    let mut lines = viewer::build_session_lines(conv)?;
-    let (_, rows) = terminal::size().unwrap_or((80, 24));
+    let mut raw_lines = viewer::build_session_lines(conv)?;
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let mut wrap_width = pager_body_width(cols as usize);
+    let mut lines = wrap_styled_lines(&raw_lines, wrap_width);
     let visible = (rows as usize).saturating_sub(1);
     let mut search_query = initial_query.trim().to_string();
     let mut search_input_mode = false;
@@ -1242,9 +1408,24 @@ fn pager_loop(
             Err(e) => return Err(crate::error::AppError::Io(e)),
         };
 
-        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let current_wrap_width = pager_body_width(cols as usize);
+        let mut rewrapped = false;
+        if current_wrap_width != wrap_width {
+            wrap_width = current_wrap_width;
+            lines = wrap_styled_lines(&raw_lines, wrap_width);
+            search = ViewerSearch::new(&search_query, &lines);
+            rewrapped = true;
+        }
         let visible = (rows as usize).saturating_sub(1); // reserve 1 for status bar
         let max_scroll = lines.len().saturating_sub(visible);
+        if rewrapped {
+            if let Some(line) = search.as_ref().and_then(ViewerSearch::current_line) {
+                scroll = scroll_to_match(line, visible, max_scroll);
+            }
+        } else if scroll > max_scroll {
+            scroll = max_scroll;
+        }
 
         let search_has_matches = search
             .as_ref()
@@ -1258,7 +1439,8 @@ fn pager_loop(
             PagerKeyAction::Resume => return Ok(PagerAction::Resume),
             PagerKeyAction::Refresh => {
                 let old_len = lines.len();
-                lines = viewer::build_session_lines(conv)?;
+                raw_lines = viewer::build_session_lines(conv)?;
+                lines = wrap_styled_lines(&raw_lines, wrap_width);
                 search = ViewerSearch::new(&search_query, &lines);
                 // If new content appeared and we were at the bottom, follow the tail
                 let was_at_bottom = scroll >= old_len.saturating_sub(visible);
@@ -1371,7 +1553,7 @@ fn draw_pager(
         render_styled_line(
             stdout,
             &lines[line_idx],
-            cols.saturating_sub(1),
+            pager_body_width(cols),
             search,
             line_idx,
         )?;
