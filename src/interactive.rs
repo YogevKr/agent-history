@@ -46,6 +46,7 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
     let mut state = PickerState {
         query: String::new(),
         selected: 0,
+        scroll: 0,
         filtered_indices,
         searchable: precompute_search_text(&conversations),
         full_search_index: None,
@@ -73,6 +74,7 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
 struct PickerState {
     query: String,
     selected: usize,
+    scroll: usize,
     filtered_indices: Vec<usize>,
     searchable: Vec<SearchableConversation>,
     full_search_index: Option<FullSearchIndex>,
@@ -243,26 +245,71 @@ fn picker_visible_rows() -> usize {
     (rows as usize).saturating_sub(2).max(1)
 }
 
-fn move_picker_selection(
+fn max_picker_scroll(len: usize, visible: usize) -> usize {
+    len.saturating_sub(visible.max(1))
+}
+
+fn keep_picker_selection_visible(
     selected: usize,
+    scroll: usize,
     len: usize,
-    page_size: usize,
-    action: PickerKeyAction,
+    visible: usize,
 ) -> usize {
     if len == 0 {
         return 0;
     }
 
+    let visible = visible.max(1);
     let selected = selected.min(len - 1);
-    match action {
+    let max_scroll = max_picker_scroll(len, visible);
+    let scroll = scroll.min(max_scroll);
+
+    if selected < scroll {
+        selected
+    } else if selected >= scroll + visible {
+        selected.saturating_sub(visible - 1).min(max_scroll)
+    } else {
+        scroll
+    }
+}
+
+fn move_picker_selection_and_scroll(
+    selected: usize,
+    scroll: usize,
+    len: usize,
+    visible: usize,
+    action: PickerKeyAction,
+) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+
+    let visible = visible.max(1);
+    let selected = selected.min(len - 1);
+    let scroll = keep_picker_selection_visible(selected, scroll, len, visible);
+    let row = selected.saturating_sub(scroll).min(visible - 1);
+    let max_scroll = max_picker_scroll(len, visible);
+
+    let next_selected = match action {
         PickerKeyAction::MoveUp => selected.saturating_sub(1),
         PickerKeyAction::MoveDown => (selected + 1).min(len - 1),
-        PickerKeyAction::PageUp => selected.saturating_sub(page_size.max(1)),
-        PickerKeyAction::PageDown => selected.saturating_add(page_size.max(1)).min(len - 1),
+        PickerKeyAction::PageUp => selected.saturating_sub(visible),
+        PickerKeyAction::PageDown => selected.saturating_add(visible).min(len - 1),
         PickerKeyAction::Home => 0,
         PickerKeyAction::End => len - 1,
         _ => selected,
-    }
+    };
+
+    let next_scroll = match action {
+        PickerKeyAction::PageUp | PickerKeyAction::PageDown => {
+            next_selected.saturating_sub(row).min(max_scroll)
+        }
+        PickerKeyAction::Home => 0,
+        PickerKeyAction::End => max_scroll,
+        _ => keep_picker_selection_visible(next_selected, scroll, len, visible),
+    };
+
+    (next_selected, next_scroll)
 }
 
 // ── Picker (list view) ────────────────────────────────
@@ -280,6 +327,7 @@ fn picker_loop(
             &state.query,
             &state.expanded_tree_roots,
             state.selected,
+            state.scroll,
             state.flash.as_deref(),
         ) {
             return PickerAction::Quit;
@@ -305,8 +353,9 @@ fn picker_loop(
             | PickerKeyAction::PageDown
             | PickerKeyAction::Home
             | PickerKeyAction::End) => {
-                state.selected = move_picker_selection(
+                (state.selected, state.scroll) = move_picker_selection_and_scroll(
                     state.selected,
+                    state.scroll,
                     state.filtered_indices.len(),
                     picker_visible_rows(),
                     action,
@@ -354,6 +403,12 @@ fn refilter(conversations: &[Conversation], state: &mut PickerState) {
     if state.selected >= state.filtered_indices.len() {
         state.selected = state.filtered_indices.len().saturating_sub(1);
     }
+    state.scroll = keep_picker_selection_visible(
+        state.selected,
+        state.scroll,
+        state.filtered_indices.len(),
+        picker_visible_rows(),
+    );
 }
 
 fn toggle_tree_expansion(conversations: &[Conversation], state: &mut PickerState) {
@@ -387,6 +442,12 @@ fn toggle_tree_expansion(conversations: &[Conversation], state: &mut PickerState
     {
         state.selected = position;
     }
+    state.scroll = keep_picker_selection_visible(
+        state.selected,
+        state.scroll,
+        state.filtered_indices.len(),
+        picker_visible_rows(),
+    );
 }
 
 fn tree_root_id(conversations: &[Conversation], index: usize) -> Option<String> {
@@ -447,6 +508,7 @@ fn draw_picker(
     query: &str,
     expanded_tree_roots: &HashSet<String>,
     selected: usize,
+    scroll: usize,
     flash: Option<&str>,
 ) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
@@ -495,12 +557,7 @@ fn draw_picker(
     // Lines 2..rows: session list
     let list_start = 2usize;
     let visible = rows.saturating_sub(list_start);
-
-    let scroll = if selected >= visible {
-        selected - visible + 1
-    } else {
-        0
-    };
+    let scroll = keep_picker_selection_visible(selected, scroll, filtered_indices.len(), visible);
 
     for i in 0..visible {
         let list_idx = scroll + i;
@@ -819,18 +876,49 @@ mod tests {
     #[test]
     fn picker_navigation_pages_and_jumps_within_bounds() {
         assert_eq!(
-            move_picker_selection(3, 20, 5, PickerKeyAction::PageDown),
-            8
+            move_picker_selection_and_scroll(0, 0, 20, 5, PickerKeyAction::PageDown),
+            (5, 5)
         );
         assert_eq!(
-            move_picker_selection(18, 20, 5, PickerKeyAction::PageDown),
-            19
+            move_picker_selection_and_scroll(4, 0, 20, 5, PickerKeyAction::PageDown),
+            (9, 5)
         );
-        assert_eq!(move_picker_selection(7, 20, 5, PickerKeyAction::PageUp), 2);
-        assert_eq!(move_picker_selection(2, 20, 5, PickerKeyAction::PageUp), 0);
-        assert_eq!(move_picker_selection(7, 20, 5, PickerKeyAction::Home), 0);
-        assert_eq!(move_picker_selection(7, 20, 5, PickerKeyAction::End), 19);
-        assert_eq!(move_picker_selection(7, 0, 5, PickerKeyAction::End), 0);
+        assert_eq!(
+            move_picker_selection_and_scroll(9, 5, 20, 5, PickerKeyAction::PageUp),
+            (4, 0)
+        );
+        assert_eq!(
+            move_picker_selection_and_scroll(7, 3, 20, 5, PickerKeyAction::Home),
+            (0, 0)
+        );
+        assert_eq!(
+            move_picker_selection_and_scroll(7, 3, 20, 5, PickerKeyAction::End),
+            (19, 15)
+        );
+        assert_eq!(
+            move_picker_selection_and_scroll(7, 3, 0, 5, PickerKeyAction::End),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn picker_arrow_navigation_scrolls_only_at_view_edges() {
+        assert_eq!(
+            move_picker_selection_and_scroll(2, 0, 20, 5, PickerKeyAction::MoveDown),
+            (3, 0)
+        );
+        assert_eq!(
+            move_picker_selection_and_scroll(4, 0, 20, 5, PickerKeyAction::MoveDown),
+            (5, 1)
+        );
+        assert_eq!(
+            move_picker_selection_and_scroll(5, 1, 20, 5, PickerKeyAction::MoveUp),
+            (4, 1)
+        );
+        assert_eq!(
+            move_picker_selection_and_scroll(1, 1, 20, 5, PickerKeyAction::MoveUp),
+            (0, 0)
+        );
     }
 
     #[test]
