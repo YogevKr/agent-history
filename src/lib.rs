@@ -19,9 +19,10 @@ mod theme;
 mod viewer;
 
 use crate::cli::{parse_duration_secs, Cli, SourceFilter};
+use crate::codex_loader::CodexLoadOptions;
 use crate::display::format_result;
-use crate::history::{Conversation, SessionSource};
-use crate::search::{precompute_search_text, search};
+use crate::history::{compare_conversations, Conversation, SessionSource};
+use crate::search::{precompute_full_search_index, search_full};
 use chrono::Local;
 use clap::Parser;
 
@@ -35,17 +36,40 @@ pub fn run() {
 fn run_inner() -> error::Result<()> {
     let args = Cli::parse();
 
-    // Load from both sources in parallel
+    let load_claude = !matches!(args.source, Some(SourceFilter::Codex));
+    let load_codex = !matches!(args.source, Some(SourceFilter::Claude));
+    let codex_options = CodexLoadOptions {
+        include_full_text: false,
+    };
+
+    // Load requested sources in parallel. Codex rows stay lightweight here;
+    // query mode hydrates full bodies through the persistent search cache.
     let (claude_result, codex_result) = rayon::join(
-        || claude_loader::load_claude_sessions(),
-        || codex_loader::load_codex_sessions(),
+        || {
+            if load_claude {
+                claude_loader::load_claude_sessions()
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        || {
+            if load_codex {
+                if codex_options.include_full_text {
+                    codex_loader::load_codex_sessions_with_options(codex_options)
+                } else {
+                    codex_loader::load_codex_sessions()
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        },
     );
 
     let mut conversations = claude_result.unwrap_or_default();
     conversations.extend(codex_result.unwrap_or_default());
 
     // Sort all by timestamp descending
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by(compare_conversations);
 
     // Deduplicate by session_id (same session can appear in multiple project dirs)
     {
@@ -76,8 +100,8 @@ fn run_inner() -> error::Result<()> {
 
     // Non-interactive: search or list to stdout
     if let Some(ref query) = args.query {
-        let searchable = precompute_search_text(&filtered);
-        let results = search(&filtered, &searchable, query, Local::now());
+        let index = precompute_full_search_index(&filtered);
+        let results = search_full(&filtered, &index, query, Local::now());
         for &idx in results.iter().take(args.limit) {
             println!("{}", format_result(&filtered[idx]));
         }
@@ -203,6 +227,13 @@ mod tests {
             summary: None,
             custom_title: None,
             git_branch: None,
+            subagent_name: None,
+            hierarchy_has_children: false,
+            hierarchy_has_next_sibling: false,
+            hierarchy_marker: None,
+            hierarchy_depth: 0,
+            hierarchy_order: 0,
+            hierarchy_sort_timestamp: Local::now(),
         }
     }
 

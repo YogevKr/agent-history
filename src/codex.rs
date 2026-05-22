@@ -20,6 +20,16 @@ pub struct SessionMeta {
     pub git: Option<GitInfo>,
     #[serde(default)]
     pub model_provider: Option<String>,
+    #[serde(default)]
+    pub source: Option<serde_json::Value>,
+    #[serde(default)]
+    pub thread_source: Option<String>,
+    #[serde(default)]
+    pub agent_nickname: Option<String>,
+    #[serde(default)]
+    pub agent_role: Option<String>,
+    #[serde(default)]
+    pub agent_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

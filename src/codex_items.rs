@@ -159,7 +159,7 @@ fn response_message(item: &ResponseItem) -> Option<(CodexRole, String)> {
     Some((role, text))
 }
 
-fn clean_user_message(text: &str) -> Option<String> {
+pub(crate) fn clean_user_message(text: &str) -> Option<String> {
     let mut rest = text.trim();
 
     loop {

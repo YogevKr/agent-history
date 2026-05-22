@@ -1,4 +1,5 @@
 use chrono::{DateTime, Local};
+use std::cmp::Ordering;
 use std::path::PathBuf;
 
 /// Source of a session
@@ -35,4 +36,19 @@ pub struct Conversation {
     pub summary: Option<String>,
     pub custom_title: Option<String>,
     pub git_branch: Option<String>,
+    pub subagent_name: Option<String>,
+    pub hierarchy_has_children: bool,
+    pub hierarchy_has_next_sibling: bool,
+    pub hierarchy_marker: Option<String>,
+    pub hierarchy_depth: usize,
+    pub hierarchy_order: usize,
+    pub hierarchy_sort_timestamp: DateTime<Local>,
+}
+
+pub fn compare_conversations(a: &Conversation, b: &Conversation) -> Ordering {
+    b.hierarchy_sort_timestamp
+        .cmp(&a.hierarchy_sort_timestamp)
+        .then_with(|| a.hierarchy_order.cmp(&b.hierarchy_order))
+        .then_with(|| b.timestamp.cmp(&a.timestamp))
+        .then_with(|| a.session_id.cmp(&b.session_id))
 }
