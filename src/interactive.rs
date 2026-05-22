@@ -25,7 +25,8 @@ use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use unicode_width::UnicodeWidthChar;
 
-const PICKER_HINT: &str = "  Enter: view  Tab: expand/collapse  \u{2190}: copy ID";
+const PICKER_HINT: &str =
+    "  Enter: view  PgUp/PgDn Home/End  Tab: expand/collapse  \u{2190}: copy ID";
 
 /// Run interactive session picker. Returns Ok(()) on clean exit.
 pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
@@ -152,6 +153,10 @@ enum PickerKeyAction {
     ViewSession,
     MoveUp,
     MoveDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
     Backspace,
     ToggleTreeExpansion,
     CopyId,
@@ -199,6 +204,21 @@ fn picker_key_action(evt: &Event) -> PickerKeyAction {
             ..
         } => PickerKeyAction::MoveDown,
         KeyEvent {
+            code: KeyCode::PageUp,
+            ..
+        } => PickerKeyAction::PageUp,
+        KeyEvent {
+            code: KeyCode::PageDown,
+            ..
+        } => PickerKeyAction::PageDown,
+        KeyEvent {
+            code: KeyCode::Home,
+            ..
+        } => PickerKeyAction::Home,
+        KeyEvent {
+            code: KeyCode::End, ..
+        } => PickerKeyAction::End,
+        KeyEvent {
             code: KeyCode::Backspace,
             ..
         } => PickerKeyAction::Backspace,
@@ -215,6 +235,33 @@ fn picker_key_action(evt: &Event) -> PickerKeyAction {
             ..
         } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => PickerKeyAction::Type(c),
         _ => PickerKeyAction::Ignore,
+    }
+}
+
+fn picker_visible_rows() -> usize {
+    let (_, rows) = terminal::size().unwrap_or((80, 24));
+    (rows as usize).saturating_sub(2).max(1)
+}
+
+fn move_picker_selection(
+    selected: usize,
+    len: usize,
+    page_size: usize,
+    action: PickerKeyAction,
+) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let selected = selected.min(len - 1);
+    match action {
+        PickerKeyAction::MoveUp => selected.saturating_sub(1),
+        PickerKeyAction::MoveDown => (selected + 1).min(len - 1),
+        PickerKeyAction::PageUp => selected.saturating_sub(page_size.max(1)),
+        PickerKeyAction::PageDown => selected.saturating_add(page_size.max(1)).min(len - 1),
+        PickerKeyAction::Home => 0,
+        PickerKeyAction::End => len - 1,
+        _ => selected,
     }
 }
 
@@ -252,15 +299,18 @@ fn picker_loop(
                     return PickerAction::ViewSession(idx);
                 }
             }
-            PickerKeyAction::MoveUp => {
-                if state.selected > 0 {
-                    state.selected -= 1;
-                }
-            }
-            PickerKeyAction::MoveDown => {
-                if state.selected + 1 < state.filtered_indices.len() {
-                    state.selected += 1;
-                }
+            action @ (PickerKeyAction::MoveUp
+            | PickerKeyAction::MoveDown
+            | PickerKeyAction::PageUp
+            | PickerKeyAction::PageDown
+            | PickerKeyAction::Home
+            | PickerKeyAction::End) => {
+                state.selected = move_picker_selection(
+                    state.selected,
+                    state.filtered_indices.len(),
+                    picker_visible_rows(),
+                    action,
+                );
             }
             PickerKeyAction::Backspace => {
                 state.query.pop();
@@ -735,6 +785,52 @@ mod tests {
         let event = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
         assert_eq!(picker_key_action(&event), PickerKeyAction::Ignore);
+    }
+
+    #[test]
+    fn picker_keymap_supports_page_and_home_end_navigation() {
+        assert_eq!(
+            picker_key_action(&Event::Key(KeyEvent::new(
+                KeyCode::PageDown,
+                KeyModifiers::NONE
+            ))),
+            PickerKeyAction::PageDown
+        );
+        assert_eq!(
+            picker_key_action(&Event::Key(KeyEvent::new(
+                KeyCode::PageUp,
+                KeyModifiers::NONE
+            ))),
+            PickerKeyAction::PageUp
+        );
+        assert_eq!(
+            picker_key_action(&Event::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE
+            ))),
+            PickerKeyAction::Home
+        );
+        assert_eq!(
+            picker_key_action(&Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))),
+            PickerKeyAction::End
+        );
+    }
+
+    #[test]
+    fn picker_navigation_pages_and_jumps_within_bounds() {
+        assert_eq!(
+            move_picker_selection(3, 20, 5, PickerKeyAction::PageDown),
+            8
+        );
+        assert_eq!(
+            move_picker_selection(18, 20, 5, PickerKeyAction::PageDown),
+            19
+        );
+        assert_eq!(move_picker_selection(7, 20, 5, PickerKeyAction::PageUp), 2);
+        assert_eq!(move_picker_selection(2, 20, 5, PickerKeyAction::PageUp), 0);
+        assert_eq!(move_picker_selection(7, 20, 5, PickerKeyAction::Home), 0);
+        assert_eq!(move_picker_selection(7, 20, 5, PickerKeyAction::End), 19);
+        assert_eq!(move_picker_selection(7, 0, 5, PickerKeyAction::End), 0);
     }
 
     #[test]
