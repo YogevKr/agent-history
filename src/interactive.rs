@@ -567,81 +567,79 @@ fn draw_picker(
     let cols = cols as usize;
     let rows = rows as usize;
 
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 0),
-        terminal::Clear(ClearType::All)
-    )?;
-
-    // Line 0: search prompt
-    execute!(
-        stdout,
-        SetForegroundColor(Color::Yellow),
-        SetAttribute(Attribute::Bold),
-        Print("> "),
-        ResetColor,
-        Print(query),
-    )?;
-
-    // Line 1: match count + hint + flash
-    let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
-    let hint = PICKER_HINT;
-    let flash_text = flash.unwrap_or("");
-    let gap = cols.saturating_sub(count.len() + hint.len() + flash_text.len() + 2);
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 1),
-        SetForegroundColor(Color::DarkGrey),
-        Print(&count),
-        Print(hint),
-        ResetColor,
-    )?;
-    if !flash_text.is_empty() {
+    draw_frame(stdout, |stdout| {
+        // Line 0: search prompt
+        clear_row(stdout, 0)?;
         execute!(
             stdout,
-            Print(" ".repeat(gap)),
-            SetForegroundColor(Color::Green),
-            Print(flash_text),
+            SetForegroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold),
+            Print("> "),
+            ResetColor,
+            Print(query),
+        )?;
+
+        // Line 1: match count + hint + flash
+        let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
+        let hint = PICKER_HINT;
+        let flash_text = flash.unwrap_or("");
+        let gap = cols.saturating_sub(count.len() + hint.len() + flash_text.len() + 2);
+        clear_row(stdout, 1)?;
+        execute!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print(&count),
+            Print(hint),
             ResetColor,
         )?;
-    }
-
-    // Lines 2..rows: session list
-    let list_start = 2usize;
-    let visible = rows.saturating_sub(list_start);
-    let scroll = keep_picker_selection_visible(selected, scroll, filtered_indices.len(), visible);
-
-    for i in 0..visible {
-        let list_idx = scroll + i;
-        if list_idx >= filtered_indices.len() {
-            break;
-        }
-        let conv = &conversations[filtered_indices[list_idx]];
-        let is_selected = list_idx == selected;
-
-        execute!(stdout, cursor::MoveTo(0, (list_start + i) as u16))?;
-
-        if is_selected {
-            execute!(stdout, SetAttribute(Attribute::Reverse))?;
+        if !flash_text.is_empty() {
+            execute!(
+                stdout,
+                Print(" ".repeat(gap)),
+                SetForegroundColor(Color::Green),
+                Print(flash_text),
+                ResetColor,
+            )?;
         }
 
-        draw_session_line(
-            stdout,
-            conv,
-            cols,
-            is_selected,
-            expanded_tree_roots,
-            query.is_empty(),
-        )?;
+        // Lines 2..rows: session list
+        let list_start = 2usize;
+        let visible = rows.saturating_sub(list_start);
+        let scroll =
+            keep_picker_selection_visible(selected, scroll, filtered_indices.len(), visible);
 
-        if is_selected {
-            execute!(stdout, SetAttribute(Attribute::NoReverse))?;
+        for i in 0..visible {
+            let row = list_start + i;
+            clear_row(stdout, row)?;
+
+            let list_idx = scroll + i;
+            if list_idx >= filtered_indices.len() {
+                continue;
+            }
+            let conv = &conversations[filtered_indices[list_idx]];
+            let is_selected = list_idx == selected;
+
+            if is_selected {
+                execute!(stdout, SetAttribute(Attribute::Reverse))?;
+            }
+
+            draw_session_line(
+                stdout,
+                conv,
+                cols,
+                is_selected,
+                expanded_tree_roots,
+                query.is_empty(),
+            )?;
+
+            if is_selected {
+                execute!(stdout, SetAttribute(Attribute::NoReverse))?;
+            }
         }
-    }
 
-    execute!(stdout, cursor::MoveTo((2 + query.len()) as u16, 0))?;
-    stdout.flush()?;
-    Ok(())
+        execute!(stdout, cursor::MoveTo((2 + query.len()) as u16, 0))?;
+        Ok(())
+    })
 }
 
 fn draw_session_line(
@@ -1798,62 +1796,77 @@ fn draw_pager(
     let rows = rows as usize;
     let content_rows = rows.saturating_sub(1); // reserve last row for status
 
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 0),
-        terminal::Clear(ClearType::All)
-    )?;
+    draw_frame(stdout, |stdout| {
+        for i in 0..content_rows {
+            clear_row(stdout, i)?;
+            let line_idx = scroll + i;
+            if line_idx >= lines.len() {
+                continue;
+            }
 
-    for i in 0..content_rows {
-        let line_idx = scroll + i;
-        if line_idx >= lines.len() {
-            break;
+            render_styled_line(
+                stdout,
+                &lines[line_idx],
+                pager_body_width(cols),
+                search,
+                line_idx,
+            )?;
         }
 
-        execute!(stdout, cursor::MoveTo(0, i as u16))?;
-        render_styled_line(
+        // Status bar: session details on left, keys + progress on right
+        let progress = if lines.is_empty() {
+            100
+        } else {
+            ((scroll + content_rows).min(lines.len()) * 100) / lines.len()
+        };
+        let project = format_project_label(conv);
+        let model = format_model_short(conv.model.as_deref());
+        let age = format_relative_time(conv.timestamp);
+        let sid = short_id(&conv.session_id);
+        let left = format!(" {} ({}) {} {}", project, model, age, sid);
+        let search_status = if search_input_mode {
+            format!(" /{} ", search_query)
+        } else {
+            search
+                .map(|search| format!(" \u{2191}\u{2193}/nN:{} /:search ", search.status_label()))
+                .unwrap_or_else(|| " /:search ".to_string())
+        };
+        let right = format!(
+            "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
+            search_status, progress
+        );
+        let gap = cols.saturating_sub(left.len() + right.len());
+        let status = format!("{}{}{}", left, " ".repeat(gap), right);
+        clear_row(stdout, rows - 1)?;
+        execute!(
             stdout,
-            &lines[line_idx],
-            pager_body_width(cols),
-            search,
-            line_idx,
+            SetAttribute(Attribute::Reverse),
+            Print(format!("{:<width$}", status, width = cols)),
+            SetAttribute(Attribute::NoReverse),
         )?;
-    }
 
-    // Status bar: session details on left, keys + progress on right
-    let progress = if lines.is_empty() {
-        100
-    } else {
-        ((scroll + content_rows).min(lines.len()) * 100) / lines.len()
-    };
-    let project = format_project_label(conv);
-    let model = format_model_short(conv.model.as_deref());
-    let age = format_relative_time(conv.timestamp);
-    let sid = short_id(&conv.session_id);
-    let left = format!(" {} ({}) {} {}", project, model, age, sid);
-    let search_status = if search_input_mode {
-        format!(" /{} ", search_query)
-    } else {
-        search
-            .map(|search| format!(" \u{2191}\u{2193}/nN:{} /:search ", search.status_label()))
-            .unwrap_or_else(|| " /:search ".to_string())
-    };
-    let right = format!(
-        "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
-        search_status, progress
-    );
-    let gap = cols.saturating_sub(left.len() + right.len());
-    let status = format!("{}{}{}", left, " ".repeat(gap), right);
+        Ok(())
+    })
+}
+
+fn draw_frame(
+    stdout: &mut io::Stdout,
+    render: impl FnOnce(&mut io::Stdout) -> io::Result<()>,
+) -> io::Result<()> {
+    execute!(stdout, terminal::BeginSynchronizedUpdate)?;
+    let render_result = render(stdout);
+    let end_result = execute!(stdout, terminal::EndSynchronizedUpdate);
+    render_result?;
+    end_result?;
+    stdout.flush()
+}
+
+fn clear_row(stdout: &mut io::Stdout, row: usize) -> io::Result<()> {
     execute!(
         stdout,
-        cursor::MoveTo(0, (rows - 1) as u16),
-        SetAttribute(Attribute::Reverse),
-        Print(format!("{:<width$}", status, width = cols)),
-        SetAttribute(Attribute::NoReverse),
-    )?;
-
-    stdout.flush()?;
-    Ok(())
+        cursor::MoveTo(0, row as u16),
+        terminal::Clear(ClearType::CurrentLine)
+    )
 }
 
 fn render_styled_line<W: Write>(
