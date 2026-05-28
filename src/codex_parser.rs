@@ -205,8 +205,8 @@ pub fn process_codex_file(
         })
         .unwrap_or_else(Local::now);
 
-    // project_name: last component of cwd
-    let project_name = cwd
+    // directory_name: last component of cwd
+    let directory_name = cwd
         .as_ref()
         .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(String::from));
 
@@ -217,7 +217,7 @@ pub fn process_codex_file(
         timestamp,
         preview,
         full_text,
-        project_name,
+        directory_name,
         cwd,
         message_count,
         model,
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn process_basic_session() {
         let lines = &[
-            r#"{"timestamp":"2026-03-19T14:28:54Z","type":"session_meta","payload":{"id":"test-id-123","cwd":"/home/user/project","git":{"branch":"main"}}}"#,
+            r#"{"timestamp":"2026-03-19T14:28:54Z","type":"session_meta","payload":{"id":"test-id-123","cwd":"/home/user/directory","git":{"branch":"main"}}}"#,
             r#"{"timestamp":"2026-03-19T14:28:55Z","type":"turn_context","payload":{"model":"gpt-4o"}}"#,
             r#"{"timestamp":"2026-03-19T14:29:00Z","type":"event_msg","payload":{"type":"user_message","message":"Hello world"}}"#,
             r#"{"timestamp":"2026-03-19T14:29:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Hi there!"}}"#,
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(conv.total_tokens, 150);
         assert_eq!(conv.message_count, 2);
         assert_eq!(conv.git_branch, Some("main".to_string()));
-        assert_eq!(conv.project_name, Some("project".to_string()));
+        assert_eq!(conv.directory_name, Some("directory".to_string()));
         assert_eq!(conv.source, SessionSource::Codex);
     }
 
@@ -328,8 +328,8 @@ mod tests {
     #[test]
     fn subagent_dispatch_envelope_sets_preview_when_user_context_is_stripped() {
         let lines = &[
-            r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"subagent-session","cwd":"/tmp/project","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","agent_nickname":"Hypatia"}}},"thread_source":"subagent","agent_nickname":"Hypatia"}}"#,
-            r##"{"timestamp":"2026-05-21T14:24:34Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nignore this context\n</INSTRUCTIONS>"}]}}"##,
+            r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"subagent-session","cwd":"/tmp/directory","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","agent_nickname":"Hypatia"}}},"thread_source":"subagent","agent_nickname":"Hypatia"}}"#,
+            r##"{"timestamp":"2026-05-21T14:24:34Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/directory\n\n<INSTRUCTIONS>\nignore this context\n</INSTRUCTIONS>"}]}}"##,
             r#"{"timestamp":"2026-05-21T14:24:35Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"author\":\"/root\",\"recipient\":\"/root/review_compaction_fix\",\"other_recipients\":[],\"content\":\"Review the local unstaged diff for compaction correctness.\",\"trigger_turn\":true}"}]}}"#,
             r#"{"timestamp":"2026-05-21T14:24:36Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"No actionable findings."}]}}"#,
         ];

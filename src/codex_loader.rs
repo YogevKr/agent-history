@@ -31,6 +31,7 @@ struct CodexFileMetadata {
     session_id: Option<String>,
     cwd: Option<String>,
     task_turn_id: Option<String>,
+    task_turn_ids: Vec<String>,
     turn_models: Vec<(TaskModelKey, String)>,
     subagent_name: Option<String>,
     parent_session_id: Option<String>,
@@ -44,6 +45,24 @@ impl CodexFileMetadata {
             cwd: self.cwd.clone()?,
             turn_id: self.task_turn_id.clone()?,
         })
+    }
+
+    fn task_keys(&self) -> Vec<TaskModelKey> {
+        let Some(cwd) = self.cwd.clone() else {
+            return Vec::new();
+        };
+        let turn_ids = if self.task_turn_ids.is_empty() {
+            self.task_turn_id.iter().cloned().collect()
+        } else {
+            self.task_turn_ids.clone()
+        };
+        turn_ids
+            .into_iter()
+            .map(|turn_id| TaskModelKey {
+                cwd: cwd.clone(),
+                turn_id,
+            })
+            .collect()
     }
 }
 
@@ -81,6 +100,7 @@ fn collect_file_index(
     let reader = BufReader::new(file);
 
     let mut task_turn_id: Option<String> = None;
+    let mut task_turn_ids: Vec<String> = Vec::new();
     let mut cwd: Option<String> = None;
     let mut model_candidates: Vec<(Option<String>, Option<String>, String)> = Vec::new();
     let mut first_model: Option<String> = None;
@@ -102,9 +122,6 @@ fn collect_file_index(
             Err(_) => continue,
         };
         if line.trim().is_empty() {
-            continue;
-        }
-        if !should_parse_codex_index_line(&line) {
             continue;
         }
 
@@ -172,8 +189,15 @@ fn collect_file_index(
             }
             "event_msg" => {
                 if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
-                    if evt.event_type == "task_started" && task_turn_id.is_none() {
-                        task_turn_id = evt.turn_id.clone();
+                    if evt.event_type == "task_started" {
+                        if let Some(turn_id) = evt.turn_id.as_ref() {
+                            if task_turn_id.is_none() {
+                                task_turn_id = Some(turn_id.clone());
+                            }
+                            if !task_turn_ids.contains(turn_id) {
+                                task_turn_ids.push(turn_id.clone());
+                            }
+                        }
                     }
                     if evt.event_type == "token_count" {
                         if let Some(info) = evt.info.as_ref() {
@@ -234,6 +258,7 @@ fn collect_file_index(
         session_id: session_id.clone(),
         cwd: cwd.clone(),
         task_turn_id,
+        task_turn_ids,
         turn_models,
         subagent_name,
         parent_session_id,
@@ -257,7 +282,7 @@ fn collect_file_index(
             first_timestamp.as_deref(),
             modified,
         );
-        let project_name = cwd.as_ref().and_then(|path| {
+        let directory_name = cwd.as_ref().and_then(|path| {
             PathBuf::from(path)
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -273,7 +298,7 @@ fn collect_file_index(
             timestamp,
             preview,
             full_text: String::new(),
-            project_name,
+            directory_name,
             cwd: cwd.map(PathBuf::from),
             message_count,
             model,
@@ -293,68 +318,6 @@ fn collect_file_index(
     };
 
     Some((path.clone(), metadata, conversation))
-}
-
-fn should_parse_codex_index_line(line: &str) -> bool {
-    let header = line_prefix(line, 2048);
-
-    if line_has_json_type(header, "session_meta") || line_has_json_type(header, "turn_context") {
-        return true;
-    }
-
-    if line_has_json_type(header, "event_msg") {
-        return line_has_json_type(header, "task_started")
-            || line_has_json_type(header, "token_count")
-            || line_has_json_type(header, "user_message")
-            || line_has_json_type(header, "agent_message");
-    }
-
-    line_has_json_type(header, "response_item") && line_has_json_type(header, "message")
-}
-
-fn line_prefix(line: &str, max_bytes: usize) -> &str {
-    if line.len() <= max_bytes {
-        return line;
-    }
-
-    let mut end = max_bytes;
-    while end > 0 && !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    &line[..end]
-}
-
-fn line_has_json_type(line: &str, ty: &str) -> bool {
-    match ty {
-        "session_meta" => {
-            line.contains(r#""type":"session_meta""#) || line.contains(r#""type": "session_meta""#)
-        }
-        "turn_context" => {
-            line.contains(r#""type":"turn_context""#) || line.contains(r#""type": "turn_context""#)
-        }
-        "event_msg" => {
-            line.contains(r#""type":"event_msg""#) || line.contains(r#""type": "event_msg""#)
-        }
-        "task_started" => {
-            line.contains(r#""type":"task_started""#) || line.contains(r#""type": "task_started""#)
-        }
-        "token_count" => {
-            line.contains(r#""type":"token_count""#) || line.contains(r#""type": "token_count""#)
-        }
-        "user_message" => {
-            line.contains(r#""type":"user_message""#) || line.contains(r#""type": "user_message""#)
-        }
-        "agent_message" => {
-            line.contains(r#""type":"agent_message""#)
-                || line.contains(r#""type": "agent_message""#)
-        }
-        "response_item" => {
-            line.contains(r#""type":"response_item""#)
-                || line.contains(r#""type": "response_item""#)
-        }
-        "message" => line.contains(r#""type":"message""#) || line.contains(r#""type": "message""#),
-        _ => false,
-    }
 }
 
 fn event_message_text(evt: &EventMsg) -> Option<(bool, String)> {
@@ -526,56 +489,27 @@ fn annotate_hierarchy(
     conversations: &mut [Conversation],
     metadata_by_path: &HashMap<PathBuf, CodexFileMetadata>,
 ) {
-    let mut group_timestamps = HashMap::new();
-    let mut subagent_counts: HashMap<TaskModelKey, usize> = HashMap::new();
-    let mut parent_by_session_id: HashMap<String, String> = HashMap::new();
-    let mut children_by_session_id: HashMap<String, Vec<String>> = HashMap::new();
-    let mut child_counts_by_session_id: HashMap<String, usize> = HashMap::new();
+    let task_keys_by_path = task_keys_by_path(metadata_by_path);
+    let ThreadEdges {
+        mut parent_by_session_id,
+        mut children_by_session_id,
+        mut child_counts_by_session_id,
+    } = explicit_thread_edges(metadata_by_path);
+    let legacy_inputs =
+        legacy_hierarchy_inputs(conversations, metadata_by_path, &task_keys_by_path);
     let mut thread_group_timestamps: HashMap<String, DateTime<Local>> = HashMap::new();
     let mut timestamp_by_session_id: HashMap<String, DateTime<Local>> = HashMap::new();
     let mut thread_order_by_session_id: HashMap<String, usize> = HashMap::new();
     let mut has_next_sibling_by_session_id: HashMap<String, bool> = HashMap::new();
     let mut hierarchy_marker_by_session_id: HashMap<String, String> = HashMap::new();
 
-    for metadata in metadata_by_path.values() {
-        let Some(session_id) = metadata.session_id.as_ref() else {
-            continue;
-        };
-        let Some(parent_session_id) = metadata.parent_session_id.as_ref() else {
-            continue;
-        };
-
-        parent_by_session_id.insert(session_id.clone(), parent_session_id.clone());
-        children_by_session_id
-            .entry(parent_session_id.clone())
-            .or_default()
-            .push(session_id.clone());
-        *child_counts_by_session_id
-            .entry(parent_session_id.clone())
-            .or_insert(0) += 1;
-    }
-
-    for conversation in conversations.iter() {
-        let Some(metadata) = metadata_by_path.get(&conversation.path) else {
-            continue;
-        };
-        let Some(key) = metadata.task_key() else {
-            continue;
-        };
-
-        group_timestamps
-            .entry(key.clone())
-            .and_modify(|timestamp| {
-                if conversation.timestamp > *timestamp {
-                    *timestamp = conversation.timestamp;
-                }
-            })
-            .or_insert(conversation.timestamp);
-
-        if metadata.subagent_name.is_some() {
-            *subagent_counts.entry(key).or_insert(0) += 1;
-        }
-    }
+    attach_legacy_children_to_roots(
+        legacy_inputs.legacy_children_by_key,
+        &legacy_inputs.root_session_by_key,
+        &mut parent_by_session_id,
+        &mut children_by_session_id,
+        &mut child_counts_by_session_id,
+    );
 
     for conversation in conversations.iter() {
         let Some(metadata) = metadata_by_path.get(&conversation.path) else {
@@ -613,19 +547,16 @@ fn annotate_hierarchy(
     }
     let mut subtree_latest_cache = HashMap::new();
     for root_session_id in thread_roots {
-        let mut next_order = 0;
-        assign_thread_order(
-            &root_session_id,
-            &children_by_session_id,
-            &timestamp_by_session_id,
-            &mut subtree_latest_cache,
-            &mut thread_order_by_session_id,
-            &mut has_next_sibling_by_session_id,
-            &mut hierarchy_marker_by_session_id,
-            &[],
-            false,
-            &mut next_order,
-        );
+        let mut context = ThreadOrderContext {
+            children_by_session_id: &children_by_session_id,
+            timestamp_by_session_id: &timestamp_by_session_id,
+            subtree_latest_cache: &mut subtree_latest_cache,
+            thread_order_by_session_id: &mut thread_order_by_session_id,
+            has_next_sibling_by_session_id: &mut has_next_sibling_by_session_id,
+            hierarchy_marker_by_session_id: &mut hierarchy_marker_by_session_id,
+            next_order: 0,
+        };
+        assign_thread_order(&root_session_id, &mut context, &[], false, true);
     }
 
     for conversation in conversations {
@@ -667,14 +598,30 @@ fn annotate_hierarchy(
             continue;
         }
 
-        let Some(key) = metadata.task_key() else {
+        let keys = task_keys_by_path
+            .get(&conversation.path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if keys.is_empty() {
             continue;
-        };
-
-        if let Some(timestamp) = group_timestamps.get(&key) {
-            conversation.hierarchy_sort_timestamp = *timestamp;
         }
-        conversation.hierarchy_has_children = subagent_counts.get(&key).copied().unwrap_or(0) > 0;
+        let legacy_group_timestamp = keys
+            .iter()
+            .filter_map(|key| legacy_inputs.group_timestamps.get(key).copied())
+            .max();
+        let has_legacy_subagents = keys
+            .iter()
+            .any(|key| legacy_inputs.subagent_counts.get(key).copied().unwrap_or(0) > 0);
+        let primary_key = metadata.task_key();
+        let has_legacy_parent = primary_key
+            .as_ref()
+            .is_some_and(|key| legacy_inputs.root_counts.get(key).copied().unwrap_or(0) > 0);
+
+        if let Some(timestamp) = legacy_group_timestamp {
+            conversation.hierarchy_sort_timestamp = timestamp;
+        }
+        conversation.hierarchy_has_children =
+            metadata.subagent_name.is_none() && has_legacy_subagents;
         conversation.hierarchy_has_next_sibling = false;
         conversation.hierarchy_marker = conversation
             .hierarchy_has_children
@@ -682,10 +629,17 @@ fn annotate_hierarchy(
         if let Some(subagent_name) = metadata.subagent_name.as_ref() {
             conversation.subagent_name = Some(subagent_name.clone());
             conversation.hierarchy_has_children = false;
-            conversation.hierarchy_has_next_sibling = false;
-            conversation.hierarchy_marker = Some("│ └─".to_string());
-            conversation.hierarchy_depth = 1;
-            conversation.hierarchy_order = 1;
+            if has_legacy_parent {
+                conversation.hierarchy_marker = Some("└─".to_string());
+                conversation.hierarchy_has_next_sibling = false;
+                conversation.hierarchy_depth = 1;
+                conversation.hierarchy_order = 1;
+            } else {
+                conversation.hierarchy_marker = None;
+                conversation.hierarchy_has_next_sibling = false;
+                conversation.hierarchy_depth = 0;
+                conversation.hierarchy_order = 0;
+            }
         } else if metadata.is_exec_wrapper {
             conversation.hierarchy_has_next_sibling = false;
             conversation.hierarchy_marker = conversation
@@ -693,6 +647,161 @@ fn annotate_hierarchy(
                 .then(|| "┬─".to_string());
             conversation.hierarchy_depth = 0;
             conversation.hierarchy_order = 0;
+        }
+    }
+}
+
+struct LegacyHierarchyInputs {
+    group_timestamps: HashMap<TaskModelKey, DateTime<Local>>,
+    subagent_counts: HashMap<TaskModelKey, usize>,
+    root_counts: HashMap<TaskModelKey, usize>,
+    legacy_children_by_key: HashMap<TaskModelKey, Vec<(String, DateTime<Local>)>>,
+    root_session_by_key: HashMap<TaskModelKey, (String, DateTime<Local>)>,
+}
+
+struct ThreadEdges {
+    parent_by_session_id: HashMap<String, String>,
+    children_by_session_id: HashMap<String, Vec<String>>,
+    child_counts_by_session_id: HashMap<String, usize>,
+}
+
+fn task_keys_by_path(
+    metadata_by_path: &HashMap<PathBuf, CodexFileMetadata>,
+) -> HashMap<PathBuf, Vec<TaskModelKey>> {
+    metadata_by_path
+        .iter()
+        .map(|(path, metadata)| (path.clone(), metadata.task_keys()))
+        .collect()
+}
+
+fn explicit_thread_edges(metadata_by_path: &HashMap<PathBuf, CodexFileMetadata>) -> ThreadEdges {
+    let mut parent_by_session_id: HashMap<String, String> = HashMap::new();
+    let mut children_by_session_id: HashMap<String, Vec<String>> = HashMap::new();
+    let mut child_counts_by_session_id: HashMap<String, usize> = HashMap::new();
+
+    for metadata in metadata_by_path.values() {
+        let Some(session_id) = metadata.session_id.as_ref() else {
+            continue;
+        };
+        let Some(parent_session_id) = metadata.parent_session_id.as_ref() else {
+            continue;
+        };
+
+        parent_by_session_id.insert(session_id.clone(), parent_session_id.clone());
+        children_by_session_id
+            .entry(parent_session_id.clone())
+            .or_default()
+            .push(session_id.clone());
+        *child_counts_by_session_id
+            .entry(parent_session_id.clone())
+            .or_insert(0) += 1;
+    }
+
+    ThreadEdges {
+        parent_by_session_id,
+        children_by_session_id,
+        child_counts_by_session_id,
+    }
+}
+
+fn legacy_hierarchy_inputs(
+    conversations: &[Conversation],
+    metadata_by_path: &HashMap<PathBuf, CodexFileMetadata>,
+    task_keys_by_path: &HashMap<PathBuf, Vec<TaskModelKey>>,
+) -> LegacyHierarchyInputs {
+    let mut inputs = LegacyHierarchyInputs {
+        group_timestamps: HashMap::new(),
+        subagent_counts: HashMap::new(),
+        root_counts: HashMap::new(),
+        legacy_children_by_key: HashMap::new(),
+        root_session_by_key: HashMap::new(),
+    };
+
+    for conversation in conversations {
+        let Some(metadata) = metadata_by_path.get(&conversation.path) else {
+            continue;
+        };
+        let keys = task_keys_by_path
+            .get(&conversation.path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        for key in keys {
+            inputs
+                .group_timestamps
+                .entry(key.clone())
+                .and_modify(|timestamp| {
+                    if conversation.timestamp > *timestamp {
+                        *timestamp = conversation.timestamp;
+                    }
+                })
+                .or_insert(conversation.timestamp);
+
+            if metadata.subagent_name.is_some() {
+                *inputs.subagent_counts.entry(key.clone()).or_insert(0) += 1;
+            } else {
+                *inputs.root_counts.entry(key.clone()).or_insert(0) += 1;
+                let session_id = metadata
+                    .session_id
+                    .as_ref()
+                    .unwrap_or(&conversation.session_id);
+                inputs
+                    .root_session_by_key
+                    .entry(key.clone())
+                    .and_modify(|(existing_session_id, existing_timestamp)| {
+                        if conversation.timestamp > *existing_timestamp
+                            || (conversation.timestamp == *existing_timestamp
+                                && session_id < existing_session_id)
+                        {
+                            *existing_session_id = session_id.clone();
+                            *existing_timestamp = conversation.timestamp;
+                        }
+                    })
+                    .or_insert_with(|| (session_id.clone(), conversation.timestamp));
+            }
+        }
+
+        if metadata.parent_session_id.is_none() && metadata.subagent_name.is_some() {
+            if let Some(key) = metadata.task_key() {
+                let session_id = metadata
+                    .session_id
+                    .as_ref()
+                    .unwrap_or(&conversation.session_id);
+                inputs
+                    .legacy_children_by_key
+                    .entry(key)
+                    .or_default()
+                    .push((session_id.clone(), conversation.timestamp));
+            }
+        }
+    }
+
+    inputs
+}
+
+fn attach_legacy_children_to_roots(
+    legacy_children_by_key: HashMap<TaskModelKey, Vec<(String, DateTime<Local>)>>,
+    root_session_by_key: &HashMap<TaskModelKey, (String, DateTime<Local>)>,
+    parent_by_session_id: &mut HashMap<String, String>,
+    children_by_session_id: &mut HashMap<String, Vec<String>>,
+    child_counts_by_session_id: &mut HashMap<String, usize>,
+) {
+    for (key, children) in legacy_children_by_key {
+        let Some((parent_session_id, _)) = root_session_by_key.get(&key) else {
+            continue;
+        };
+        for (session_id, _) in children {
+            if session_id == *parent_session_id || parent_by_session_id.contains_key(&session_id) {
+                continue;
+            }
+            parent_by_session_id.insert(session_id.clone(), parent_session_id.clone());
+            children_by_session_id
+                .entry(parent_session_id.clone())
+                .or_default()
+                .push(session_id);
+            *child_counts_by_session_id
+                .entry(parent_session_id.clone())
+                .or_insert(0) += 1;
         }
     }
 }
@@ -711,73 +820,76 @@ fn root_session_id(session_id: &str, parent_by_session_id: &HashMap<String, Stri
     current.to_string()
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ThreadOrderContext<'a> {
+    children_by_session_id: &'a HashMap<String, Vec<String>>,
+    timestamp_by_session_id: &'a HashMap<String, DateTime<Local>>,
+    subtree_latest_cache: &'a mut HashMap<String, Option<DateTime<Local>>>,
+    thread_order_by_session_id: &'a mut HashMap<String, usize>,
+    has_next_sibling_by_session_id: &'a mut HashMap<String, bool>,
+    hierarchy_marker_by_session_id: &'a mut HashMap<String, String>,
+    next_order: usize,
+}
+
 fn assign_thread_order(
     session_id: &str,
-    children_by_session_id: &HashMap<String, Vec<String>>,
-    timestamp_by_session_id: &HashMap<String, DateTime<Local>>,
-    subtree_latest_cache: &mut HashMap<String, Option<DateTime<Local>>>,
-    thread_order_by_session_id: &mut HashMap<String, usize>,
-    has_next_sibling_by_session_id: &mut HashMap<String, bool>,
-    hierarchy_marker_by_session_id: &mut HashMap<String, String>,
+    context: &mut ThreadOrderContext<'_>,
     ancestor_continuations: &[bool],
     has_next_sibling: bool,
-    next_order: &mut usize,
+    is_root: bool,
 ) {
-    let mut children = children_by_session_id
+    let mut children = context
+        .children_by_session_id
         .get(session_id)
         .cloned()
         .unwrap_or_default();
     children.sort_by(|a, b| {
         subtree_latest(
             b,
-            children_by_session_id,
-            timestamp_by_session_id,
-            subtree_latest_cache,
+            context.children_by_session_id,
+            context.timestamp_by_session_id,
+            context.subtree_latest_cache,
         )
         .cmp(&subtree_latest(
             a,
-            children_by_session_id,
-            timestamp_by_session_id,
-            subtree_latest_cache,
+            context.children_by_session_id,
+            context.timestamp_by_session_id,
+            context.subtree_latest_cache,
         ))
         .then_with(|| a.cmp(b))
     });
 
-    if timestamp_by_session_id.contains_key(session_id) {
-        thread_order_by_session_id.insert(session_id.to_string(), *next_order);
-        hierarchy_marker_by_session_id.insert(
+    if context.timestamp_by_session_id.contains_key(session_id) {
+        context
+            .thread_order_by_session_id
+            .insert(session_id.to_string(), context.next_order);
+        context.hierarchy_marker_by_session_id.insert(
             session_id.to_string(),
             format_thread_marker(
                 ancestor_continuations,
                 has_next_sibling,
                 !children.is_empty(),
+                is_root,
             ),
         );
-        *next_order += 1;
+        context.next_order += 1;
     }
 
     let child_count = children.len();
     for (index, child) in children.into_iter().enumerate() {
         let child_has_next_sibling = index + 1 < child_count;
         let mut child_ancestor_continuations = ancestor_continuations.to_vec();
-        child_ancestor_continuations.push(if ancestor_continuations.is_empty() {
-            true
-        } else {
-            has_next_sibling
-        });
-        has_next_sibling_by_session_id.insert(child.clone(), child_has_next_sibling);
+        if !is_root {
+            child_ancestor_continuations.push(has_next_sibling);
+        }
+        context
+            .has_next_sibling_by_session_id
+            .insert(child.clone(), child_has_next_sibling);
         assign_thread_order(
             &child,
-            children_by_session_id,
-            timestamp_by_session_id,
-            subtree_latest_cache,
-            thread_order_by_session_id,
-            has_next_sibling_by_session_id,
-            hierarchy_marker_by_session_id,
+            context,
             &child_ancestor_continuations,
             child_has_next_sibling,
-            next_order,
+            false,
         );
     }
 }
@@ -786,8 +898,16 @@ fn format_thread_marker(
     ancestor_continuations: &[bool],
     has_next_sibling: bool,
     has_children: bool,
+    is_root: bool,
 ) -> String {
     if ancestor_continuations.is_empty() {
+        if !is_root {
+            return if has_next_sibling {
+                "├─".to_string()
+            } else {
+                "└─".to_string()
+            };
+        }
         return if has_children {
             "┬─".to_string()
         } else {
@@ -910,19 +1030,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_index_scan_skips_heavy_response_items() {
-        assert!(should_parse_codex_index_line(
-            r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id"}}"#
-        ));
-        assert!(should_parse_codex_index_line(
-            r#"{"timestamp":"2026-05-20T22:45:28Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#
-        ));
-        assert!(!should_parse_codex_index_line(
-            r#"{"timestamp":"2026-05-20T22:45:29Z","type":"response_item","payload":{"type":"function_call_output","output":"large payload"}}"#
-        ));
-    }
-
-    #[test]
     fn backfills_exec_wrapper_model_from_matching_turn_context() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous_codex_home = std::env::var_os("CODEX_HOME");
@@ -932,7 +1039,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T15-45-27-parent.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/project","originator":"codex_exec","source":"exec"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/directory","originator":"codex_exec","source":"exec"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:30Z","type":"event_msg","payload":{"type":"agent_message","message":"Looks good"}}"#,
@@ -942,7 +1049,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T15-45-28-child.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"session_meta","payload":{"id":"child-session","cwd":"/tmp/project","originator":"codex_exec","source":{"subagent":"review"}}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"session_meta","payload":{"id":"child-session","cwd":"/tmp/directory","originator":"codex_exec","source":{"subagent":"review"}}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
@@ -974,6 +1081,103 @@ mod tests {
     }
 
     #[test]
+    fn keeps_legacy_subagent_without_parent_as_plain_row() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+
+        write_session(
+            root.path(),
+            "rollout-2026-05-20T15-45-28-child.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"session_meta","payload":{"id":"child-session","cwd":"/tmp/directory","originator":"codex_exec","source":{"subagent":"review"}}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
+            ],
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+        let sessions = load_codex_sessions().unwrap();
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        let child = sessions
+            .iter()
+            .find(|session| session.session_id == "child-session")
+            .unwrap();
+        assert_eq!(child.subagent_name.as_deref(), Some("review"));
+        assert_eq!(child.hierarchy_depth, 0);
+        assert!(!child.hierarchy_has_children);
+        assert_eq!(format_hierarchy_marker(child), "");
+    }
+
+    #[test]
+    fn groups_legacy_subagent_with_later_parent_turn() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+
+        write_session(
+            root.path(),
+            "rollout-2026-05-20T15-45-27-parent.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/directory","originator":"codex-tui","source":"cli"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-root"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Initial task"}}"#,
+                r#"{"timestamp":"2026-05-20T22:46:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-child"}}"#,
+                r#"{"timestamp":"2026-05-20T22:46:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
+            ],
+        );
+        write_session(
+            root.path(),
+            "rollout-2026-05-20T15-46-30-child-a.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T22:46:30Z","type":"session_meta","payload":{"id":"child-a","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":"review"}}}"#,
+                r#"{"timestamp":"2026-05-20T22:46:31Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-child"}}"#,
+                r#"{"timestamp":"2026-05-20T22:46:32Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
+            ],
+        );
+        write_session(
+            root.path(),
+            "rollout-2026-05-20T15-46-20-child-b.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T22:46:20Z","type":"session_meta","payload":{"id":"child-b","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":"audit"}}}"#,
+                r#"{"timestamp":"2026-05-20T22:46:21Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-child"}}"#,
+                r#"{"timestamp":"2026-05-20T22:46:22Z","type":"event_msg","payload":{"type":"user_message","message":"Audit this"}}"#,
+            ],
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+        let sessions = load_codex_sessions().unwrap();
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        let parent_position = sessions
+            .iter()
+            .position(|session| session.session_id == "parent-session")
+            .unwrap();
+        let child_a_position = sessions
+            .iter()
+            .position(|session| session.session_id == "child-a")
+            .unwrap();
+        let child_b_position = sessions
+            .iter()
+            .position(|session| session.session_id == "child-b")
+            .unwrap();
+        assert!(parent_position < child_a_position);
+        assert!(child_a_position < child_b_position);
+        assert!(sessions[parent_position].hierarchy_has_children);
+        assert_eq!(format_hierarchy_marker(&sessions[child_a_position]), "├─");
+        assert_eq!(format_hierarchy_marker(&sessions[child_b_position]), "└─");
+    }
+
+    #[test]
     fn load_codex_sessions_uses_lightweight_index_by_default() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous_codex_home = std::env::var_os("CODEX_HOME");
@@ -983,7 +1187,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T15-45-27-session.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/directory","originator":"codex-tui"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Index preview"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:30Z","type":"event_msg","payload":{"type":"agent_message","message":"Body that should stay lazy"}}"#,
@@ -1013,7 +1217,7 @@ mod tests {
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         let root = tempdir().unwrap();
         let mut lines = vec![
-            r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"long-session","cwd":"/tmp/project","originator":"codex-tui"}}"#.to_string(),
+            r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"long-session","cwd":"/tmp/directory","originator":"codex-tui"}}"#.to_string(),
             r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"user_message","message":"Index preview"}}"#.to_string(),
         ];
         for i in 0..300 {
@@ -1058,7 +1262,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T15-45-27-session.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/directory","originator":"codex-tui"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"user_message","message":"Searchable body"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"agent_message","message":"Searchable answer"}}"#,
             ],
@@ -1093,7 +1297,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T15-45-27-parent.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/project-a","originator":"codex_exec","source":"exec"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/directory-a","originator":"codex_exec","source":"exec"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
             ],
@@ -1102,7 +1306,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T15-45-28-unrelated.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"session_meta","payload":{"id":"unrelated-session","cwd":"/tmp/project-b","originator":"codex_exec","source":{"subagent":"review"}}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"session_meta","payload":{"id":"unrelated-session","cwd":"/tmp/directory-b","originator":"codex_exec","source":{"subagent":"review"}}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review that"}}"#,
@@ -1134,7 +1338,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T15-45-27-parent.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/project","originator":"codex_exec","source":"exec"}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/directory","originator":"codex_exec","source":"exec"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
             ],
@@ -1143,7 +1347,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T15-45-28-child.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"session_meta","payload":{"id":"child-session","cwd":"/tmp/project","originator":"codex_exec","source":{"subagent":"review"}}}"#,
+                r#"{"timestamp":"2026-05-20T22:45:28Z","type":"session_meta","payload":{"id":"child-session","cwd":"/tmp/directory","originator":"codex_exec","source":{"subagent":"review"}}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:28Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
                 r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
@@ -1179,7 +1383,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-21T07-24-33-019e4aec-7d77-7783-9e57-0bb26a8d848a.jsonl",
             &[
-                r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"019e4aec-7d77-7783-9e57-0bb26a8d848a","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_path":"/root/review_compaction_fix","agent_nickname":"Hypatia","agent_role":"explorer"}}},"thread_source":"subagent","agent_nickname":"Hypatia","agent_role":"explorer"}}"#,
+                r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"019e4aec-7d77-7783-9e57-0bb26a8d848a","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_path":"/root/review_compaction_fix","agent_nickname":"Hypatia","agent_role":"explorer"}}},"thread_source":"subagent","agent_nickname":"Hypatia","agent_role":"explorer"}}"#,
                 r#"{"timestamp":"2026-05-21T14:24:34Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"timestamp":"2026-05-21T14:24:35Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
                 r#"{"timestamp":"2026-05-21T14:24:36Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
@@ -1212,7 +1416,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-00-00-parent-session.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:00:00Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T14:00:00Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/directory","originator":"codex-tui"}}"#,
                 r#"{"timestamp":"2026-05-20T14:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn","model":"gpt-5.5"}}"#,
                 r#"{"timestamp":"2026-05-20T14:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Parent task"}}"#,
             ],
@@ -1221,7 +1425,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-21T07-24-33-child-session.jsonl",
             &[
-                r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"child-session","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Hypatia","agent_role":"explorer"}}},"thread_source":"subagent","agent_nickname":"Hypatia","agent_role":"explorer"}}"#,
+                r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"child-session","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Hypatia","agent_role":"explorer"}}},"thread_source":"subagent","agent_nickname":"Hypatia","agent_role":"explorer"}}"#,
                 r#"{"timestamp":"2026-05-21T14:24:34Z","type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn"}}"#,
                 r#"{"timestamp":"2026-05-21T14:24:35Z","type":"turn_context","payload":{"turn_id":"child-turn","model":"gpt-5.5"}}"#,
                 r#"{"timestamp":"2026-05-21T14:24:36Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
@@ -1264,7 +1468,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-00-00-parent-session.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:00:00Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T14:00:00Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/directory","originator":"codex-tui"}}"#,
                 r#"{"timestamp":"2026-05-20T14:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Parent task"}}"#,
             ],
         );
@@ -1272,7 +1476,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-21T07-24-33-active-child.jsonl",
             &[
-                r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"active-child","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Hypatia"}}},"thread_source":"subagent","agent_nickname":"Hypatia"}}"#,
+                r#"{"timestamp":"2026-05-21T14:24:33Z","type":"session_meta","payload":{"id":"active-child","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Hypatia"}}},"thread_source":"subagent","agent_nickname":"Hypatia"}}"#,
                 r#"{"timestamp":"2026-05-21T14:24:34Z","type":"event_msg","payload":{"type":"user_message","message":"Review this"}}"#,
             ],
         );
@@ -1280,7 +1484,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-21T07-25-33-grandchild.jsonl",
             &[
-                r#"{"timestamp":"2026-05-21T14:25:33Z","type":"session_meta","payload":{"id":"grandchild","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"active-child","depth":2,"agent_nickname":"Hume"}}},"thread_source":"subagent","agent_nickname":"Hume"}}"#,
+                r#"{"timestamp":"2026-05-21T14:25:33Z","type":"session_meta","payload":{"id":"grandchild","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"active-child","depth":2,"agent_nickname":"Hume"}}},"thread_source":"subagent","agent_nickname":"Hume"}}"#,
                 r#"{"timestamp":"2026-05-21T14:25:34Z","type":"event_msg","payload":{"type":"user_message","message":"Nested review"}}"#,
             ],
         );
@@ -1288,7 +1492,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T08-00-00-stale-child.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T15:00:00Z","type":"session_meta","payload":{"id":"stale-child","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Stale"}}},"thread_source":"subagent","agent_nickname":"Stale"}}"#,
+                r#"{"timestamp":"2026-05-20T15:00:00Z","type":"session_meta","payload":{"id":"stale-child","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Stale"}}},"thread_source":"subagent","agent_nickname":"Stale"}}"#,
                 r#"{"timestamp":"2026-05-20T15:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Old review"}}"#,
             ],
         );
@@ -1326,7 +1530,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-00-00-parent-session.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:00:00Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T14:00:00Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/directory","originator":"codex-tui"}}"#,
                 r#"{"timestamp":"2026-05-20T14:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Parent task"}}"#,
             ],
         );
@@ -1334,7 +1538,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-03-00-child-a.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:03:00Z","type":"session_meta","payload":{"id":"child-a","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Alpha"}}},"thread_source":"subagent","agent_nickname":"Alpha"}}"#,
+                r#"{"timestamp":"2026-05-20T14:03:00Z","type":"session_meta","payload":{"id":"child-a","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Alpha"}}},"thread_source":"subagent","agent_nickname":"Alpha"}}"#,
                 r#"{"timestamp":"2026-05-20T14:03:01Z","type":"event_msg","payload":{"type":"user_message","message":"Alpha task"}}"#,
             ],
         );
@@ -1342,7 +1546,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-02-00-child-b.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:02:00Z","type":"session_meta","payload":{"id":"child-b","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Beta"}}},"thread_source":"subagent","agent_nickname":"Beta"}}"#,
+                r#"{"timestamp":"2026-05-20T14:02:00Z","type":"session_meta","payload":{"id":"child-b","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Beta"}}},"thread_source":"subagent","agent_nickname":"Beta"}}"#,
                 r#"{"timestamp":"2026-05-20T14:02:01Z","type":"event_msg","payload":{"type":"user_message","message":"Beta task"}}"#,
             ],
         );
@@ -1350,7 +1554,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-01-00-child-c.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:01:00Z","type":"session_meta","payload":{"id":"child-c","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Gamma"}}},"thread_source":"subagent","agent_nickname":"Gamma"}}"#,
+                r#"{"timestamp":"2026-05-20T14:01:00Z","type":"session_meta","payload":{"id":"child-c","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Gamma"}}},"thread_source":"subagent","agent_nickname":"Gamma"}}"#,
                 r#"{"timestamp":"2026-05-20T14:01:01Z","type":"event_msg","payload":{"type":"user_message","message":"Gamma task"}}"#,
             ],
         );
@@ -1377,9 +1581,9 @@ mod tests {
             rendered,
             vec![
                 ("parent-session", "┬─".to_string()),
-                ("child-a", "│ ├─".to_string()),
-                ("child-b", "│ ├─".to_string()),
-                ("child-c", "│ └─".to_string()),
+                ("child-a", "├─".to_string()),
+                ("child-b", "├─".to_string()),
+                ("child-c", "└─".to_string()),
             ]
         );
     }
@@ -1394,7 +1598,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-00-00-parent-session.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:00:00Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T14:00:00Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/tmp/directory","originator":"codex-tui"}}"#,
                 r#"{"timestamp":"2026-05-20T14:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Parent task"}}"#,
             ],
         );
@@ -1402,7 +1606,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-03-00-child-a.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:03:00Z","type":"session_meta","payload":{"id":"child-a","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Alpha"}}},"thread_source":"subagent","agent_nickname":"Alpha"}}"#,
+                r#"{"timestamp":"2026-05-20T14:03:00Z","type":"session_meta","payload":{"id":"child-a","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Alpha"}}},"thread_source":"subagent","agent_nickname":"Alpha"}}"#,
                 r#"{"timestamp":"2026-05-20T14:03:01Z","type":"event_msg","payload":{"type":"user_message","message":"Alpha task"}}"#,
             ],
         );
@@ -1410,7 +1614,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-04-00-grandchild.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:04:00Z","type":"session_meta","payload":{"id":"grandchild","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"child-a","depth":2,"agent_nickname":"Nested"}}},"thread_source":"subagent","agent_nickname":"Nested"}}"#,
+                r#"{"timestamp":"2026-05-20T14:04:00Z","type":"session_meta","payload":{"id":"grandchild","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"child-a","depth":2,"agent_nickname":"Nested"}}},"thread_source":"subagent","agent_nickname":"Nested"}}"#,
                 r#"{"timestamp":"2026-05-20T14:04:01Z","type":"event_msg","payload":{"type":"user_message","message":"Nested task"}}"#,
             ],
         );
@@ -1418,7 +1622,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-05-00-great-grandchild.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:05:00Z","type":"session_meta","payload":{"id":"great-grandchild","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"grandchild","depth":3,"agent_nickname":"Deep"}}},"thread_source":"subagent","agent_nickname":"Deep"}}"#,
+                r#"{"timestamp":"2026-05-20T14:05:00Z","type":"session_meta","payload":{"id":"great-grandchild","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"grandchild","depth":3,"agent_nickname":"Deep"}}},"thread_source":"subagent","agent_nickname":"Deep"}}"#,
                 r#"{"timestamp":"2026-05-20T14:05:01Z","type":"event_msg","payload":{"type":"user_message","message":"Deep task"}}"#,
             ],
         );
@@ -1426,7 +1630,7 @@ mod tests {
             root.path(),
             "rollout-2026-05-20T07-02-00-child-b.jsonl",
             &[
-                r#"{"timestamp":"2026-05-20T14:02:00Z","type":"session_meta","payload":{"id":"child-b","cwd":"/tmp/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Beta"}}},"thread_source":"subagent","agent_nickname":"Beta"}}"#,
+                r#"{"timestamp":"2026-05-20T14:02:00Z","type":"session_meta","payload":{"id":"child-b","cwd":"/tmp/directory","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Beta"}}},"thread_source":"subagent","agent_nickname":"Beta"}}"#,
                 r#"{"timestamp":"2026-05-20T14:02:01Z","type":"event_msg","payload":{"type":"user_message","message":"Beta task"}}"#,
             ],
         );
@@ -1453,10 +1657,10 @@ mod tests {
             rendered,
             vec![
                 ("parent-session", "┬─".to_string()),
-                ("child-a", "│ ├─".to_string()),
-                ("grandchild", "│ │ └─".to_string()),
-                ("great-grandchild", "│ │   └─".to_string()),
-                ("child-b", "│ └─".to_string()),
+                ("child-a", "├─".to_string()),
+                ("grandchild", "│ └─".to_string()),
+                ("great-grandchild", "│   └─".to_string()),
+                ("child-b", "└─".to_string()),
             ]
         );
     }

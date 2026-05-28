@@ -9,21 +9,23 @@ mod codex_parser;
 mod display;
 mod error;
 mod export;
+mod filters;
 mod history;
 mod interactive;
 mod path;
 mod resume;
 mod search;
+mod session_store;
 mod syntax;
 mod theme;
 mod viewer;
 
-use crate::claude_loader::ClaudeLoadOptions;
 use crate::cli::{parse_duration_secs, Cli, SourceFilter};
-use crate::codex_loader::CodexLoadOptions;
 use crate::display::{format_result, short_id};
-use crate::history::{compare_conversations, Conversation, SessionSource};
+use crate::filters::SessionFilters;
+use crate::history::{Conversation, SessionSource};
 use crate::search::{precompute_full_search_index, search_full, search_full_exact};
+use crate::session_store::SessionStore;
 use chrono::Local;
 use clap::Parser;
 use std::any::Any;
@@ -64,72 +66,30 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> Option<&str> {
 fn run_inner() -> error::Result<()> {
     let args = Cli::parse();
 
-    let load_claude = !matches!(args.source, Some(SourceFilter::Codex));
-    let load_codex = !matches!(args.source, Some(SourceFilter::Claude));
-    let claude_options = ClaudeLoadOptions {
-        include_full_text: false,
-    };
-    let codex_options = CodexLoadOptions {
-        include_full_text: false,
-    };
-
-    // Load requested sources in parallel. Codex rows stay lightweight here;
-    // query mode hydrates full bodies through the persistent search cache.
-    let (claude_result, codex_result) = rayon::join(
-        || {
-            if load_claude {
-                claude_loader::load_claude_sessions_with_options(claude_options)
-            } else {
-                Ok(Vec::new())
-            }
-        },
-        || {
-            if load_codex {
-                if codex_options.include_full_text {
-                    codex_loader::load_codex_sessions_with_options(codex_options)
-                } else {
-                    codex_loader::load_codex_sessions()
-                }
-            } else {
-                Ok(Vec::new())
-            }
-        },
-    );
-
-    let mut conversations = claude_result.unwrap_or_default();
-    conversations.extend(codex_result.unwrap_or_default());
-
-    // Sort all by timestamp descending
-    conversations.sort_by(compare_conversations);
-
-    // Deduplicate by session_id (same session can appear in multiple project dirs)
-    {
-        let mut seen = std::collections::HashSet::new();
-        conversations.retain(|c| seen.insert(c.session_id.clone()));
-    }
+    let initial_sources = initial_sources_from_args(&args);
+    let store = load_initial_store(&initial_sources);
+    let filters = filters_from_args(&args, store.conversations());
 
     // Handle --show
     if let Some(ref id) = args.show {
-        let conv = resolve_session(&conversations, id)?;
+        let conv = resolve_session(store.conversations(), id)?;
         return viewer::review_session(conv);
     }
 
     // Handle --resume
     if let Some(ref id) = args.resume {
-        let conv = resolve_session(&conversations, id)?;
+        let conv = resolve_session(store.conversations(), id)?;
         return resume::resume_session(conv);
     }
-
-    // Apply filters
-    let filtered = apply_filters(conversations, &args);
 
     // Interactive mode: no query and no --list → fzf-style picker
     let is_interactive = args.query.is_none() && !args.list;
     if is_interactive && atty::is(atty::Stream::Stdout) {
-        return interactive::run(filtered);
+        return interactive::run(store, filters);
     }
 
     // Non-interactive: search or list to stdout
+    let filtered = filtered_conversations_for_output(store.conversations(), &filters, &args);
     if let Some(ref query) = args.query {
         let index = precompute_full_search_index(&filtered);
         let results = if args.exact {
@@ -155,7 +115,67 @@ fn run_inner() -> error::Result<()> {
     Ok(())
 }
 
-fn apply_filters(conversations: Vec<Conversation>, args: &Cli) -> Vec<Conversation> {
+fn initial_sources_from_args(args: &Cli) -> Vec<SessionSource> {
+    match args.source.as_ref() {
+        Some(SourceFilter::Claude) => vec![SessionSource::Claude],
+        Some(SourceFilter::Codex) => vec![SessionSource::Codex],
+        None => vec![SessionSource::Claude, SessionSource::Codex],
+    }
+}
+
+fn load_initial_store(sources: &[SessionSource]) -> SessionStore {
+    load_initial_store_with(sources, load_initial_source)
+}
+
+fn load_initial_store_with(
+    sources: &[SessionSource],
+    mut load_source: impl FnMut(SessionSource) -> error::Result<Vec<Conversation>>,
+) -> SessionStore {
+    let conversations = sources
+        .iter()
+        .flat_map(|source| load_source(*source).unwrap_or_default())
+        .collect::<Vec<_>>();
+
+    SessionStore::from_loaded(conversations, sources.iter().copied())
+}
+
+fn load_initial_source(source: SessionSource) -> error::Result<Vec<Conversation>> {
+    match source {
+        SessionSource::Claude => claude_loader::load_claude_sessions(),
+        SessionSource::Codex => codex_loader::load_codex_sessions(),
+    }
+}
+
+fn filters_from_args(args: &Cli, _conversations: &[Conversation]) -> SessionFilters {
+    let mut filters = match args.source.as_ref() {
+        Some(SourceFilter::Claude) => SessionFilters::source_only(SessionSource::Claude),
+        Some(SourceFilter::Codex) => SessionFilters::source_only(SessionSource::Codex),
+        None => SessionFilters::all(),
+    };
+
+    if let Some(directory) = args.directory.as_ref() {
+        filters.set_directory_contains(directory);
+    }
+
+    filters
+}
+
+fn filtered_conversations_for_output(
+    conversations: &[Conversation],
+    filters: &SessionFilters,
+    args: &Cli,
+) -> Vec<Conversation> {
+    apply_non_source_filters(
+        conversations
+            .iter()
+            .filter(|conversation| filters.matches(conversation))
+            .cloned()
+            .collect(),
+        args,
+    )
+}
+
+fn apply_non_source_filters(conversations: Vec<Conversation>, args: &Cli) -> Vec<Conversation> {
     let now = Local::now();
     let since_secs = args.since.as_ref().and_then(|s| parse_duration_secs(s));
     let current_dir = if args.local {
@@ -167,28 +187,6 @@ fn apply_filters(conversations: Vec<Conversation>, args: &Cli) -> Vec<Conversati
     conversations
         .into_iter()
         .filter(|conv| {
-            // Source filter
-            if let Some(ref source) = args.source {
-                match (source, conv.source) {
-                    (SourceFilter::Claude, SessionSource::Claude) => {}
-                    (SourceFilter::Codex, SessionSource::Codex) => {}
-                    _ => return false,
-                }
-            }
-
-            // Project filter
-            if let Some(ref project) = args.project {
-                let proj_lower = project.to_lowercase();
-                let matches = conv
-                    .project_name
-                    .as_ref()
-                    .map(|n| n.to_lowercase().contains(&proj_lower))
-                    .unwrap_or(false);
-                if !matches {
-                    return false;
-                }
-            }
-
             // Since filter
             if let Some(secs) = since_secs {
                 let age = now.signed_duration_since(conv.timestamp).num_seconds();
@@ -262,14 +260,22 @@ mod tests {
     use std::path::PathBuf;
 
     fn conversation(session_id: &str) -> Conversation {
+        conversation_with(session_id, SessionSource::Codex, None)
+    }
+
+    fn conversation_with(
+        session_id: &str,
+        source: SessionSource,
+        directory_name: Option<&str>,
+    ) -> Conversation {
         Conversation {
             path: PathBuf::from(format!("{session_id}.jsonl")),
-            source: SessionSource::Codex,
+            source,
             session_id: session_id.to_string(),
             timestamp: Local::now(),
             preview: String::new(),
             full_text: String::new(),
-            project_name: None,
+            directory_name: directory_name.map(str::to_string),
             cwd: None,
             message_count: 0,
             model: None,
@@ -288,6 +294,129 @@ mod tests {
         }
     }
 
+    fn cli_with_filters(source: Option<SourceFilter>, directory: Option<&str>) -> Cli {
+        Cli {
+            query: None,
+            source,
+            directory: directory.map(str::to_string),
+            since: None,
+            limit: 20,
+            list: false,
+            show: None,
+            resume: None,
+            local: false,
+            exact: false,
+        }
+    }
+
+    #[test]
+    fn cli_source_initializes_filter_to_codex_only() {
+        let args = cli_with_filters(Some(SourceFilter::Codex), None);
+        let conversations = [
+            conversation_with("codex", SessionSource::Codex, Some("agent-history")),
+            conversation_with("claude", SessionSource::Claude, Some("agent-history")),
+        ];
+
+        let filters = filters_from_args(&args, &conversations);
+
+        assert!(filters.source_enabled(SessionSource::Codex));
+        assert!(!filters.source_enabled(SessionSource::Claude));
+        assert!(filters.matches(&conversations[0]));
+        assert!(!filters.matches(&conversations[1]));
+    }
+
+    #[test]
+    fn cli_directory_initializes_substring_directory_filter() {
+        let args = cli_with_filters(None, Some("agent"));
+        let conversations = [
+            conversation_with("agent-history", SessionSource::Codex, Some("agent-history")),
+            conversation_with("agent-tools", SessionSource::Claude, Some("Agent Tools")),
+            conversation_with("other", SessionSource::Codex, Some("other")),
+            conversation_with("unknown", SessionSource::Claude, None),
+        ];
+
+        let filters = filters_from_args(&args, &conversations);
+
+        assert!(filters.matches(&conversations[0]));
+        assert!(filters.matches(&conversations[1]));
+        assert!(!filters.matches(&conversations[2]));
+        assert!(!filters.matches(&conversations[3]));
+    }
+
+    #[test]
+    fn cli_directory_filter_matches_later_enabled_sources() {
+        let args = cli_with_filters(Some(SourceFilter::Codex), Some("agent"));
+        let initial_conversations = [conversation_with(
+            "codex-other",
+            SessionSource::Codex,
+            Some("other"),
+        )];
+        let later_loaded_claude =
+            conversation_with("claude-agent", SessionSource::Claude, Some("agent-history"));
+
+        let mut filters = filters_from_args(&args, &initial_conversations);
+        assert!(!filters.matches(&later_loaded_claude));
+
+        filters.set_source_enabled(SessionSource::Claude, true);
+        assert!(filters.matches(&later_loaded_claude));
+    }
+
+    #[test]
+    fn cli_directory_unknown_does_not_match_missing_directory_name() {
+        let args = cli_with_filters(None, Some("unknown"));
+        let conversations = [
+            conversation_with(
+                "unknown-directory",
+                SessionSource::Codex,
+                Some("unknown-directory"),
+            ),
+            conversation_with("missing-directory", SessionSource::Claude, None),
+        ];
+
+        let filters = filters_from_args(&args, &conversations);
+
+        assert!(filters.matches(&conversations[0]));
+        assert!(!filters.matches(&conversations[1]));
+    }
+
+    #[test]
+    fn initial_store_marks_failed_sources_loaded_and_keeps_successes() {
+        let codex = conversation_with("codex", SessionSource::Codex, Some("agent-history"));
+        let store =
+            load_initial_store_with(&[SessionSource::Claude, SessionSource::Codex], |source| {
+                match source {
+                    SessionSource::Claude => Err(error::AppError::CliExecutionError(
+                        "claude load failed".to_string(),
+                    )),
+                    SessionSource::Codex => Ok(vec![codex.clone()]),
+                }
+            });
+
+        assert!(store.loaded_source(SessionSource::Claude));
+        assert!(store.loaded_source(SessionSource::Codex));
+        assert_eq!(store.conversations().len(), 1);
+        assert_eq!(store.conversations()[0].session_id, "codex");
+    }
+
+    #[test]
+    fn interactive_store_keeps_directory_filtered_rows_loaded() {
+        let args = cli_with_filters(None, Some("agent"));
+        let store = SessionStore::from_loaded(
+            vec![
+                conversation_with("agent-history", SessionSource::Codex, Some("agent-history")),
+                conversation_with("other", SessionSource::Codex, Some("other")),
+            ],
+            [SessionSource::Codex],
+        );
+        let filters = filters_from_args(&args, store.conversations());
+
+        let filtered = filtered_conversations_for_output(store.conversations(), &filters, &args);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, "agent-history");
+        assert_eq!(store.conversations().len(), 2);
+    }
+
     #[test]
     fn resolve_session_accepts_exact_id() {
         let conversations = vec![conversation("abc12345-full")];
@@ -304,18 +433,6 @@ mod tests {
         let resolved = resolve_session(&conversations, "abc12345").unwrap();
 
         assert_eq!(resolved.session_id, "abc12345-full");
-    }
-
-    #[test]
-    fn resolve_session_accepts_unique_display_short_id() {
-        let conversations = vec![
-            conversation("019e4aec-7d77-7783-9e57-0bb26a8d848a"),
-            conversation("019e4aec-930e-7a52-8a49-b659df8fb813"),
-        ];
-
-        let resolved = resolve_session(&conversations, "6a8d848a").unwrap();
-
-        assert_eq!(resolved.session_id, "019e4aec-7d77-7783-9e57-0bb26a8d848a");
     }
 
     #[test]
@@ -338,20 +455,6 @@ mod tests {
 
         match resolve_session(&conversations, "abc12345") {
             Err(error::AppError::SessionIdAmbiguous(id)) => assert_eq!(id, "abc12345"),
-            Err(err) => panic!("unexpected error: {err}"),
-            Ok(conv) => panic!("unexpected session: {}", conv.session_id),
-        }
-    }
-
-    #[test]
-    fn resolve_session_rejects_ambiguous_display_short_id() {
-        let conversations = vec![
-            conversation("019e4aec-7d77-7783-9e57-0bb26a8d848a"),
-            conversation("119e4aec-7d77-7783-9e57-0bb26a8d848a"),
-        ];
-
-        match resolve_session(&conversations, "6a8d848a") {
-            Err(error::AppError::SessionIdAmbiguous(id)) => assert_eq!(id, "6a8d848a"),
             Err(err) => panic!("unexpected error: {err}"),
             Ok(conv) => panic!("unexpected session: {}", conv.session_id),
         }

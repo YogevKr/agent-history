@@ -110,8 +110,8 @@ pub fn build_session_lines(conv: &Conversation) -> Result<Vec<StyledLine>> {
         Span::dim(&format!(" ({})", conv.source)),
     ]);
     lines.push(vec![
-        Span::bold("Project: "),
-        Span::plain(conv.project_name.as_deref().unwrap_or("unknown")),
+        Span::bold("Directory: "),
+        Span::plain(conv.directory_name.as_deref().unwrap_or("unknown")),
     ]);
     if let Some(ref model) = conv.model {
         lines.push(vec![Span::bold("Model: "), Span::plain(model)]);
@@ -159,8 +159,8 @@ pub fn review_session(conv: &Conversation) -> Result<()> {
     );
     println!(
         "{} {}",
-        "Project:".bold(),
-        conv.project_name.as_deref().unwrap_or("unknown")
+        "Directory:".bold(),
+        conv.directory_name.as_deref().unwrap_or("unknown")
     );
     if let Some(ref model) = conv.model {
         println!("{} {}", "Model:".bold(), model);
@@ -381,7 +381,7 @@ fn markdown_to_lines(text: &str, max_width: usize) -> Vec<StyledLine> {
         result.push(current);
     }
     // Remove trailing empty lines
-    while result.last().is_some_and(|l| l.is_empty()) {
+    while result.last().is_some_and(|line| line.is_empty()) {
         result.pop();
     }
     result
@@ -978,7 +978,7 @@ mod tests {
             timestamp: Local::now(),
             preview: String::new(),
             full_text: String::new(),
-            project_name: Some("project".to_string()),
+            directory_name: Some("directory".to_string()),
             cwd: None,
             message_count: 0,
             model: None,

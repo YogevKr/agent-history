@@ -143,7 +143,7 @@ fn conversation_metadata_text(conv: &Conversation) -> String {
     if !conv.preview.is_empty() {
         parts.push(conv.preview.as_str());
     }
-    if let Some(name) = conv.project_name.as_deref() {
+    if let Some(name) = conv.directory_name.as_deref() {
         parts.push(name);
     }
     if let Some(name) = conv.subagent_name.as_deref() {
@@ -734,7 +734,7 @@ mod tests {
             timestamp,
             preview: preview.to_string(),
             full_text: full_text.to_string(),
-            project_name: Some("project".to_string()),
+            directory_name: Some("directory".to_string()),
             cwd: None,
             message_count: 1,
             model: None,
@@ -845,7 +845,7 @@ mod tests {
     #[test]
     fn full_search_index_finds_codex_body_terms_with_sqlite_fts() {
         let file = codex_jsonl(&[
-            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/directory"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible preview"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Hidden needle context"}}"#,
         ]);
@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn full_search_index_reindexes_changed_files() {
         let mut file = codex_jsonl(&[
-            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/directory"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible preview"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"First needle context"}}"#,
         ]);
@@ -981,7 +981,7 @@ mod tests {
         write_codex_jsonl(
             &mut file,
             &[
-                r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"session-id","cwd":"/tmp/directory"}}"#,
                 r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible preview"}}"#,
                 r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Second needle context with more bytes"}}"#,
             ],
@@ -999,12 +999,12 @@ mod tests {
     #[test]
     fn full_search_index_keeps_rows_outside_current_filter_scope() {
         let first = codex_jsonl(&[
-            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"first-session","cwd":"/tmp/project-a"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"first-session","cwd":"/tmp/directory-a"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible first"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Alpha needle context"}}"#,
         ]);
         let second = codex_jsonl(&[
-            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"second-session","cwd":"/tmp/project-b"}}"#,
+            r#"{"timestamp":"2026-05-21T20:00:00Z","type":"session_meta","payload":{"id":"second-session","cwd":"/tmp/directory-b"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible second"}}"#,
             r#"{"timestamp":"2026-05-21T20:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Beta needle context"}}"#,
         ]);

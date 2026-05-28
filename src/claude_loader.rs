@@ -11,8 +11,8 @@ use std::time::SystemTime;
 
 use crate::history::Conversation;
 
-/// Project directory metadata
-struct Project {
+/// Claude encoded directory metadata.
+struct Directory {
     name: String,
     modified: SystemTime,
 }
@@ -40,11 +40,11 @@ fn get_claude_projects_root() -> Result<PathBuf> {
     Ok(claude_dir.join("projects"))
 }
 
-/// List all projects that contain conversation files
-fn list_projects(root: &Path) -> Result<Vec<Project>> {
+/// List all encoded directories that contain conversation files.
+fn list_directories(root: &Path) -> Result<Vec<Directory>> {
     let entries = read_dir(root)?;
 
-    let mut projects: Vec<Project> = entries
+    let mut directories: Vec<Directory> = entries
         .par_bridge()
         .filter_map(|entry| {
             let entry = entry.ok()?;
@@ -54,7 +54,7 @@ fn list_projects(root: &Path) -> Result<Vec<Project>> {
                 return None;
             }
 
-            // Check if project has any non-agent .jsonl files
+            // Check if the encoded directory has any non-agent .jsonl files.
             let has_conversations = read_dir(&path).ok()?.any(|e| {
                 e.ok()
                     .map(|e| {
@@ -78,23 +78,23 @@ fn list_projects(root: &Path) -> Result<Vec<Project>> {
                 .ok()
                 .unwrap_or(SystemTime::UNIX_EPOCH);
 
-            Some(Project { name, modified })
+            Some(Directory { name, modified })
         })
         .collect();
 
-    projects.sort_by_key(|project| Reverse(project.modified));
+    directories.sort_by_key(|directory| Reverse(directory.modified));
 
-    Ok(projects)
+    Ok(directories)
 }
 
-/// Load conversations from a single project directory
+/// Load conversations from a single encoded directory.
 fn load_conversations(
-    projects_dir: &Path,
+    directory_dir: &Path,
     options: ClaudeLoadOptions,
 ) -> Result<Vec<Conversation>> {
     let mut files_with_meta = Vec::new();
 
-    for entry in read_dir(projects_dir)? {
+    for entry in read_dir(directory_dir)? {
         let entry = entry?;
         let path = entry.path();
 
@@ -136,6 +136,7 @@ fn load_conversations(
     Ok(conversations)
 }
 
+/// Load all Claude sessions from all directories, sorted by timestamp descending.
 pub fn load_claude_sessions_with_options(options: ClaudeLoadOptions) -> Result<Vec<Conversation>> {
     let root = get_claude_projects_root()?;
 
@@ -143,20 +144,20 @@ pub fn load_claude_sessions_with_options(options: ClaudeLoadOptions) -> Result<V
         return Ok(Vec::new());
     }
 
-    let projects = list_projects(&root)?;
+    let directories = list_directories(&root)?;
 
-    let mut all_conversations: Vec<Conversation> = projects
+    let mut all_conversations: Vec<Conversation> = directories
         .par_iter()
-        .flat_map(|project| {
-            let project_dir = root.join(&project.name);
-            match load_conversations(&project_dir, options) {
+        .flat_map(|directory| {
+            let directory_dir = root.join(&directory.name);
+            match load_conversations(&directory_dir, options) {
                 Ok(mut convs) => {
-                    let fallback_path = decode_project_dir_name_to_path(&project.name);
+                    let fallback_path = decode_project_dir_name_to_path(&directory.name);
 
                     for conv in &mut convs {
-                        let project_path =
+                        let directory_path =
                             conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-                        conv.project_name = Some(format_short_name_from_path(&project_path));
+                        conv.directory_name = Some(format_short_name_from_path(&directory_path));
                     }
                     convs
                 }
@@ -168,4 +169,8 @@ pub fn load_claude_sessions_with_options(options: ClaudeLoadOptions) -> Result<V
     all_conversations.sort_by_key(|conversation| Reverse(conversation.timestamp));
 
     Ok(all_conversations)
+}
+
+pub fn load_claude_sessions() -> Result<Vec<Conversation>> {
+    load_claude_sessions_with_options(ClaudeLoadOptions::default())
 }

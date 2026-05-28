@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 
 /// Source of a session
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum SessionSource {
     Claude,
     Codex,
@@ -27,7 +27,7 @@ pub struct Conversation {
     pub timestamp: DateTime<Local>,
     pub preview: String,
     pub full_text: String,
-    pub project_name: Option<String>,
+    pub directory_name: Option<String>,
     pub cwd: Option<PathBuf>,
     pub message_count: usize,
     pub model: Option<String>,
