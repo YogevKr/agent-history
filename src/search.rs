@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SEARCH_INDEX_FILE: &str = "search-index-v3.sqlite";
 
 /// Precomputed search data for a conversation
+#[derive(Clone)]
 pub struct SearchableConversation {
     /// Lowercased full text for searching
     pub text_lower: String,
@@ -21,11 +22,13 @@ pub struct SearchableConversation {
 }
 
 /// Persistent full-context search index.
+#[derive(Clone)]
 pub enum FullSearchIndex {
     Sqlite(SqliteSearchIndex),
     InMemory(Vec<SearchableConversation>),
 }
 
+#[derive(Clone)]
 pub struct SqliteSearchIndex {
     db_path: PathBuf,
     rowid_to_index: HashMap<i64, usize>,

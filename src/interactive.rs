@@ -23,7 +23,7 @@ use crossterm::{
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
@@ -54,6 +54,9 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
         searchable: precompute_search_text(&conversations),
         full_search_index: None,
         full_search_index_rx: None,
+        full_search_query_tx: None,
+        full_search_result_rx: None,
+        full_search_pending: false,
         expanded_tree_roots,
         flash: None,
     };
@@ -81,8 +84,16 @@ struct PickerState {
     searchable: Vec<SearchableConversation>,
     full_search_index: Option<FullSearchIndex>,
     full_search_index_rx: Option<Receiver<FullSearchIndex>>,
+    full_search_query_tx: Option<Sender<String>>,
+    full_search_result_rx: Option<Receiver<FullSearchResult>>,
+    full_search_pending: bool,
     expanded_tree_roots: HashSet<String>,
     flash: Option<String>,
+}
+
+struct FullSearchResult {
+    query: String,
+    indices: Vec<usize>,
 }
 
 fn main_loop(
@@ -324,6 +335,7 @@ fn picker_loop(
 ) -> PickerAction {
     loop {
         poll_full_search_index(conversations, state);
+        poll_full_search_result(conversations, state);
 
         if draw_picker(
             stdout,
@@ -341,7 +353,9 @@ fn picker_loop(
         }
         state.flash = None;
 
-        let evt = if state.full_search_index_rx.is_some() {
+        let waiting_for_background =
+            state.full_search_index_rx.is_some() || state.full_search_pending;
+        let evt = if waiting_for_background {
             match event::poll(Duration::from_millis(50)) {
                 Ok(true) => match event::read() {
                     Ok(e) => e,
@@ -383,6 +397,7 @@ fn picker_loop(
                 state.query.pop();
                 refilter(conversations, state);
                 start_full_search_index(conversations, state);
+                request_full_search(state);
             }
             PickerKeyAction::ToggleTreeExpansion => toggle_tree_expansion(conversations, state),
             PickerKeyAction::CopyId => {
@@ -395,6 +410,7 @@ fn picker_loop(
                 state.query.push(c);
                 refilter(conversations, state);
                 start_full_search_index(conversations, state);
+                request_full_search(state);
             }
             PickerKeyAction::Ignore => {}
         }
@@ -403,12 +419,19 @@ fn picker_loop(
 
 fn refilter(conversations: &[Conversation], state: &mut PickerState) {
     let base_indices = if state.query.is_empty() {
+        state.full_search_pending = false;
         (0..conversations.len()).collect()
-    } else if let Some(index) = state.full_search_index.as_ref() {
-        search_full(conversations, index, &state.query, Local::now())
     } else {
         search(conversations, &state.searchable, &state.query, Local::now())
     };
+    apply_filtered_indices(conversations, state, base_indices);
+}
+
+fn apply_filtered_indices(
+    conversations: &[Conversation],
+    state: &mut PickerState,
+    base_indices: Vec<usize>,
+) {
     state.filtered_indices = collapse_visible_indices(
         conversations,
         base_indices,
@@ -449,17 +472,102 @@ fn poll_full_search_index(conversations: &[Conversation], state: &mut PickerStat
 
     match result {
         Some(Ok(index)) => {
+            start_full_search_worker(conversations, &index, state);
             state.full_search_index = Some(index);
             state.full_search_index_rx = None;
             if !state.query.is_empty() {
                 state.flash = Some("Indexed full context".to_string());
-                refilter(conversations, state);
+                request_full_search(state);
             }
         }
         Some(Err(TryRecvError::Disconnected)) => {
             state.full_search_index_rx = None;
         }
         Some(Err(TryRecvError::Empty)) | None => {}
+    }
+}
+
+fn start_full_search_worker(
+    conversations: &[Conversation],
+    index: &FullSearchIndex,
+    state: &mut PickerState,
+) {
+    if state.full_search_query_tx.is_some() {
+        return;
+    }
+
+    let (query_tx, query_rx) = mpsc::channel::<String>();
+    let (result_tx, result_rx) = mpsc::channel::<FullSearchResult>();
+    let conversations = conversations.to_vec();
+    let index = index.clone();
+
+    thread::spawn(move || {
+        while let Ok(mut query) = query_rx.recv() {
+            while let Ok(next_query) = query_rx.try_recv() {
+                query = next_query;
+            }
+
+            if query.trim().is_empty() {
+                continue;
+            }
+
+            let indices = search_full(&conversations, &index, &query, Local::now());
+            if result_tx.send(FullSearchResult { query, indices }).is_err() {
+                break;
+            }
+        }
+    });
+
+    state.full_search_query_tx = Some(query_tx);
+    state.full_search_result_rx = Some(result_rx);
+}
+
+fn request_full_search(state: &mut PickerState) {
+    if state.query.is_empty() {
+        return;
+    }
+
+    if let Some(tx) = state.full_search_query_tx.as_ref() {
+        if tx.send(state.query.clone()).is_ok() {
+            state.full_search_pending = true;
+            state.flash = Some("Searching full context".to_string());
+        } else {
+            state.full_search_pending = false;
+        }
+    }
+}
+
+fn poll_full_search_result(conversations: &[Conversation], state: &mut PickerState) {
+    let mut latest = None;
+    let mut disconnected = false;
+
+    if let Some(rx) = state.full_search_result_rx.as_ref() {
+        loop {
+            match rx.try_recv() {
+                Ok(result) => latest = Some(result),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if disconnected {
+        state.full_search_result_rx = None;
+        state.full_search_query_tx = None;
+        state.full_search_pending = false;
+    }
+
+    let Some(result) = latest else {
+        return;
+    };
+
+    if result.query == state.query {
+        apply_filtered_indices(conversations, state, result.indices);
+        state.full_search_pending = false;
+        state.flash = Some("Searched full context".to_string());
     }
 }
 
@@ -881,6 +989,9 @@ mod tests {
             searchable: precompute_search_text(&conversations),
             full_search_index: None,
             full_search_index_rx: None,
+            full_search_query_tx: None,
+            full_search_result_rx: None,
+            full_search_pending: false,
             expanded_tree_roots: HashSet::new(),
             flash: None,
         };
@@ -890,6 +1001,75 @@ mod tests {
         assert_eq!(state.filtered_indices, vec![1]);
         assert!(state.full_search_index.is_none());
         assert!(state.full_search_index_rx.is_none());
+    }
+
+    #[test]
+    fn refilter_stays_lightweight_and_queues_full_search() {
+        let conversations = vec![conversation("row", 0, false)];
+        let (query_tx, query_rx) = mpsc::channel();
+        let mut state = PickerState {
+            query: "'hidden".to_string(),
+            selected: 0,
+            scroll: 0,
+            filtered_indices: (0..conversations.len()).collect(),
+            searchable: precompute_search_text(&conversations),
+            full_search_index: Some(FullSearchIndex::InMemory(vec![SearchableConversation {
+                text_lower: "hidden".to_string(),
+                index: 0,
+            }])),
+            full_search_index_rx: None,
+            full_search_query_tx: Some(query_tx),
+            full_search_result_rx: None,
+            full_search_pending: false,
+            expanded_tree_roots: HashSet::new(),
+            flash: None,
+        };
+
+        refilter(&conversations, &mut state);
+        request_full_search(&mut state);
+
+        assert!(state.filtered_indices.is_empty());
+        assert_eq!(query_rx.try_recv().unwrap(), "'hidden");
+    }
+
+    #[test]
+    fn full_search_result_applies_only_current_query() {
+        let conversations = vec![
+            conversation("stale", 0, false),
+            conversation("current", 0, false),
+        ];
+        let (result_tx, result_rx) = mpsc::channel();
+        result_tx
+            .send(FullSearchResult {
+                query: "old".to_string(),
+                indices: vec![0],
+            })
+            .unwrap();
+        result_tx
+            .send(FullSearchResult {
+                query: "'current".to_string(),
+                indices: vec![1],
+            })
+            .unwrap();
+
+        let mut state = PickerState {
+            query: "'current".to_string(),
+            selected: 0,
+            scroll: 0,
+            filtered_indices: Vec::new(),
+            searchable: precompute_search_text(&conversations),
+            full_search_index: None,
+            full_search_index_rx: None,
+            full_search_query_tx: None,
+            full_search_result_rx: Some(result_rx),
+            full_search_pending: true,
+            expanded_tree_roots: HashSet::new(),
+            flash: None,
+        };
+
+        poll_full_search_result(&conversations, &mut state);
+
+        assert_eq!(state.filtered_indices, vec![1]);
     }
 
     #[test]
