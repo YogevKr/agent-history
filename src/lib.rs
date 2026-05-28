@@ -18,18 +18,46 @@ mod syntax;
 mod theme;
 mod viewer;
 
+use crate::claude_loader::ClaudeLoadOptions;
 use crate::cli::{parse_duration_secs, Cli, SourceFilter};
 use crate::codex_loader::CodexLoadOptions;
-use crate::display::format_result;
+use crate::display::{format_result, short_id};
 use crate::history::{compare_conversations, Conversation, SessionSource};
-use crate::search::{precompute_full_search_index, search_full};
+use crate::search::{precompute_full_search_index, search_full, search_full_exact};
 use chrono::Local;
 use clap::Parser;
+use std::any::Any;
 
 pub fn run() {
-    if let Err(e) = run_inner() {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        if !is_broken_pipe_panic(panic_info.payload()) {
+            default_panic_hook(panic_info);
+        }
+    }));
+
+    match std::panic::catch_unwind(run_inner) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+        Err(payload) if is_broken_pipe_panic(payload.as_ref()) => {}
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn is_broken_pipe_panic(payload: &(dyn Any + Send)) -> bool {
+    panic_payload_message(payload).is_some_and(|message| {
+        message.contains("failed printing to stdout") && message.contains("Broken pipe")
+    })
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> Option<&str> {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        Some(message.as_str())
+    } else {
+        payload.downcast_ref::<&str>().copied()
     }
 }
 
@@ -38,6 +66,9 @@ fn run_inner() -> error::Result<()> {
 
     let load_claude = !matches!(args.source, Some(SourceFilter::Codex));
     let load_codex = !matches!(args.source, Some(SourceFilter::Claude));
+    let claude_options = ClaudeLoadOptions {
+        include_full_text: false,
+    };
     let codex_options = CodexLoadOptions {
         include_full_text: false,
     };
@@ -47,7 +78,7 @@ fn run_inner() -> error::Result<()> {
     let (claude_result, codex_result) = rayon::join(
         || {
             if load_claude {
-                claude_loader::load_claude_sessions()
+                claude_loader::load_claude_sessions_with_options(claude_options)
             } else {
                 Ok(Vec::new())
             }
@@ -101,7 +132,11 @@ fn run_inner() -> error::Result<()> {
     // Non-interactive: search or list to stdout
     if let Some(ref query) = args.query {
         let index = precompute_full_search_index(&filtered);
-        let results = search_full(&filtered, &index, query, Local::now());
+        let results = if args.exact {
+            search_full_exact(&filtered, &index, query, Local::now())
+        } else {
+            search_full(&filtered, &index, query, Local::now())
+        };
         for &idx in results.iter().take(args.limit) {
             println!("{}", format_result(&filtered[idx]));
         }
@@ -191,16 +226,32 @@ fn resolve_session<'a>(
         return Ok(conv);
     }
 
-    let mut matches = conversations
-        .iter()
-        .filter(|conv| conv.session_id.starts_with(id_or_prefix));
+    if let Some(conv) = resolve_unique_session_by(conversations, id_or_prefix, |conv, query| {
+        conv.session_id.starts_with(query)
+    })? {
+        return Ok(conv);
+    }
 
-    match (matches.next(), matches.next()) {
-        (Some(conv), None) => Ok(conv),
-        (None, _) => Err(error::AppError::SessionNotFound(id_or_prefix.to_string())),
-        (Some(_), Some(_)) => Err(error::AppError::SessionIdAmbiguous(
-            id_or_prefix.to_string(),
-        )),
+    if let Some(conv) = resolve_unique_session_by(conversations, id_or_prefix, |conv, query| {
+        short_id(&conv.session_id) == query
+    })? {
+        return Ok(conv);
+    }
+
+    Err(error::AppError::SessionNotFound(id_or_prefix.to_string()))
+}
+
+fn resolve_unique_session_by<'a>(
+    conversations: &'a [Conversation],
+    id: &str,
+    matches: impl Fn(&Conversation, &str) -> bool,
+) -> error::Result<Option<&'a Conversation>> {
+    let mut matched = conversations.iter().filter(|conv| matches(conv, id));
+
+    match (matched.next(), matched.next()) {
+        (Some(conv), None) => Ok(Some(conv)),
+        (None, _) => Ok(None),
+        (Some(_), Some(_)) => Err(error::AppError::SessionIdAmbiguous(id.to_string())),
     }
 }
 
@@ -256,6 +307,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_session_accepts_unique_display_short_id() {
+        let conversations = vec![
+            conversation("019e4aec-7d77-7783-9e57-0bb26a8d848a"),
+            conversation("019e4aec-930e-7a52-8a49-b659df8fb813"),
+        ];
+
+        let resolved = resolve_session(&conversations, "6a8d848a").unwrap();
+
+        assert_eq!(resolved.session_id, "019e4aec-7d77-7783-9e57-0bb26a8d848a");
+    }
+
+    #[test]
     fn resolve_session_rejects_missing_prefix() {
         let conversations = vec![conversation("abc12345-full")];
 
@@ -275,6 +338,20 @@ mod tests {
 
         match resolve_session(&conversations, "abc12345") {
             Err(error::AppError::SessionIdAmbiguous(id)) => assert_eq!(id, "abc12345"),
+            Err(err) => panic!("unexpected error: {err}"),
+            Ok(conv) => panic!("unexpected session: {}", conv.session_id),
+        }
+    }
+
+    #[test]
+    fn resolve_session_rejects_ambiguous_display_short_id() {
+        let conversations = vec![
+            conversation("019e4aec-7d77-7783-9e57-0bb26a8d848a"),
+            conversation("119e4aec-7d77-7783-9e57-0bb26a8d848a"),
+        ];
+
+        match resolve_session(&conversations, "6a8d848a") {
+            Err(error::AppError::SessionIdAmbiguous(id)) => assert_eq!(id, "6a8d848a"),
             Err(err) => panic!("unexpected error: {err}"),
             Ok(conv) => panic!("unexpected session: {}", conv.session_id),
         }

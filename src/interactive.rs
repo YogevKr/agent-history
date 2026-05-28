@@ -29,7 +29,7 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
 const PICKER_HINT: &str =
-    "  Enter: view  PgUp/PgDn Home/End  Tab: expand/collapse  \u{2190}: copy ID";
+    "  Enter:view  'term:exact  PgUp/PgDn Home/End  Tab:tree  \u{2190}:copy ID";
 
 /// Run interactive session picker. Returns Ok(()) on clean exit.
 pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
@@ -69,9 +69,7 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
     let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
 
-    if let Err(e) = result {
-        return Err(e);
-    }
+    result?;
     Ok(())
 }
 
@@ -327,7 +325,7 @@ fn picker_loop(
     loop {
         poll_full_search_index(conversations, state);
 
-        if let Err(_) = draw_picker(
+        if draw_picker(
             stdout,
             conversations,
             &state.filtered_indices,
@@ -336,7 +334,9 @@ fn picker_loop(
             state.selected,
             state.scroll,
             state.flash.as_deref(),
-        ) {
+        )
+        .is_err()
+        {
             return PickerAction::Quit;
         }
         state.flash = None;
@@ -553,6 +553,7 @@ fn collapse_visible_indices(
     visible
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_picker(
     stdout: &mut io::Stdout,
     conversations: &[Conversation],
@@ -1706,9 +1707,7 @@ fn pager_loop(
                 let new_max = lines.len().saturating_sub(visible);
                 if let Some(line) = search.as_ref().and_then(ViewerSearch::current_line) {
                     scroll = scroll_to_match(line, visible, new_max);
-                } else if was_at_bottom && lines.len() > old_len {
-                    scroll = new_max;
-                } else if scroll > new_max {
+                } else if (was_at_bottom && lines.len() > old_len) || scroll > new_max {
                     scroll = new_max;
                 }
             }

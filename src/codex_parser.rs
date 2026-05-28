@@ -110,26 +110,21 @@ pub fn process_codex_file(
                     }
                 }
             }
-            "turn_context" => {
-                if model.is_none() {
-                    if let Ok(tc) = serde_json::from_value::<TurnContext>(codex_line.payload) {
-                        if tc.model.is_some() {
-                            model = tc.model;
-                        }
+            "turn_context" if model.is_none() => {
+                if let Ok(tc) = serde_json::from_value::<TurnContext>(codex_line.payload) {
+                    if tc.model.is_some() {
+                        model = tc.model;
                     }
                 }
             }
             "event_msg" => {
                 if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
-                    match evt.event_type.as_str() {
-                        "token_count" => {
-                            if let Some(info) = evt.info {
-                                if let Some(usage) = info.total_token_usage {
-                                    total_tokens = usage.total_tokens;
-                                }
+                    if evt.event_type.as_str() == "token_count" {
+                        if let Some(info) = evt.info {
+                            if let Some(usage) = info.total_token_usage {
+                                total_tokens = usage.total_tokens;
                             }
                         }
-                        _ => {}
                     }
                 }
             }

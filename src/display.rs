@@ -162,23 +162,6 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{}...", truncated)
 }
 
-pub fn show_session(conv: &Conversation) {
-    println!("Session: {} ({})", conv.session_id, conv.source);
-    println!(
-        "Project: {}",
-        conv.project_name.as_deref().unwrap_or("unknown")
-    );
-    if let Some(ref model) = conv.model {
-        println!("Model: {}", model);
-    }
-    if let Some(ref branch) = conv.git_branch {
-        println!("Branch: {}", branch);
-    }
-    println!("Messages: {}", conv.message_count);
-    println!("---");
-    println!("{}", conv.full_text);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

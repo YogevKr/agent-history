@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local, TimeZone};
@@ -48,9 +48,9 @@ impl CodexFileMetadata {
 }
 
 /// Recursively collect all `rollout-*.jsonl` files under a directory.
-fn collect_jsonl_files(dir: &PathBuf) -> Vec<PathBuf> {
+fn collect_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let mut stack = vec![dir.clone()];
+    let mut stack = vec![dir.to_path_buf()];
 
     while let Some(current) = stack.pop() {
         let entries = match std::fs::read_dir(&current) {
@@ -102,6 +102,9 @@ fn collect_file_index(
             Err(_) => continue,
         };
         if line.trim().is_empty() {
+            continue;
+        }
+        if !should_parse_codex_index_line(&line) {
             continue;
         }
 
@@ -290,6 +293,68 @@ fn collect_file_index(
     };
 
     Some((path.clone(), metadata, conversation))
+}
+
+fn should_parse_codex_index_line(line: &str) -> bool {
+    let header = line_prefix(line, 2048);
+
+    if line_has_json_type(header, "session_meta") || line_has_json_type(header, "turn_context") {
+        return true;
+    }
+
+    if line_has_json_type(header, "event_msg") {
+        return line_has_json_type(header, "task_started")
+            || line_has_json_type(header, "token_count")
+            || line_has_json_type(header, "user_message")
+            || line_has_json_type(header, "agent_message");
+    }
+
+    line_has_json_type(header, "response_item") && line_has_json_type(header, "message")
+}
+
+fn line_prefix(line: &str, max_bytes: usize) -> &str {
+    if line.len() <= max_bytes {
+        return line;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+fn line_has_json_type(line: &str, ty: &str) -> bool {
+    match ty {
+        "session_meta" => {
+            line.contains(r#""type":"session_meta""#) || line.contains(r#""type": "session_meta""#)
+        }
+        "turn_context" => {
+            line.contains(r#""type":"turn_context""#) || line.contains(r#""type": "turn_context""#)
+        }
+        "event_msg" => {
+            line.contains(r#""type":"event_msg""#) || line.contains(r#""type": "event_msg""#)
+        }
+        "task_started" => {
+            line.contains(r#""type":"task_started""#) || line.contains(r#""type": "task_started""#)
+        }
+        "token_count" => {
+            line.contains(r#""type":"token_count""#) || line.contains(r#""type": "token_count""#)
+        }
+        "user_message" => {
+            line.contains(r#""type":"user_message""#) || line.contains(r#""type": "user_message""#)
+        }
+        "agent_message" => {
+            line.contains(r#""type":"agent_message""#)
+                || line.contains(r#""type": "agent_message""#)
+        }
+        "response_item" => {
+            line.contains(r#""type":"response_item""#)
+                || line.contains(r#""type": "response_item""#)
+        }
+        "message" => line.contains(r#""type":"message""#) || line.contains(r#""type": "message""#),
+        _ => false,
+    }
 }
 
 fn event_message_text(evt: &EventMsg) -> Option<(bool, String)> {
@@ -646,6 +711,7 @@ fn root_session_id(session_id: &str, parent_by_session_id: &HashMap<String, Stri
     current.to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assign_thread_order(
     session_id: &str,
     children_by_session_id: &HashMap<String, Vec<String>>,
@@ -841,6 +907,19 @@ mod tests {
         let dir = root.join("sessions/2026/05/20");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(name), lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn codex_index_scan_skips_heavy_response_items() {
+        assert!(should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id"}}"#
+        ));
+        assert!(should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:28Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#
+        ));
+        assert!(!should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:29Z","type":"response_item","payload":{"type":"function_call_output","output":"large payload"}}"#
+        ));
     }
 
     #[test]

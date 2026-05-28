@@ -13,6 +13,10 @@ pub struct Cli {
     /// Search query (fuzzy matches across session content)
     pub query: Option<String>,
 
+    /// Match exact normalized tokens instead of fuzzy prefixes
+    #[arg(long, short = 'x')]
+    pub exact: bool,
+
     /// Filter by session source
     #[arg(long, value_enum)]
     pub source: Option<SourceFilter>,

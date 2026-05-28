@@ -381,7 +381,7 @@ fn markdown_to_lines(text: &str, max_width: usize) -> Vec<StyledLine> {
         result.push(current);
     }
     // Remove trailing empty lines
-    while result.last().map_or(false, |l| l.is_empty()) {
+    while result.last().is_some_and(|l| l.is_empty()) {
         result.pop();
     }
     result
@@ -827,7 +827,7 @@ fn print_markdown_stdout(text: &str) {
                 }
             }
             MdEvent::Start(Tag::CodeBlock(kind)) => {
-                flush(&mut line_buf, &gutter);
+                flush(&mut line_buf, gutter);
                 code_block = true;
                 code_buf.clear();
                 code_lang = match kind {
@@ -857,7 +857,7 @@ fn print_markdown_stdout(text: &str) {
             MdEvent::Start(Tag::BlockQuote(_)) => blockquote = true,
             MdEvent::End(TagEnd::BlockQuote(_)) => blockquote = false,
             MdEvent::Start(Tag::List(_)) => {
-                flush(&mut line_buf, &gutter);
+                flush(&mut line_buf, gutter);
                 list_depth += 1;
             }
             MdEvent::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
@@ -865,7 +865,7 @@ fn print_markdown_stdout(text: &str) {
                 let indent = "  ".repeat(list_depth.saturating_sub(1));
                 line_buf.push_str(&format!("{}• ", indent));
             }
-            MdEvent::End(TagEnd::Item) => flush(&mut line_buf, &gutter),
+            MdEvent::End(TagEnd::Item) => flush(&mut line_buf, gutter),
             MdEvent::End(TagEnd::Paragraph) => {
                 // Wrap paragraph text
                 if !line_buf.is_empty() {
@@ -902,13 +902,13 @@ fn print_markdown_stdout(text: &str) {
                 line_buf.push(' ');
             }
             MdEvent::Rule => {
-                flush(&mut line_buf, &gutter);
+                flush(&mut line_buf, gutter);
                 println!("{}{}", gutter, SEPARATOR.dimmed());
             }
             _ => {}
         }
     }
-    flush(&mut line_buf, &gutter);
+    flush(&mut line_buf, gutter);
 }
 
 // ── Shared helpers ────────────────────────────────────

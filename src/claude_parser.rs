@@ -16,10 +16,31 @@ use std::time::SystemTime;
 /// Maximum characters for full_text search index per conversation.
 const MAX_FULL_TEXT_CHARS: usize = 256 * 1024;
 
+#[derive(Clone, Copy, Debug)]
+pub struct ClaudeParseOptions {
+    pub include_full_text: bool,
+}
+
+impl Default for ClaudeParseOptions {
+    fn default() -> Self {
+        Self {
+            include_full_text: true,
+        }
+    }
+}
+
 /// Process a single Claude conversation JSONL file
 pub fn process_claude_file(
     path: PathBuf,
     modified: Option<SystemTime>,
+) -> Result<Option<Conversation>> {
+    process_claude_file_with_options(path, modified, ClaudeParseOptions::default())
+}
+
+pub fn process_claude_file_with_options(
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    options: ClaudeParseOptions,
 ) -> Result<Option<Conversation>> {
     let file = File::open(&path)?;
     let reader = BufReader::new(file);
@@ -29,8 +50,6 @@ pub fn process_claude_file(
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_owned();
-
-    let lines: Vec<String> = reader.lines().map_while(|l| l.ok()).collect();
 
     let mut all_parts = Vec::new();
     let mut preview_parts = Vec::new();
@@ -49,12 +68,12 @@ pub fn process_claude_file(
     let mut last_timestamp: Option<chrono::DateTime<chrono::FixedOffset>> = None;
     let mut non_interactive_session_detector = NonInteractiveSessionDetector::default();
 
-    for line in &lines {
+    for line in reader.lines().map_while(|line| line.ok()) {
         if line.trim().is_empty() {
             continue;
         }
 
-        let Ok(raw) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
 
@@ -87,9 +106,14 @@ pub fn process_claude_file(
                 }
 
                 let preview_text = extract_text_from_user(&message);
-                let search_text = extract_search_text_from_user(&message);
+                let search_text = if options.include_full_text {
+                    extract_search_text_from_user(&message)
+                } else {
+                    String::new()
+                };
 
-                if preview_text.is_empty() && search_text.is_empty() {
+                if preview_text.is_empty() && (!options.include_full_text || search_text.is_empty())
+                {
                     continue;
                 }
 
@@ -101,7 +125,7 @@ pub fn process_claude_file(
                     if let Some(skill_preview) = extract_skill_preview(&preview_text) {
                         skill_preview
                     } else if !preview_text.is_empty() && is_clear_metadata_message(&preview_text) {
-                        if !search_text.is_empty() {
+                        if options.include_full_text && !search_text.is_empty() {
                             all_parts.push(search_text);
                         }
                         continue;
@@ -109,7 +133,7 @@ pub fn process_claude_file(
                         preview_text
                     };
 
-                if !search_text.is_empty() {
+                if options.include_full_text && !search_text.is_empty() {
                     all_parts.push(search_text);
                 }
 
@@ -152,9 +176,13 @@ pub fn process_claude_file(
                 }
 
                 let preview_text = extract_text_from_assistant(&message);
-                let search_text = extract_search_text_from_assistant(&message);
+                let search_text = if options.include_full_text {
+                    extract_search_text_from_assistant(&message)
+                } else {
+                    String::new()
+                };
 
-                if !search_text.is_empty() {
+                if options.include_full_text && !search_text.is_empty() {
                     all_parts.push(search_text);
                 }
 
@@ -192,7 +220,7 @@ pub fn process_claude_file(
         return Ok(None);
     }
 
-    if all_parts.is_empty() || preview_parts.is_empty() {
+    if preview_parts.is_empty() || (options.include_full_text && all_parts.is_empty()) {
         return Ok(None);
     }
 
@@ -207,17 +235,20 @@ pub fn process_claude_file(
         .collect::<Vec<_>>()
         .join(" ... ");
 
-    let mut full_text = all_parts.join(" ");
-    if let Some(ref summary) = extracted_summary {
-        full_text = format!("{} {}", summary, full_text);
-    }
-    if let Some(ref custom_title) = extracted_custom_title {
-        full_text = format!("{} {}", custom_title, full_text);
-    }
-
     let preview = normalize_whitespace(&preview);
-    let full_text = normalize_whitespace(&full_text);
-    let full_text = truncate_to_char_boundary(&full_text, MAX_FULL_TEXT_CHARS);
+    let full_text = if options.include_full_text {
+        let mut full_text = all_parts.join(" ");
+        if let Some(ref summary) = extracted_summary {
+            full_text = format!("{} {}", summary, full_text);
+        }
+        if let Some(ref custom_title) = extracted_custom_title {
+            full_text = format!("{} {}", custom_title, full_text);
+        }
+        let full_text = normalize_whitespace(&full_text);
+        truncate_to_char_boundary(&full_text, MAX_FULL_TEXT_CHARS)
+    } else {
+        String::new()
+    };
 
     let total_tokens: u64 = token_usage_by_msg
         .values()
@@ -465,6 +496,28 @@ mod tests {
             r#"{{"type":"user","timestamp":"2026-05-27T10:00:00Z","entrypoint":"cli","cwd":"{}","message":{{"role":"user","content":"hello"}}}}"#,
             cwd
         )
+    }
+
+    #[test]
+    fn process_claude_file_can_skip_full_text_for_startup() {
+        let file = write_jsonl(&[
+            &normal_user_line("/Users/igor/work/project"),
+            normal_assistant_line(),
+        ]);
+
+        let parsed = process_claude_file_with_options(
+            file.path().to_path_buf(),
+            None,
+            ClaudeParseOptions {
+                include_full_text: false,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(parsed.preview, "hello ... world");
+        assert_eq!(parsed.message_count, 2);
+        assert!(parsed.full_text.is_empty());
     }
 
     #[test]

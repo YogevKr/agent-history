@@ -16,13 +16,7 @@ pub enum CodexItem {
 }
 
 pub fn read_codex_lines<R: BufRead>(reader: R) -> Vec<String> {
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            lines.push(line);
-        }
-    }
-    lines
+    reader.lines().map_while(Result::ok).collect()
 }
 
 pub fn codex_items(lines: &[String]) -> Vec<CodexItem> {

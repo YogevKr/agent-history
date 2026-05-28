@@ -1,8 +1,10 @@
+use crate::claude_parser::process_claude_file;
 use crate::codex_parser::process_codex_file;
 use crate::history::{Conversation, SessionSource};
 use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,30 +89,40 @@ fn precompute_uncached_full_search_text(
 }
 
 fn uncached_full_search_text_lower(conv: &Conversation) -> String {
-    if conv.source != SessionSource::Codex || !conv.full_text.is_empty() {
+    if !conv.full_text.is_empty() {
         return conversation_search_text_lower(conv);
     }
 
     let modified = std::fs::metadata(&conv.path)
         .and_then(|metadata| metadata.modified())
         .ok();
-    process_codex_file(conv.path.clone(), modified)
-        .ok()
-        .flatten()
+    hydrate_full_conversation(conv, modified)
         .map(|parsed| conversation_search_text_lower(&parsed))
         .unwrap_or_else(|| conversation_search_text_lower(conv))
 }
 
 fn full_search_text_lower_with_modified(conv: &Conversation, modified: SystemTime) -> String {
-    if conv.source != SessionSource::Codex || !conv.full_text.is_empty() {
+    if !conv.full_text.is_empty() {
         return conversation_search_text_lower(conv);
     }
 
-    process_codex_file(conv.path.clone(), Some(modified))
-        .ok()
-        .flatten()
+    hydrate_full_conversation(conv, Some(modified))
         .map(|parsed| conversation_search_text_lower(&parsed))
         .unwrap_or_else(|| conversation_search_text_lower(conv))
+}
+
+fn hydrate_full_conversation(
+    conv: &Conversation,
+    modified: Option<SystemTime>,
+) -> Option<Conversation> {
+    match conv.source {
+        SessionSource::Claude => process_claude_file(conv.path.clone(), modified)
+            .ok()
+            .flatten(),
+        SessionSource::Codex => process_codex_file(conv.path.clone(), modified)
+            .ok()
+            .flatten(),
+    }
 }
 
 fn conversation_search_text_lower(conv: &Conversation) -> String {
@@ -352,6 +364,10 @@ pub fn search(
     query: &str,
     now: DateTime<Local>,
 ) -> Vec<usize> {
+    if let Some(exact_query) = exact_syntax_query(query) {
+        return search_exact(conversations, searchable, exact_query, now);
+    }
+
     let query = query.trim();
     if query.is_empty() {
         return (0..conversations.len()).collect();
@@ -390,6 +406,45 @@ pub fn search(
     scored.into_iter().map(|(idx, _, _)| idx).collect()
 }
 
+/// Filter conversations whose normalized search text contains every query token exactly.
+pub fn search_exact(
+    conversations: &[Conversation],
+    searchable: &[SearchableConversation],
+    query: &str,
+    _now: DateTime<Local>,
+) -> Vec<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        return (0..conversations.len()).collect();
+    }
+
+    let query_lower = normalize_for_search(query);
+    let query_words: Vec<String> = query_lower.split_whitespace().map(String::from).collect();
+    if query_words.is_empty() {
+        return (0..conversations.len()).collect();
+    }
+
+    let mut matches: Vec<(usize, DateTime<Local>)> = searchable
+        .par_iter()
+        .filter_map(|s| {
+            if contains_exact_tokens(&s.text_lower, &query_words) {
+                Some((s.index, conversations[s.index].timestamp))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    matches.sort_unstable_by_key(|matched| Reverse(matched.1));
+    matches.into_iter().map(|(idx, _)| idx).collect()
+}
+
+fn contains_exact_tokens(text_lower: &str, query_words: &[String]) -> bool {
+    query_words
+        .iter()
+        .all(|query_word| text_lower.split_whitespace().any(|word| word == query_word))
+}
+
 /// Search conversations through the full-context index.
 pub fn search_full(
     conversations: &[Conversation],
@@ -397,6 +452,10 @@ pub fn search_full(
     query: &str,
     now: DateTime<Local>,
 ) -> Vec<usize> {
+    if let Some(exact_query) = exact_syntax_query(query) {
+        return search_full_exact(conversations, index, exact_query, now);
+    }
+
     match index {
         FullSearchIndex::Sqlite(index) => search_sqlite(conversations, index, query)
             .unwrap_or_else(|_| {
@@ -405,6 +464,72 @@ pub fn search_full(
             }),
         FullSearchIndex::InMemory(searchable) => search(conversations, searchable, query, now),
     }
+}
+
+/// Search conversations through the full-context index using exact token matches.
+pub fn search_full_exact(
+    conversations: &[Conversation],
+    index: &FullSearchIndex,
+    query: &str,
+    now: DateTime<Local>,
+) -> Vec<usize> {
+    match index {
+        FullSearchIndex::Sqlite(index) => {
+            let candidates =
+                search_sqlite_exact(conversations, index, query).unwrap_or_else(|_| {
+                    let searchable = precompute_uncached_full_search_text(conversations);
+                    search_exact(conversations, &searchable, query, now)
+                });
+            filter_exact_full_transcript_matches(conversations, candidates, query)
+        }
+        FullSearchIndex::InMemory(searchable) => {
+            let candidates = search_exact(conversations, searchable, query, now);
+            filter_exact_full_transcript_matches(conversations, candidates, query)
+        }
+    }
+}
+
+fn filter_exact_full_transcript_matches(
+    conversations: &[Conversation],
+    candidates: Vec<usize>,
+    query: &str,
+) -> Vec<usize> {
+    let Some(query_words) = exact_query_words(query) else {
+        return candidates;
+    };
+
+    candidates
+        .into_iter()
+        .filter(|&idx| {
+            let text_lower = full_transcript_text_lower(&conversations[idx]);
+            contains_exact_tokens(&text_lower, &query_words)
+        })
+        .collect()
+}
+
+fn exact_query_words(query: &str) -> Option<Vec<String>> {
+    let normalized = normalize_for_search(query);
+    let query_words: Vec<String> = normalized.split_whitespace().map(String::from).collect();
+    (!query_words.is_empty()).then_some(query_words)
+}
+
+fn exact_syntax_query(query: &str) -> Option<&str> {
+    let query = query.trim();
+    let exact_query = query.strip_prefix('\'')?.trim();
+    (!exact_query.is_empty()).then_some(exact_query)
+}
+
+fn full_transcript_text_lower(conv: &Conversation) -> String {
+    if !conv.full_text.is_empty() {
+        return normalize_for_search(&conv.full_text);
+    }
+
+    let modified = std::fs::metadata(&conv.path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    hydrate_full_conversation(conv, modified)
+        .map(|parsed| normalize_for_search(&parsed.full_text))
+        .unwrap_or_default()
 }
 
 fn search_sqlite(
@@ -452,7 +577,60 @@ fn search_sqlite(
     Ok(scored.into_iter().map(|(idx, _, _)| idx).collect())
 }
 
+fn search_sqlite_exact(
+    conversations: &[Conversation],
+    index: &SqliteSearchIndex,
+    query: &str,
+) -> rusqlite::Result<Vec<usize>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok((0..conversations.len()).collect());
+    }
+
+    let Some(match_query) = fts_exact_match_query(query) else {
+        return Ok((0..conversations.len()).collect());
+    };
+
+    let conn = Connection::open_with_flags(&index.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(
+        "
+        SELECT rowid, bm25(session_fts) AS rank
+        FROM session_fts
+        WHERE session_fts MATCH ?1
+        ORDER BY rank
+        ",
+    )?;
+    let rows = stmt.query_map(params![match_query], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+    })?;
+
+    let mut scored = Vec::new();
+    for row in rows {
+        let (rowid, rank) = row?;
+        let Some(&idx) = index.rowid_to_index.get(&rowid) else {
+            continue;
+        };
+        scored.push((idx, rank, conversations[idx].timestamp));
+    }
+
+    scored.sort_unstable_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+    });
+
+    Ok(scored.into_iter().map(|(idx, _, _)| idx).collect())
+}
+
 fn fts_match_query(query: &str) -> Option<String> {
+    fts_match_query_with_suffix(query, "*")
+}
+
+fn fts_exact_match_query(query: &str) -> Option<String> {
+    fts_match_query_with_suffix(query, "")
+}
+
+fn fts_match_query_with_suffix(query: &str, suffix: &str) -> Option<String> {
     let mut normalized = String::with_capacity(query.len());
     for ch in query.chars() {
         if ch.is_alphanumeric() {
@@ -464,7 +642,7 @@ fn fts_match_query(query: &str) -> Option<String> {
 
     let terms: Vec<String> = normalized
         .split_whitespace()
-        .map(|term| format!("{term}*"))
+        .map(|term| format!("{term}{suffix}"))
         .collect();
     if terms.is_empty() {
         None
@@ -587,6 +765,14 @@ mod tests {
         file
     }
 
+    fn claude_jsonl(lines: &[&str]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file
+    }
+
     #[test]
     fn precompute_search_text_includes_preview_for_lightweight_rows() {
         let conversations = vec![conversation(
@@ -600,6 +786,57 @@ mod tests {
         let results = search(&conversations, &searchable, "visible", Local::now());
 
         assert_eq!(results, vec![0]);
+    }
+
+    #[test]
+    fn exact_search_requires_whole_tokens() {
+        let conversations = vec![
+            conversation(
+                SessionSource::Codex,
+                PathBuf::from("first.jsonl"),
+                "pup command",
+                "",
+            ),
+            conversation(
+                SessionSource::Codex,
+                PathBuf::from("second.jsonl"),
+                "puppet config",
+                "",
+            ),
+        ];
+        let searchable = precompute_search_text(&conversations);
+
+        let fuzzy_results = search(&conversations, &searchable, "pup", Local::now());
+        let exact_results = search_exact(&conversations, &searchable, "pup", Local::now());
+
+        assert_eq!(fuzzy_results.len(), 2);
+        assert!(fuzzy_results.contains(&0));
+        assert!(fuzzy_results.contains(&1));
+        assert_eq!(exact_results, vec![0]);
+    }
+
+    #[test]
+    fn exact_search_can_use_query_syntax() {
+        let conversations = vec![
+            conversation(
+                SessionSource::Codex,
+                PathBuf::from("first.jsonl"),
+                "pup command",
+                "",
+            ),
+            conversation(
+                SessionSource::Codex,
+                PathBuf::from("second.jsonl"),
+                "puppet config",
+                "",
+            ),
+        ];
+        let searchable = precompute_search_text(&conversations);
+
+        assert_eq!(
+            search(&conversations, &searchable, "'pup", Local::now()),
+            vec![0]
+        );
     }
 
     #[test]
@@ -623,6 +860,97 @@ mod tests {
 
         assert_eq!(results, vec![0]);
         assert!(index_path.exists());
+    }
+
+    #[test]
+    fn full_exact_search_uses_sqlite_without_prefix_matches() {
+        let first = NamedTempFile::new().unwrap();
+        let second = NamedTempFile::new().unwrap();
+        let third = NamedTempFile::new().unwrap();
+        let conversations = vec![
+            conversation(
+                SessionSource::Codex,
+                first.path().to_path_buf(),
+                "first",
+                "pup command trace",
+            ),
+            conversation(
+                SessionSource::Codex,
+                second.path().to_path_buf(),
+                "second",
+                "puppet command trace",
+            ),
+            conversation(
+                SessionSource::Codex,
+                third.path().to_path_buf(),
+                "pup metadata only",
+                "unrelated command trace",
+            ),
+        ];
+        let cache_dir = tempdir().unwrap();
+        let index_path = cache_dir.path().join("search-index.sqlite");
+
+        let index = precompute_full_search_index_with_db_path(&conversations, &index_path);
+
+        let fuzzy_results = search_full(&conversations, &index, "pup", Local::now());
+        assert_eq!(fuzzy_results.len(), 3);
+        assert!(fuzzy_results.contains(&0));
+        assert!(fuzzy_results.contains(&1));
+        assert!(fuzzy_results.contains(&2));
+        assert_eq!(
+            search_full_exact(&conversations, &index, "pup", Local::now()),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn full_exact_search_can_use_query_syntax() {
+        let first = NamedTempFile::new().unwrap();
+        let second = NamedTempFile::new().unwrap();
+        let conversations = vec![
+            conversation(
+                SessionSource::Codex,
+                first.path().to_path_buf(),
+                "first",
+                "pup command trace",
+            ),
+            conversation(
+                SessionSource::Codex,
+                second.path().to_path_buf(),
+                "second",
+                "puppet command trace",
+            ),
+        ];
+        let cache_dir = tempdir().unwrap();
+        let index_path = cache_dir.path().join("search-index.sqlite");
+
+        let index = precompute_full_search_index_with_db_path(&conversations, &index_path);
+
+        assert_eq!(
+            search_full(&conversations, &index, "'pup", Local::now()),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn full_search_index_hydrates_lightweight_claude_body_terms() {
+        let file = claude_jsonl(&[
+            r#"{"type":"user","timestamp":"2026-05-21T20:00:01Z","cwd":"/tmp/project","message":{"role":"user","content":"Visible preview"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-05-21T20:00:02Z","message":{"role":"assistant","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Hidden needle context"}]}}"#,
+        ]);
+        let conversations = vec![conversation(
+            SessionSource::Claude,
+            file.path().to_path_buf(),
+            "Visible preview",
+            "",
+        )];
+        let cache_dir = tempdir().unwrap();
+        let index_path = cache_dir.path().join("search-index.sqlite");
+
+        let index = precompute_full_search_index_with_db_path(&conversations, &index_path);
+        let results = search_full(&conversations, &index, "hidden needle", Local::now());
+
+        assert_eq!(results, vec![0]);
     }
 
     #[test]

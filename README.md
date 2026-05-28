@@ -37,11 +37,20 @@ agent-history
 # Search sessions
 agent-history "auth flow"
 
+# Exact token search
+agent-history "'pup"
+
+# Exact token search via flag
+agent-history --exact "pup"
+
 # Filter by source, project, or time
 agent-history --source claude --project my-app --since 7d
 
 # Show a specific session (non-interactive; full ID or unique prefix)
 agent-history --show <session-id-or-prefix>
+
+# Show by the short ID printed in search/list results
+agent-history --show <short-display-id>
 
 # Resume a session in its CLI (full ID or unique prefix)
 agent-history --resume <session-id-or-prefix>

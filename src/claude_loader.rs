@@ -1,11 +1,10 @@
 //! Claude session discovery and loading.
 
-use crate::claude_parser::process_claude_file;
+use crate::claude_parser::{process_claude_file_with_options, ClaudeParseOptions};
 use crate::error::{AppError, Result};
-use crate::path::{
-    decode_project_dir_name, decode_project_dir_name_to_path, format_short_name_from_path,
-};
+use crate::path::{decode_project_dir_name_to_path, format_short_name_from_path};
 use rayon::prelude::*;
+use std::cmp::Reverse;
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -15,10 +14,12 @@ use crate::history::Conversation;
 /// Project directory metadata
 struct Project {
     name: String,
-    #[allow(dead_code)]
-    display_name: String,
-    #[allow(dead_code)]
     modified: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClaudeLoadOptions {
+    pub include_full_text: bool,
 }
 
 /// Get the root Claude projects directory (~/.claude/projects).
@@ -70,7 +71,6 @@ fn list_projects(root: &Path) -> Result<Vec<Project>> {
             }
 
             let name = path.file_name()?.to_string_lossy().to_string();
-            let display_name = decode_project_dir_name(&name);
             let modified = entry
                 .metadata()
                 .ok()?
@@ -78,21 +78,20 @@ fn list_projects(root: &Path) -> Result<Vec<Project>> {
                 .ok()
                 .unwrap_or(SystemTime::UNIX_EPOCH);
 
-            Some(Project {
-                name,
-                display_name,
-                modified,
-            })
+            Some(Project { name, modified })
         })
         .collect();
 
-    projects.sort_by(|a, b| b.modified.cmp(&a.modified));
+    projects.sort_by_key(|project| Reverse(project.modified));
 
     Ok(projects)
 }
 
 /// Load conversations from a single project directory
-fn load_conversations(projects_dir: &Path) -> Result<Vec<Conversation>> {
+fn load_conversations(
+    projects_dir: &Path,
+    options: ClaudeLoadOptions,
+) -> Result<Vec<Conversation>> {
     let mut files_with_meta = Vec::new();
 
     for entry in read_dir(projects_dir)? {
@@ -120,19 +119,24 @@ fn load_conversations(projects_dir: &Path) -> Result<Vec<Conversation>> {
 
     let conversations: Vec<Conversation> = files_with_meta
         .into_par_iter()
-        .filter_map(
-            |(path, modified)| match process_claude_file(path, modified) {
+        .filter_map(|(path, modified)| {
+            match process_claude_file_with_options(
+                path,
+                modified,
+                ClaudeParseOptions {
+                    include_full_text: options.include_full_text,
+                },
+            ) {
                 Ok(Some(conversation)) => Some(conversation),
                 _ => None,
-            },
-        )
+            }
+        })
         .collect();
 
     Ok(conversations)
 }
 
-/// Load all Claude sessions from all projects, sorted by timestamp descending.
-pub fn load_claude_sessions() -> Result<Vec<Conversation>> {
+pub fn load_claude_sessions_with_options(options: ClaudeLoadOptions) -> Result<Vec<Conversation>> {
     let root = get_claude_projects_root()?;
 
     if !root.exists() {
@@ -145,7 +149,7 @@ pub fn load_claude_sessions() -> Result<Vec<Conversation>> {
         .par_iter()
         .flat_map(|project| {
             let project_dir = root.join(&project.name);
-            match load_conversations(&project_dir) {
+            match load_conversations(&project_dir, options) {
                 Ok(mut convs) => {
                     let fallback_path = decode_project_dir_name_to_path(&project.name);
 
@@ -161,7 +165,7 @@ pub fn load_claude_sessions() -> Result<Vec<Conversation>> {
         })
         .collect();
 
-    all_conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    all_conversations.sort_by_key(|conversation| Reverse(conversation.timestamp));
 
     Ok(all_conversations)
 }

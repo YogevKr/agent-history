@@ -42,12 +42,7 @@ pub enum LogEntry {
         #[serde(rename = "isSnapshotUpdate")]
         is_snapshot_update: bool,
     },
-    Progress {
-        data: serde_json::Value,
-        #[allow(dead_code)]
-        #[serde(flatten)]
-        extra: serde_json::Value,
-    },
+    Progress {},
     #[allow(dead_code)]
     System {
         subtype: String,
@@ -124,11 +119,7 @@ pub enum ContentBlock {
         #[serde(default)]
         content: Option<serde_json::Value>,
     },
-    Thinking {
-        thinking: String,
-        #[allow(dead_code)]
-        signature: String,
-    },
+    Thinking {},
     #[allow(dead_code)]
     Image {
         source: serde_json::Value,

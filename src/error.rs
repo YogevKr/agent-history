@@ -8,12 +8,6 @@ pub enum AppError {
     #[error("JSON parsing error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Claude projects directory not found at {0}")]
-    ProjectsDirNotFound(String),
-
-    #[error("No conversation history found")]
-    NoHistoryFound,
-
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
