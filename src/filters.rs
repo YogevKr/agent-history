@@ -1,5 +1,7 @@
 use crate::history::{Conversation, SessionSource};
+use chrono::{DateTime, Local};
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 pub const ALL_SOURCES: [SessionSource; 2] = [SessionSource::Claude, SessionSource::Codex];
 
@@ -12,6 +14,9 @@ pub enum DirectorySelection {
 pub struct SessionFilters {
     enabled_sources: HashSet<SessionSource>,
     directory_selection: DirectorySelection,
+    since_secs: Option<i64>,
+    local_cwd: Option<PathBuf>,
+    time_anchor: DateTime<Local>,
 }
 
 impl SessionFilters {
@@ -19,6 +24,9 @@ impl SessionFilters {
         Self {
             enabled_sources: ALL_SOURCES.into_iter().collect(),
             directory_selection: DirectorySelection::All,
+            since_secs: None,
+            local_cwd: None,
+            time_anchor: Local::now(),
         }
     }
 
@@ -26,6 +34,9 @@ impl SessionFilters {
         Self {
             enabled_sources: HashSet::from([source]),
             directory_selection: DirectorySelection::All,
+            since_secs: None,
+            local_cwd: None,
+            time_anchor: Local::now(),
         }
     }
 
@@ -70,6 +81,14 @@ impl SessionFilters {
 
     pub fn set_directory_contains(&mut self, directory: &str) {
         self.directory_selection = DirectorySelection::Contains(directory.to_lowercase());
+    }
+
+    pub fn set_since_secs(&mut self, since_secs: i64) {
+        self.since_secs = Some(since_secs);
+    }
+
+    pub fn set_local_cwd(&mut self, cwd: PathBuf) {
+        self.local_cwd = Some(cwd);
     }
 
     #[cfg(test)]
@@ -161,6 +180,22 @@ impl SessionFilters {
             return false;
         }
 
+        if let Some(secs) = self.since_secs {
+            let age = self
+                .time_anchor
+                .signed_duration_since(conv.timestamp)
+                .num_seconds();
+            if age > secs {
+                return false;
+            }
+        }
+
+        if let Some(cwd) = self.local_cwd.as_ref() {
+            if conv.cwd.as_ref() != Some(cwd) {
+                return false;
+            }
+        }
+
         match &self.directory_selection {
             DirectorySelection::All => true,
             DirectorySelection::Only(directories) => conv
@@ -218,7 +253,18 @@ impl SessionFilters {
             DirectorySelection::Contains(directory) => directory.clone(),
         };
 
-        format!("agent=[{}] directory=[{}]", agent, directory)
+        let mut parts = vec![
+            format!("agent=[{}]", agent),
+            format!("directory=[{}]", directory),
+        ];
+        if let Some(secs) = self.since_secs {
+            parts.push(format!("since=[{}s]", secs));
+        }
+        if let Some(cwd) = self.local_cwd.as_ref() {
+            parts.push(format!("local=[{}]", cwd.display()));
+        }
+
+        parts.join(" ")
     }
 }
 

@@ -28,6 +28,7 @@ use crate::search::{precompute_full_search_index, search_full, search_full_exact
 use crate::session_store::SessionStore;
 use chrono::Local;
 use clap::Parser;
+use rayon::prelude::*;
 use std::any::Any;
 
 pub fn run() {
@@ -68,7 +69,7 @@ fn run_inner() -> error::Result<()> {
 
     let initial_sources = initial_sources_from_args(&args);
     let store = load_initial_store(&initial_sources);
-    let filters = filters_from_args(&args, store.conversations());
+    let filters = filters_from_args(&args);
 
     // Handle --show
     if let Some(ref id) = args.show {
@@ -89,7 +90,7 @@ fn run_inner() -> error::Result<()> {
     }
 
     // Non-interactive: search or list to stdout
-    let filtered = filtered_conversations_for_output(store.conversations(), &filters, &args);
+    let filtered = filtered_conversations_for_output(store.conversations(), &filters);
     if let Some(ref query) = args.query {
         let index = precompute_full_search_index(&filtered);
         let results = if args.exact {
@@ -129,10 +130,10 @@ fn load_initial_store(sources: &[SessionSource]) -> SessionStore {
 
 fn load_initial_store_with(
     sources: &[SessionSource],
-    mut load_source: impl FnMut(SessionSource) -> error::Result<Vec<Conversation>>,
+    load_source: impl Fn(SessionSource) -> error::Result<Vec<Conversation>> + Sync,
 ) -> SessionStore {
     let conversations = sources
-        .iter()
+        .par_iter()
         .flat_map(|source| load_source(*source).unwrap_or_default())
         .collect::<Vec<_>>();
 
@@ -146,7 +147,7 @@ fn load_initial_source(source: SessionSource) -> error::Result<Vec<Conversation>
     }
 }
 
-fn filters_from_args(args: &Cli, _conversations: &[Conversation]) -> SessionFilters {
+fn filters_from_args(args: &Cli) -> SessionFilters {
     let mut filters = match args.source.as_ref() {
         Some(SourceFilter::Claude) => SessionFilters::source_only(SessionSource::Claude),
         Some(SourceFilter::Codex) => SessionFilters::source_only(SessionSource::Codex),
@@ -156,6 +157,18 @@ fn filters_from_args(args: &Cli, _conversations: &[Conversation]) -> SessionFilt
     if let Some(directory) = args.directory.as_ref() {
         filters.set_directory_contains(directory);
     }
+    if let Some(since_secs) = args
+        .since
+        .as_ref()
+        .and_then(|since| parse_duration_secs(since))
+    {
+        filters.set_since_secs(since_secs);
+    }
+    if args.local {
+        if let Ok(cwd) = std::env::current_dir() {
+            filters.set_local_cwd(cwd);
+        }
+    }
 
     filters
 }
@@ -163,48 +176,11 @@ fn filters_from_args(args: &Cli, _conversations: &[Conversation]) -> SessionFilt
 fn filtered_conversations_for_output(
     conversations: &[Conversation],
     filters: &SessionFilters,
-    args: &Cli,
 ) -> Vec<Conversation> {
-    apply_non_source_filters(
-        conversations
-            .iter()
-            .filter(|conversation| filters.matches(conversation))
-            .cloned()
-            .collect(),
-        args,
-    )
-}
-
-fn apply_non_source_filters(conversations: Vec<Conversation>, args: &Cli) -> Vec<Conversation> {
-    let now = Local::now();
-    let since_secs = args.since.as_ref().and_then(|s| parse_duration_secs(s));
-    let current_dir = if args.local {
-        std::env::current_dir().ok()
-    } else {
-        None
-    };
-
     conversations
-        .into_iter()
-        .filter(|conv| {
-            // Since filter
-            if let Some(secs) = since_secs {
-                let age = now.signed_duration_since(conv.timestamp).num_seconds();
-                if age > secs {
-                    return false;
-                }
-            }
-
-            // Local filter
-            if let Some(ref cdir) = current_dir {
-                let matches = conv.cwd.as_ref().map(|c| c == cdir).unwrap_or(false);
-                if !matches {
-                    return false;
-                }
-            }
-
-            true
-        })
+        .iter()
+        .filter(|conversation| filters.matches(conversation))
+        .cloned()
         .collect()
 }
 
@@ -256,7 +232,7 @@ fn resolve_unique_session_by<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Local;
+    use chrono::{Duration, Local};
     use std::path::PathBuf;
 
     fn conversation(session_id: &str) -> Conversation {
@@ -317,7 +293,7 @@ mod tests {
             conversation_with("claude", SessionSource::Claude, Some("agent-history")),
         ];
 
-        let filters = filters_from_args(&args, &conversations);
+        let filters = filters_from_args(&args);
 
         assert!(filters.source_enabled(SessionSource::Codex));
         assert!(!filters.source_enabled(SessionSource::Claude));
@@ -335,7 +311,7 @@ mod tests {
             conversation_with("unknown", SessionSource::Claude, None),
         ];
 
-        let filters = filters_from_args(&args, &conversations);
+        let filters = filters_from_args(&args);
 
         assert!(filters.matches(&conversations[0]));
         assert!(filters.matches(&conversations[1]));
@@ -346,15 +322,10 @@ mod tests {
     #[test]
     fn cli_directory_filter_matches_later_enabled_sources() {
         let args = cli_with_filters(Some(SourceFilter::Codex), Some("agent"));
-        let initial_conversations = [conversation_with(
-            "codex-other",
-            SessionSource::Codex,
-            Some("other"),
-        )];
         let later_loaded_claude =
             conversation_with("claude-agent", SessionSource::Claude, Some("agent-history"));
 
-        let mut filters = filters_from_args(&args, &initial_conversations);
+        let mut filters = filters_from_args(&args);
         assert!(!filters.matches(&later_loaded_claude));
 
         filters.set_source_enabled(SessionSource::Claude, true);
@@ -373,7 +344,7 @@ mod tests {
             conversation_with("missing-directory", SessionSource::Claude, None),
         ];
 
-        let filters = filters_from_args(&args, &conversations);
+        let filters = filters_from_args(&args);
 
         assert!(filters.matches(&conversations[0]));
         assert!(!filters.matches(&conversations[1]));
@@ -408,13 +379,47 @@ mod tests {
             ],
             [SessionSource::Codex],
         );
-        let filters = filters_from_args(&args, store.conversations());
+        let filters = filters_from_args(&args);
 
-        let filtered = filtered_conversations_for_output(store.conversations(), &filters, &args);
+        let filtered = filtered_conversations_for_output(store.conversations(), &filters);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].session_id, "agent-history");
         assert_eq!(store.conversations().len(), 2);
+    }
+
+    #[test]
+    fn cli_filters_include_local_and_since_for_interactive_store() {
+        let current_dir = std::env::current_dir().unwrap();
+        let mut local_recent =
+            conversation_with("local-recent", SessionSource::Codex, Some("agent-history"));
+        local_recent.cwd = Some(current_dir.clone());
+        local_recent.timestamp = Local::now() - Duration::days(1);
+
+        let mut local_old =
+            conversation_with("local-old", SessionSource::Codex, Some("agent-history"));
+        local_old.cwd = Some(current_dir.clone());
+        local_old.timestamp = Local::now() - Duration::days(10);
+
+        let mut other_recent =
+            conversation_with("other-recent", SessionSource::Codex, Some("agent-history"));
+        other_recent.cwd = Some(current_dir.join("other"));
+        other_recent.timestamp = Local::now() - Duration::days(1);
+
+        let mut args = cli_with_filters(None, None);
+        args.local = true;
+        args.since = Some("7d".to_string());
+        let filters = filters_from_args(&args);
+        let conversations = vec![local_recent, local_old, other_recent];
+
+        let filtered = filtered_conversations_for_output(&conversations, &filters);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, "local-recent");
+        assert_eq!(
+            filters.filter_indices(&conversations, vec![0, 1, 2]),
+            vec![0]
+        );
     }
 
     #[test]

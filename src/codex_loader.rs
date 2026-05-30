@@ -124,6 +124,9 @@ fn collect_file_index(
         if line.trim().is_empty() {
             continue;
         }
+        if !should_parse_codex_index_line(&line) {
+            continue;
+        }
 
         let codex_line: CodexLine = match serde_json::from_str(&line) {
             Ok(line) => line,
@@ -318,6 +321,68 @@ fn collect_file_index(
     };
 
     Some((path.clone(), metadata, conversation))
+}
+
+fn should_parse_codex_index_line(line: &str) -> bool {
+    let header = line_prefix(line, 2048);
+
+    if line_has_json_type(header, "session_meta") || line_has_json_type(header, "turn_context") {
+        return true;
+    }
+
+    if line_has_json_type(header, "event_msg") {
+        return line_has_json_type(header, "task_started")
+            || line_has_json_type(header, "token_count")
+            || line_has_json_type(header, "user_message")
+            || line_has_json_type(header, "agent_message");
+    }
+
+    line_has_json_type(header, "response_item") && line_has_json_type(header, "message")
+}
+
+fn line_prefix(line: &str, max_bytes: usize) -> &str {
+    if line.len() <= max_bytes {
+        return line;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+fn line_has_json_type(line: &str, ty: &str) -> bool {
+    match ty {
+        "session_meta" => {
+            line.contains(r#""type":"session_meta""#) || line.contains(r#""type": "session_meta""#)
+        }
+        "turn_context" => {
+            line.contains(r#""type":"turn_context""#) || line.contains(r#""type": "turn_context""#)
+        }
+        "event_msg" => {
+            line.contains(r#""type":"event_msg""#) || line.contains(r#""type": "event_msg""#)
+        }
+        "task_started" => {
+            line.contains(r#""type":"task_started""#) || line.contains(r#""type": "task_started""#)
+        }
+        "token_count" => {
+            line.contains(r#""type":"token_count""#) || line.contains(r#""type": "token_count""#)
+        }
+        "user_message" => {
+            line.contains(r#""type":"user_message""#) || line.contains(r#""type": "user_message""#)
+        }
+        "agent_message" => {
+            line.contains(r#""type":"agent_message""#)
+                || line.contains(r#""type": "agent_message""#)
+        }
+        "response_item" => {
+            line.contains(r#""type":"response_item""#)
+                || line.contains(r#""type": "response_item""#)
+        }
+        "message" => line.contains(r#""type":"message""#) || line.contains(r#""type": "message""#),
+        _ => false,
+    }
 }
 
 fn event_message_text(evt: &EventMsg) -> Option<(bool, String)> {
@@ -1209,6 +1274,32 @@ mod tests {
         assert_eq!(session.preview, "Index preview");
         assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
         assert!(session.full_text.is_empty());
+    }
+
+    #[test]
+    fn lightweight_index_prefilters_irrelevant_large_lines() {
+        assert!(should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:27Z","type":"session_meta","payload":{"id":"session-id"}}"#
+        ));
+        assert!(should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:28Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#
+        ));
+        assert!(should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:29Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#
+        ));
+        assert!(should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:30Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":5}}}}"#
+        ));
+        assert!(should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:31Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#
+        ));
+        assert!(should_parse_codex_index_line(
+            r#"{"timestamp":"2026-05-20T22:45:32Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#
+        ));
+        assert!(!should_parse_codex_index_line(&format!(
+            r#"{{"timestamp":"2026-05-20T22:45:33Z","type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
+            "x".repeat(10_000)
+        )));
     }
 
     #[test]
