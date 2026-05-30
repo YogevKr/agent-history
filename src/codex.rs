@@ -15,7 +15,13 @@ pub struct SessionMeta {
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
+    pub cli_version: Option<String>,
+    #[serde(default)]
     pub git: Option<GitInfo>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub model_provider: Option<String>,
     #[serde(default)]
     pub source: Option<serde_json::Value>,
     #[serde(default)]
@@ -32,6 +38,9 @@ pub struct SessionMeta {
 pub struct GitInfo {
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub commit_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +74,12 @@ pub struct TokenInfo {
 #[derive(Debug, Deserialize)]
 pub struct TokenUsage {
     #[serde(default)]
+    #[allow(dead_code)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub output_tokens: u64,
+    #[serde(default)]
     pub total_tokens: u64,
 }
 
@@ -79,11 +94,20 @@ pub struct ResponseItem {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
+    pub arguments: Option<String>,
+    #[serde(default)]
     pub output: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub call_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ContentPart {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    pub part_type: String,
     #[serde(default)]
     pub text: Option<String>,
 }

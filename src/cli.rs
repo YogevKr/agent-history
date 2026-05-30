@@ -21,9 +21,9 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub source: Option<SourceFilter>,
 
-    /// Filter by project/cwd name
-    #[arg(long)]
-    pub project: Option<String>,
+    /// Filter by directory/cwd name
+    #[arg(long, alias = "project")]
+    pub directory: Option<String>,
 
     /// Filter by time (e.g. "7d", "2w", "1m")
     #[arg(long)]

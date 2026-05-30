@@ -9,17 +9,15 @@ fn main() {
     println!("Try: Ctrl-y, Ctrl-r, arrows, Enter\r");
     println!("---\r");
     loop {
-        if let Ok(evt) = event::read() {
-            if let Event::Key(ke) = &evt {
-                println!(
-                    "code={:?}  mod={:?}  kind={:?}\r",
-                    ke.code, ke.modifiers, ke.kind
-                );
-                if ke.kind == KeyEventKind::Press {
-                    if let crossterm::event::KeyCode::Char('q') = ke.code {
-                        if ke.modifiers.is_empty() {
-                            break;
-                        }
+        if let Ok(Event::Key(ke)) = event::read() {
+            println!(
+                "code={:?}  mod={:?}  kind={:?}\r",
+                ke.code, ke.modifiers, ke.kind
+            );
+            if ke.kind == KeyEventKind::Press {
+                if let crossterm::event::KeyCode::Char('q') = ke.code {
+                    if ke.modifiers.is_empty() {
+                        break;
                     }
                 }
             }

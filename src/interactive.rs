@@ -1,7 +1,7 @@
 //! fzf-like interactive session picker with in-TUI session viewer.
 
 use crate::display::{
-    format_hierarchy_marker, format_model_short, format_project_label, format_relative_time,
+    format_directory_label, format_hierarchy_marker, format_model_short, format_relative_time,
     get_display_title, short_id, truncate, HIERARCHY_GUTTER_WIDTH,
 };
 use crate::history::{Conversation, SessionSource};
@@ -26,32 +26,39 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const PICKER_HINT: &str =
-    "  Enter:view  'term:exact  PgUp/PgDn Home/End  Tab:tree  \u{2190}:copy ID";
+    "  Enter: view  Left/Right: column  PgUp/PgDn Home/End  Tab: expand/collapse";
+const PICKER_HEADER_ROWS: usize = 4;
+const PICKER_SOURCE_WIDTH: usize = 8;
+const PICKER_AGE_WIDTH: usize = 5;
+const PICKER_DIRECTORY_WIDTH: usize = 20;
+const PICKER_MODEL_WIDTH: usize = 22;
+const PICKER_MIN_HIERARCHY_GUTTER_WIDTH: usize = 3;
+const FILTER_OVERLAY_MIN_NAV_WIDTH: usize = 12;
+const FILTER_OVERLAY_MAX_NAV_WIDTH: usize = 20;
 
 /// Run interactive session picker. Returns Ok(()) on clean exit.
-pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
-    if conversations.is_empty() {
+pub fn run(
+    mut store: crate::session_store::SessionStore,
+    filters: crate::filters::SessionFilters,
+) -> crate::error::Result<()> {
+    if store.conversations().is_empty() {
         eprintln!("No sessions found");
         return Ok(());
     }
 
     let expanded_tree_roots = HashSet::new();
-    let filtered_indices = collapse_visible_indices(
-        &conversations,
-        (0..conversations.len()).collect(),
-        &expanded_tree_roots,
-        true,
-    );
+    let filtered_indices =
+        initial_filtered_indices(store.conversations(), &filters, &expanded_tree_roots);
 
     let mut state = PickerState {
         query: String::new(),
         selected: 0,
         scroll: 0,
         filtered_indices,
-        searchable: precompute_search_text(&conversations),
+        searchable: precompute_search_text(store.conversations()),
         full_search_index: None,
         full_search_index_rx: None,
         full_search_query_tx: None,
@@ -59,6 +66,9 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
         full_search_pending: false,
         expanded_tree_roots,
         flash: None,
+        filters,
+        filter_overlay: None,
+        focused_column: PickerColumn::Preview,
     };
 
     terminal::enable_raw_mode().map_err(crate::error::AppError::Io)?;
@@ -66,7 +76,7 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)
         .map_err(crate::error::AppError::Io)?;
 
-    let result = main_loop(&mut stdout, &conversations, &mut state);
+    let result = main_loop(&mut stdout, &mut store, &mut state);
 
     // Always restore terminal
     let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
@@ -74,6 +84,15 @@ pub fn run(conversations: Vec<Conversation>) -> crate::error::Result<()> {
 
     result?;
     Ok(())
+}
+
+fn initial_filtered_indices(
+    conversations: &[Conversation],
+    filters: &crate::filters::SessionFilters,
+    expanded_tree_roots: &HashSet<String>,
+) -> Vec<usize> {
+    let base_indices = filters.filter_indices(conversations, (0..conversations.len()).collect());
+    collapse_visible_indices(conversations, base_indices, expanded_tree_roots, true)
 }
 
 struct PickerState {
@@ -89,6 +108,9 @@ struct PickerState {
     full_search_pending: bool,
     expanded_tree_roots: HashSet<String>,
     flash: Option<String>,
+    filters: crate::filters::SessionFilters,
+    filter_overlay: Option<FilterOverlayState>,
+    focused_column: PickerColumn,
 }
 
 struct FullSearchResult {
@@ -96,25 +118,123 @@ struct FullSearchResult {
     indices: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PickerColumn {
+    Agent,
+    Age,
+    Directory,
+    Model,
+    Preview,
+}
+
+impl PickerColumn {
+    const VISIBLE: [Self; 5] = [
+        Self::Agent,
+        Self::Age,
+        Self::Directory,
+        Self::Model,
+        Self::Preview,
+    ];
+
+    fn previous(self) -> Self {
+        let index = Self::VISIBLE
+            .iter()
+            .position(|column| *column == self)
+            .unwrap_or(0);
+        Self::VISIBLE[(index + Self::VISIBLE.len() - 1) % Self::VISIBLE.len()]
+    }
+
+    fn next(self) -> Self {
+        let index = Self::VISIBLE
+            .iter()
+            .position(|column| *column == self)
+            .unwrap_or(0);
+        Self::VISIBLE[(index + 1) % Self::VISIBLE.len()]
+    }
+
+    fn filter_section(self) -> Option<FilterSection> {
+        match self {
+            Self::Agent => Some(FilterSection::Agent),
+            Self::Age | Self::Directory | Self::Model | Self::Preview => {
+                Some(FilterSection::Directory)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilterOverlayState {
+    section: FilterSection,
+    agent_selected: usize,
+    directory_selected: usize,
+    agent_query: String,
+    directory_query: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilterSection {
+    Agent,
+    Directory,
+}
+
+impl PickerState {
+    #[cfg(test)]
+    fn for_test(conversations: &[Conversation], filters: crate::filters::SessionFilters) -> Self {
+        let expanded_tree_roots = HashSet::new();
+        let filtered_indices =
+            initial_filtered_indices(conversations, &filters, &expanded_tree_roots);
+
+        Self {
+            query: String::new(),
+            selected: 0,
+            scroll: 0,
+            filtered_indices,
+            searchable: precompute_search_text(conversations),
+            full_search_index: None,
+            full_search_index_rx: None,
+            full_search_query_tx: None,
+            full_search_result_rx: None,
+            full_search_pending: false,
+            expanded_tree_roots,
+            flash: None,
+            filters,
+            filter_overlay: None,
+            focused_column: PickerColumn::Preview,
+        }
+    }
+}
+
+impl FilterOverlayState {
+    fn new(section: FilterSection) -> Self {
+        Self {
+            section,
+            agent_selected: 0,
+            directory_selected: 0,
+            agent_query: String::new(),
+            directory_query: String::new(),
+        }
+    }
+}
+
 fn main_loop(
     stdout: &mut io::Stdout,
-    conversations: &[Conversation],
+    store: &mut crate::session_store::SessionStore,
     state: &mut PickerState,
 ) -> crate::error::Result<()> {
     loop {
-        let idx = match picker_loop(stdout, conversations, state) {
+        let idx = match picker_loop(stdout, store, state) {
             PickerAction::ViewSession(idx) => {
                 let viewer_query = state.query.clone();
-                match pager_loop(stdout, &conversations[idx], &viewer_query)? {
+                match pager_loop(stdout, &store.conversations()[idx], &viewer_query)? {
                     PagerAction::Back => continue,
                     PagerAction::CopyId => idx,
                     PagerAction::Resume => {
                         let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
                         let _ = terminal::disable_raw_mode();
-                        return crate::resume::resume_session(&conversations[idx]);
+                        return crate::resume::resume_session(&store.conversations()[idx]);
                     }
                     PagerAction::CopyConversation => {
-                        match crate::export::to_markdown(&conversations[idx]) {
+                        match crate::export::to_markdown(&store.conversations()[idx]) {
                             Ok(md) => {
                                 if crate::export::copy_to_clipboard(&md).is_ok() {
                                     state.flash =
@@ -130,9 +250,11 @@ fn main_loop(
                         continue;
                     }
                     PagerAction::ExportFile => {
-                        match crate::export::to_markdown(&conversations[idx]) {
-                            Ok(md) => match crate::export::export_to_file(&conversations[idx], &md)
-                            {
+                        match crate::export::to_markdown(&store.conversations()[idx]) {
+                            Ok(md) => match crate::export::export_to_file(
+                                &store.conversations()[idx],
+                                &md,
+                            ) {
                                 Ok(filename) => {
                                     state.flash = Some(format!("Exported to ./{}", filename));
                                 }
@@ -148,10 +270,9 @@ fn main_loop(
                     }
                 }
             }
-            PickerAction::CopyId(idx) => idx,
             PickerAction::Quit => return Ok(()),
         };
-        let id = &conversations[idx].session_id;
+        let id = &store.conversations()[idx].session_id;
         let _ = copy_to_clipboard(id);
         state.flash = Some(format!("Copied: {}", id));
     }
@@ -159,7 +280,6 @@ fn main_loop(
 
 enum PickerAction {
     ViewSession(usize),
-    CopyId(usize),
     Quit,
 }
 
@@ -167,6 +287,7 @@ enum PickerAction {
 enum PickerKeyAction {
     Quit,
     ViewSession,
+    OpenFilterOverlay,
     MoveUp,
     MoveDown,
     PageUp,
@@ -175,7 +296,8 @@ enum PickerKeyAction {
     End,
     Backspace,
     ToggleTreeExpansion,
-    CopyId,
+    PreviousColumn,
+    NextColumn,
     Type(char),
     Ignore,
 }
@@ -202,6 +324,11 @@ fn picker_key_action(evt: &Event) -> PickerKeyAction {
             code: KeyCode::Enter,
             ..
         } => PickerKeyAction::ViewSession,
+        KeyEvent {
+            code: KeyCode::Char('/'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => PickerKeyAction::OpenFilterOverlay,
         KeyEvent {
             code: KeyCode::Up, ..
         }
@@ -244,7 +371,11 @@ fn picker_key_action(evt: &Event) -> PickerKeyAction {
         KeyEvent {
             code: KeyCode::Left,
             ..
-        } => PickerKeyAction::CopyId,
+        } => PickerKeyAction::PreviousColumn,
+        KeyEvent {
+            code: KeyCode::Right,
+            ..
+        } => PickerKeyAction::NextColumn,
         KeyEvent {
             code: KeyCode::Char(c),
             modifiers,
@@ -254,9 +385,292 @@ fn picker_key_action(evt: &Event) -> PickerKeyAction {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum FilterOverlayKeyAction {
+    Close,
+    PreviousSection,
+    NextSection,
+    MoveUp,
+    MoveDown,
+    Toggle,
+    BackspaceQuery,
+    TypeQuery(char),
+    Ignore,
+}
+
+fn filter_overlay_key_action(evt: &Event) -> FilterOverlayKeyAction {
+    let Event::Key(key) = evt else {
+        return FilterOverlayKeyAction::Ignore;
+    };
+
+    if key.kind != KeyEventKind::Press {
+        return FilterOverlayKeyAction::Ignore;
+    }
+
+    match *key {
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        } => FilterOverlayKeyAction::Close,
+        KeyEvent {
+            code: KeyCode::Left,
+            ..
+        } => FilterOverlayKeyAction::PreviousSection,
+        KeyEvent {
+            code: KeyCode::Right,
+            ..
+        } => FilterOverlayKeyAction::NextSection,
+        KeyEvent {
+            code: KeyCode::Up, ..
+        } => FilterOverlayKeyAction::MoveUp,
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        } => FilterOverlayKeyAction::MoveDown,
+        KeyEvent {
+            code: KeyCode::Char(' '),
+            ..
+        } if key.modifiers.is_empty() => FilterOverlayKeyAction::Toggle,
+        KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        } => FilterOverlayKeyAction::BackspaceQuery,
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers,
+            ..
+        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            FilterOverlayKeyAction::TypeQuery(c)
+        }
+        _ => FilterOverlayKeyAction::Ignore,
+    }
+}
+
+fn handle_picker_key_action(
+    _conversations: &[Conversation],
+    state: &mut PickerState,
+    action: PickerKeyAction,
+) {
+    if action == PickerKeyAction::OpenFilterOverlay && state.filter_overlay.is_none() {
+        if let Some(section) = state.focused_column.filter_section() {
+            state.filter_overlay = Some(FilterOverlayState::new(section));
+        }
+    }
+}
+
+fn handle_filter_overlay_key_action(
+    conversations: &[Conversation],
+    state: &mut PickerState,
+    action: FilterOverlayKeyAction,
+) -> bool {
+    if state.filter_overlay.is_none() {
+        return false;
+    }
+
+    match action {
+        FilterOverlayKeyAction::Close => {
+            state.filter_overlay = None;
+            false
+        }
+        FilterOverlayKeyAction::PreviousSection | FilterOverlayKeyAction::NextSection => {
+            let Some(overlay) = state.filter_overlay.as_mut() else {
+                return false;
+            };
+            overlay.section = match overlay.section {
+                FilterSection::Agent => FilterSection::Directory,
+                FilterSection::Directory => FilterSection::Agent,
+            };
+            clamp_filter_overlay_selection(conversations, overlay);
+            false
+        }
+        FilterOverlayKeyAction::MoveUp => {
+            let Some(overlay) = state.filter_overlay.as_mut() else {
+                return false;
+            };
+            move_filter_overlay_selection(conversations, overlay, -1);
+            false
+        }
+        FilterOverlayKeyAction::MoveDown => {
+            let Some(overlay) = state.filter_overlay.as_mut() else {
+                return false;
+            };
+            move_filter_overlay_selection(conversations, overlay, 1);
+            false
+        }
+        FilterOverlayKeyAction::Toggle => {
+            let mutated = toggle_filter_overlay_selection(conversations, state);
+            if mutated {
+                refilter(conversations, state);
+            }
+            mutated
+        }
+        FilterOverlayKeyAction::BackspaceQuery => {
+            let Some(overlay) = state.filter_overlay.as_mut() else {
+                return false;
+            };
+            overlay_query_mut(overlay).pop();
+            clamp_filter_overlay_selection(conversations, overlay);
+            false
+        }
+        FilterOverlayKeyAction::TypeQuery(c) => {
+            let Some(overlay) = state.filter_overlay.as_mut() else {
+                return false;
+            };
+            overlay_query_mut(overlay).push(c);
+            clamp_filter_overlay_selection(conversations, overlay);
+            false
+        }
+        FilterOverlayKeyAction::Ignore => false,
+    }
+}
+
+fn toggle_filter_overlay_selection(
+    conversations: &[Conversation],
+    state: &mut PickerState,
+) -> bool {
+    let Some(overlay) = state.filter_overlay.as_ref() else {
+        return false;
+    };
+
+    match overlay.section {
+        FilterSection::Agent => {
+            let sources = filtered_overlay_sources(overlay);
+            if sources.is_empty() {
+                return false;
+            }
+
+            if overlay.agent_selected == 0 {
+                let enable = sources
+                    .iter()
+                    .any(|source| !state.filters.source_enabled(*source));
+                return state.filters.set_sources_enabled(sources, enable);
+            }
+
+            let Some(source) = sources.get(overlay.agent_selected - 1).copied() else {
+                return false;
+            };
+            state.filters.toggle_source(source)
+        }
+        FilterSection::Directory => {
+            let directories = filtered_overlay_directories(conversations, overlay);
+            if directories.is_empty() {
+                return false;
+            }
+
+            if overlay.directory_selected == 0 {
+                let enable = directories
+                    .iter()
+                    .any(|directory| !state.filters.directory_enabled(directory));
+                state.filters.set_directories_enabled(
+                    directories,
+                    available_directories(conversations),
+                    enable,
+                );
+                return true;
+            }
+
+            let Some(directory) = directories.get(overlay.directory_selected - 1) else {
+                return false;
+            };
+            // Leaving All mode snapshots currently known directory names; later
+            // lazy-loaded directories only match if their name is in that set.
+            state
+                .filters
+                .toggle_directory(directory, available_directories(conversations));
+            true
+        }
+    }
+}
+
+fn move_filter_overlay_selection(
+    conversations: &[Conversation],
+    overlay: &mut FilterOverlayState,
+    delta: isize,
+) {
+    let len = filter_overlay_row_count(conversations, overlay);
+    if len == 0 {
+        overlay.directory_selected = 0;
+        return;
+    }
+
+    let selected = match overlay.section {
+        FilterSection::Agent => &mut overlay.agent_selected,
+        FilterSection::Directory => &mut overlay.directory_selected,
+    };
+    let next = (*selected as isize + delta).clamp(0, len as isize - 1);
+    *selected = next as usize;
+}
+
+fn clamp_filter_overlay_selection(
+    conversations: &[Conversation],
+    overlay: &mut FilterOverlayState,
+) {
+    let agent_len = filtered_overlay_sources(overlay).len();
+    overlay.agent_selected = overlay.agent_selected.min(agent_len);
+
+    let directory_len = filtered_overlay_directories(conversations, overlay).len();
+    overlay.directory_selected = overlay.directory_selected.min(directory_len);
+}
+
+fn filter_overlay_row_count(conversations: &[Conversation], overlay: &FilterOverlayState) -> usize {
+    match overlay.section {
+        FilterSection::Agent => filtered_overlay_sources(overlay).len() + 1,
+        FilterSection::Directory => filtered_overlay_directories(conversations, overlay).len() + 1,
+    }
+}
+
+fn overlay_query_mut(overlay: &mut FilterOverlayState) -> &mut String {
+    match overlay.section {
+        FilterSection::Agent => &mut overlay.agent_query,
+        FilterSection::Directory => &mut overlay.directory_query,
+    }
+}
+
+fn available_directories(conversations: &[Conversation]) -> Vec<String> {
+    let mut directories = conversations
+        .iter()
+        .filter_map(|conversation| conversation.directory_name.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories
+}
+
+fn filtered_overlay_directories(
+    conversations: &[Conversation],
+    overlay: &FilterOverlayState,
+) -> Vec<String> {
+    available_directories(conversations)
+        .into_iter()
+        .filter(|directory| fuzzy_match(directory, &overlay.directory_query))
+        .collect()
+}
+
+fn filtered_overlay_sources(overlay: &FilterOverlayState) -> Vec<SessionSource> {
+    crate::filters::ALL_SOURCES
+        .into_iter()
+        .filter(|source| fuzzy_match(&source.to_string(), &overlay.agent_query))
+        .collect()
+}
+
+fn fuzzy_match(text: &str, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+
+    let mut text_chars = text.chars().flat_map(char::to_lowercase);
+    for query_char in query.chars().flat_map(char::to_lowercase) {
+        if !text_chars.any(|text_char| text_char == query_char) {
+            return false;
+        }
+    }
+    true
+}
+
 fn picker_visible_rows() -> usize {
     let (_, rows) = terminal::size().unwrap_or((80, 24));
-    (rows as usize).saturating_sub(2).max(1)
+    (rows as usize).saturating_sub(PICKER_HEADER_ROWS).max(1)
 }
 
 fn max_picker_scroll(len: usize, visible: usize) -> usize {
@@ -330,25 +744,25 @@ fn move_picker_selection_and_scroll(
 
 fn picker_loop(
     stdout: &mut io::Stdout,
-    conversations: &[Conversation],
+    store: &mut crate::session_store::SessionStore,
     state: &mut PickerState,
 ) -> PickerAction {
     loop {
+        let conversations = store.conversations();
         poll_full_search_index(conversations, state);
         poll_full_search_result(conversations, state);
 
-        if draw_picker(
-            stdout,
-            conversations,
-            &state.filtered_indices,
-            &state.query,
-            &state.expanded_tree_roots,
-            state.selected,
-            state.scroll,
-            state.flash.as_deref(),
-        )
-        .is_err()
-        {
+        let render_state = PickerRenderState {
+            query: &state.query,
+            filters: &state.filters,
+            filter_overlay: state.filter_overlay.as_ref(),
+            expanded_tree_roots: &state.expanded_tree_roots,
+            selected: state.selected,
+            scroll: state.scroll,
+            flash: state.flash.as_deref(),
+            focused_column: state.focused_column,
+        };
+        if draw_picker(stdout, conversations, &state.filtered_indices, render_state).is_err() {
             return PickerAction::Quit;
         }
         state.flash = None;
@@ -371,6 +785,15 @@ fn picker_loop(
             }
         };
 
+        if state.filter_overlay.is_some() {
+            let action = filter_overlay_key_action(&evt);
+            let mutated = handle_filter_overlay_key_action(store.conversations(), state, action);
+            if mutated {
+                load_missing_enabled_sources_for_filters(store, state);
+            }
+            continue;
+        }
+
         match picker_key_action(&evt) {
             PickerKeyAction::Quit => return PickerAction::Quit,
             PickerKeyAction::ViewSession => {
@@ -378,6 +801,13 @@ fn picker_loop(
                     let idx = state.filtered_indices[state.selected];
                     return PickerAction::ViewSession(idx);
                 }
+            }
+            PickerKeyAction::OpenFilterOverlay => {
+                handle_picker_key_action(
+                    store.conversations(),
+                    state,
+                    PickerKeyAction::OpenFilterOverlay,
+                );
             }
             action @ (PickerKeyAction::MoveUp
             | PickerKeyAction::MoveDown
@@ -395,21 +825,23 @@ fn picker_loop(
             }
             PickerKeyAction::Backspace => {
                 state.query.pop();
-                refilter(conversations, state);
-                start_full_search_index(conversations, state);
+                refilter(store.conversations(), state);
+                start_full_search_index(store.conversations(), state);
                 request_full_search(state);
             }
-            PickerKeyAction::ToggleTreeExpansion => toggle_tree_expansion(conversations, state),
-            PickerKeyAction::CopyId => {
-                if !state.filtered_indices.is_empty() {
-                    let idx = state.filtered_indices[state.selected];
-                    return PickerAction::CopyId(idx);
-                }
+            PickerKeyAction::ToggleTreeExpansion => {
+                toggle_tree_expansion(store.conversations(), state)
+            }
+            PickerKeyAction::PreviousColumn => {
+                state.focused_column = state.focused_column.previous();
+            }
+            PickerKeyAction::NextColumn => {
+                state.focused_column = state.focused_column.next();
             }
             PickerKeyAction::Type(c) => {
                 state.query.push(c);
-                refilter(conversations, state);
-                start_full_search_index(conversations, state);
+                refilter(store.conversations(), state);
+                start_full_search_index(store.conversations(), state);
                 request_full_search(state);
             }
             PickerKeyAction::Ignore => {}
@@ -417,21 +849,54 @@ fn picker_loop(
     }
 }
 
+fn load_missing_enabled_sources_for_filters(
+    store: &mut crate::session_store::SessionStore,
+    state: &mut PickerState,
+) {
+    if store.missing_enabled_sources(&state.filters).is_empty() {
+        return;
+    }
+
+    let result = store.load_missing_enabled_sources(&state.filters);
+    refresh_search_indexes(store.conversations(), state);
+    refilter(store.conversations(), state);
+    start_full_search_index(store.conversations(), state);
+    request_full_search(state);
+
+    match result {
+        Ok(loaded) if !loaded.is_empty() => {
+            let names = loaded
+                .into_iter()
+                .map(|source| source.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            state.flash = Some(format!("Loaded {}", names));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            state.flash = Some(format!("Failed to load source: {}", error));
+        }
+    }
+}
+
 fn refilter(conversations: &[Conversation], state: &mut PickerState) {
-    let base_indices = if state.query.is_empty() {
+    let searched_indices = if state.query.is_empty() {
         state.full_search_pending = false;
         (0..conversations.len()).collect()
     } else {
         search(conversations, &state.searchable, &state.query, Local::now())
     };
-    apply_filtered_indices(conversations, state, base_indices);
+    apply_filtered_indices(conversations, state, searched_indices);
 }
 
 fn apply_filtered_indices(
     conversations: &[Conversation],
     state: &mut PickerState,
-    base_indices: Vec<usize>,
+    searched_indices: Vec<usize>,
 ) {
+    let base_indices = state
+        .filters
+        .filter_indices(conversations, searched_indices);
     state.filtered_indices = collapse_visible_indices(
         conversations,
         base_indices,
@@ -447,6 +912,15 @@ fn apply_filtered_indices(
         state.filtered_indices.len(),
         picker_visible_rows(),
     );
+}
+
+fn refresh_search_indexes(conversations: &[Conversation], state: &mut PickerState) {
+    state.searchable = precompute_search_text(conversations);
+    state.full_search_index = None;
+    state.full_search_index_rx = None;
+    state.full_search_query_tx = None;
+    state.full_search_result_rx = None;
+    state.full_search_pending = false;
 }
 
 fn start_full_search_index(conversations: &[Conversation], state: &mut PickerState) {
@@ -661,100 +1135,773 @@ fn collapse_visible_indices(
     visible
 }
 
-#[allow(clippy::too_many_arguments)]
+struct PickerRenderState<'a> {
+    query: &'a str,
+    filters: &'a crate::filters::SessionFilters,
+    filter_overlay: Option<&'a FilterOverlayState>,
+    expanded_tree_roots: &'a HashSet<String>,
+    selected: usize,
+    scroll: usize,
+    flash: Option<&'a str>,
+    focused_column: PickerColumn,
+}
+
 fn draw_picker(
     stdout: &mut io::Stdout,
     conversations: &[Conversation],
     filtered_indices: &[usize],
-    query: &str,
-    expanded_tree_roots: &HashSet<String>,
-    selected: usize,
-    scroll: usize,
-    flash: Option<&str>,
+    render_state: PickerRenderState<'_>,
 ) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
     let cols = cols as usize;
     let rows = rows as usize;
 
-    draw_frame(stdout, |stdout| {
-        // Line 0: search prompt
-        clear_row(stdout, 0)?;
-        execute!(
-            stdout,
-            SetForegroundColor(Color::Yellow),
-            SetAttribute(Attribute::Bold),
-            Print("> "),
-            ResetColor,
-            Print(query),
-        )?;
+    execute!(
+        stdout,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(ClearType::All)
+    )?;
 
-        // Line 1: match count + hint + flash
-        let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
-        let hint = PICKER_HINT;
-        let flash_text = flash.unwrap_or("");
-        let gap = cols.saturating_sub(count.len() + hint.len() + flash_text.len() + 2);
-        clear_row(stdout, 1)?;
-        execute!(
-            stdout,
-            SetForegroundColor(Color::DarkGrey),
-            Print(&count),
-            Print(hint),
-            ResetColor,
-        )?;
-        if !flash_text.is_empty() {
-            execute!(
-                stdout,
-                Print(" ".repeat(gap)),
-                SetForegroundColor(Color::Green),
-                Print(flash_text),
-                ResetColor,
-            )?;
+    // Line 0: search scope summary
+    let filter_line =
+        truncate_to_width_text(&format!("search: {}", render_state.filters.summary()), cols);
+    execute!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print(filter_line),
+        ResetColor,
+    )?;
+
+    // Line 1: search prompt
+    let query_width = cols.saturating_sub(2);
+    let query_text = truncate_to_width_text(render_state.query, query_width);
+    execute!(
+        stdout,
+        cursor::MoveTo(0, 1),
+        SetForegroundColor(Color::Yellow),
+        SetAttribute(Attribute::Bold),
+        Print("> "),
+        ResetColor,
+        Print(&query_text),
+    )?;
+
+    // Line 2: match count + hint + flash
+    let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
+    let status_line = picker_status_line(&count, PICKER_HINT, render_state.flash, cols);
+    execute!(
+        stdout,
+        cursor::MoveTo(0, 2),
+        SetForegroundColor(Color::DarkGrey),
+        Print(status_line),
+        ResetColor,
+    )?;
+
+    // Lines 4..rows: session list
+    let list_start = PICKER_HEADER_ROWS;
+    let visible = rows.saturating_sub(list_start);
+    let selected = render_state
+        .selected
+        .min(filtered_indices.len().saturating_sub(1));
+    let scroll = keep_picker_selection_visible(
+        selected,
+        render_state.scroll,
+        filtered_indices.len(),
+        visible,
+    );
+    let hierarchy_width = picker_hierarchy_gutter_width(
+        conversations,
+        filtered_indices,
+        scroll,
+        visible,
+        render_state.expanded_tree_roots,
+        render_state.query.is_empty(),
+    );
+
+    // Line 3: session table header
+    execute!(stdout, cursor::MoveTo(0, 3))?;
+    draw_picker_column_header(stdout, cols, hierarchy_width, render_state.focused_column)?;
+
+    for i in 0..visible {
+        let list_idx = scroll + i;
+        if list_idx >= filtered_indices.len() {
+            break;
+        }
+        let conv = &conversations[filtered_indices[list_idx]];
+        let is_selected = list_idx == selected;
+
+        execute!(stdout, cursor::MoveTo(0, (list_start + i) as u16))?;
+
+        if is_selected {
+            execute!(stdout, SetAttribute(Attribute::Reverse))?;
         }
 
-        // Lines 2..rows: session list
-        let list_start = 2usize;
-        let visible = rows.saturating_sub(list_start);
-        let scroll =
-            keep_picker_selection_visible(selected, scroll, filtered_indices.len(), visible);
+        draw_session_line(
+            stdout,
+            conv,
+            cols,
+            hierarchy_width,
+            is_selected,
+            render_state.expanded_tree_roots,
+            render_state.query.is_empty(),
+        )?;
 
-        for i in 0..visible {
-            let row = list_start + i;
-            clear_row(stdout, row)?;
+        if is_selected {
+            execute!(stdout, SetAttribute(Attribute::NoReverse))?;
+        }
+    }
 
-            let list_idx = scroll + i;
-            if list_idx >= filtered_indices.len() {
-                continue;
-            }
-            let conv = &conversations[filtered_indices[list_idx]];
-            let is_selected = list_idx == selected;
+    if let Some(overlay) = render_state.filter_overlay {
+        draw_filter_overlay(
+            stdout,
+            conversations,
+            render_state.filters,
+            overlay,
+            cols,
+            rows,
+        )?;
+    }
 
-            if is_selected {
-                execute!(stdout, SetAttribute(Attribute::Reverse))?;
-            }
+    let cursor_col = 2usize
+        .saturating_add(UnicodeWidthStr::width(render_state.query))
+        .min(cols.saturating_sub(1));
+    execute!(stdout, cursor::MoveTo(cursor_col as u16, 1))?;
+    stdout.flush()?;
+    Ok(())
+}
 
-            draw_session_line(
-                stdout,
-                conv,
-                cols,
-                is_selected,
-                expanded_tree_roots,
-                query.is_empty(),
-            )?;
+fn picker_status_line(count: &str, hint: &str, flash: Option<&str>, cols: usize) -> String {
+    let mut line = format!("{}{}", count, hint);
+    if let Some(flash) = flash.filter(|flash| !flash.is_empty()) {
+        let gap = cols
+            .saturating_sub(UnicodeWidthStr::width(line.as_str()) + UnicodeWidthStr::width(flash))
+            .max(1);
+        line.push_str(&" ".repeat(gap));
+        line.push_str(flash);
+    }
 
-            if is_selected {
-                execute!(stdout, SetAttribute(Attribute::NoReverse))?;
-            }
+    truncate_to_width_text(&line, cols)
+}
+
+fn truncate_to_width_text(text: &str, cols: usize) -> String {
+    truncate_to_display_width(text, cols)
+}
+
+fn truncate_to_display_width(text: &str, max_width: usize) -> String {
+    let mut rendered_width = 0;
+    let mut clipped = String::new();
+
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if rendered_width + ch_width > max_width {
+            break;
+        }
+        rendered_width += ch_width;
+        clipped.push(ch);
+    }
+
+    clipped
+}
+
+fn draw_filter_overlay(
+    stdout: &mut io::Stdout,
+    conversations: &[Conversation],
+    filters: &crate::filters::SessionFilters,
+    overlay: &FilterOverlayState,
+    cols: usize,
+    rows: usize,
+) -> io::Result<()> {
+    let panel = filter_overlay_panel(conversations, filters, overlay);
+    let line_count = panel.right_rows.len().max(FILTER_OVERLAY_MIN_BODY_ROWS)
+        + FILTER_OVERLAY_VERTICAL_PADDING * 2
+        + 2;
+    let (x, y, width, height) = filter_overlay_bounds(cols, rows, line_count);
+    let nav_width = filter_overlay_nav_width(width);
+    let nav_content_width = nav_width.saturating_sub(FILTER_OVERLAY_INNER_PADDING * 2);
+    let right_width = width.saturating_sub(nav_width + FILTER_OVERLAY_INNER_PADDING * 3 + 3);
+
+    draw_filter_overlay_backdrop(stdout, x, y, width, height, cols, rows)?;
+    draw_filter_overlay_border(stdout, x, y, width, height, overlay.section)?;
+    draw_filter_overlay_nav(
+        stdout,
+        x + 1 + FILTER_OVERLAY_INNER_PADDING,
+        y + 1 + FILTER_OVERLAY_VERTICAL_PADDING,
+        nav_content_width,
+        &panel,
+        overlay,
+    )?;
+    draw_filter_overlay_divider(
+        stdout,
+        x + 1 + nav_width,
+        y + 1 + FILTER_OVERLAY_VERTICAL_PADDING,
+        height.saturating_sub(2 + FILTER_OVERLAY_VERTICAL_PADDING * 2),
+    )?;
+
+    let right_x = x + nav_width + FILTER_OVERLAY_INNER_PADDING * 2 + 2;
+    let body_rows = height.saturating_sub(2 + FILTER_OVERLAY_VERTICAL_PADDING * 2);
+    for row in 0..body_rows {
+        let content_y = y + 1 + FILTER_OVERLAY_VERTICAL_PADDING + row;
+        let (content, selected) = panel
+            .right_rows
+            .get(row)
+            .map(|line| (line.content.as_str(), line.selected))
+            .unwrap_or(("", false));
+        execute!(
+            stdout,
+            cursor::MoveTo(right_x as u16, content_y as u16),
+            SetBackgroundColor(Color::Black),
+            Print(" ".repeat(right_width)),
+            cursor::MoveTo(right_x as u16, content_y as u16),
+        )?;
+        if selected {
+            execute!(stdout, SetAttribute(Attribute::Reverse))?;
         }
 
-        execute!(stdout, cursor::MoveTo((2 + query.len()) as u16, 0))?;
-        Ok(())
-    })
+        let text = truncate(content, right_width);
+        execute!(stdout, Print(format!("{:<right_width$}", text)))?;
+
+        if selected {
+            execute!(stdout, SetAttribute(Attribute::NoReverse))?;
+        }
+        execute!(stdout, ResetColor)?;
+    }
+
+    Ok(())
+}
+
+const FILTER_OVERLAY_MIN_BODY_ROWS: usize = 7;
+const FILTER_OVERLAY_INNER_PADDING: usize = 2;
+const FILTER_OVERLAY_VERTICAL_PADDING: usize = 1;
+
+#[derive(Debug, Eq, PartialEq)]
+struct FilterOverlayPanel {
+    agent_summary: String,
+    directory_summary: String,
+    right_rows: Vec<FilterOverlayLine>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FilterOverlayLine {
+    content: String,
+    selected: bool,
+}
+
+fn filter_overlay_panel(
+    conversations: &[Conversation],
+    filters: &crate::filters::SessionFilters,
+    overlay: &FilterOverlayState,
+) -> FilterOverlayPanel {
+    let right_rows = match overlay.section {
+        FilterSection::Agent => filter_overlay_agent_rows(filters, overlay),
+        FilterSection::Directory => filter_overlay_directory_rows(conversations, filters, overlay),
+    };
+
+    FilterOverlayPanel {
+        agent_summary: format!(
+            "{}/{}",
+            selected_source_count(filters, overlay),
+            filtered_overlay_sources(overlay).len()
+        ),
+        directory_summary: {
+            let directories = filtered_overlay_directories(conversations, overlay);
+            format!(
+                "{}/{}",
+                selected_directory_count(filters, &directories),
+                directories.len()
+            )
+        },
+        right_rows,
+    }
+}
+
+fn filter_overlay_agent_rows(
+    filters: &crate::filters::SessionFilters,
+    overlay: &FilterOverlayState,
+) -> Vec<FilterOverlayLine> {
+    let sources = filtered_overlay_sources(overlay);
+    let mut rows = vec![
+        FilterOverlayLine {
+            content: filter_overlay_search_line("agent", &overlay.agent_query),
+            selected: false,
+        },
+        FilterOverlayLine {
+            content: filter_overlay_scope_line(
+                overlay.agent_query.as_str(),
+                selected_source_count(filters, overlay),
+                sources.len(),
+                overlay.agent_selected == 0,
+            ),
+            selected: overlay.agent_selected == 0,
+        },
+    ];
+
+    if sources.is_empty() {
+        rows.push(FilterOverlayLine {
+            content: "No agents".to_string(),
+            selected: false,
+        });
+    } else {
+        rows.extend(sources.into_iter().enumerate().map(|(idx, source)| {
+            let checked = if filters.source_enabled(source) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            FilterOverlayLine {
+                content: format!("{} {}", checked, source),
+                selected: idx + 1 == overlay.agent_selected,
+            }
+        }));
+    }
+
+    rows
+}
+
+fn filter_overlay_directory_rows(
+    conversations: &[Conversation],
+    filters: &crate::filters::SessionFilters,
+    overlay: &FilterOverlayState,
+) -> Vec<FilterOverlayLine> {
+    let directories = filtered_overlay_directories(conversations, overlay);
+    let mut rows = vec![
+        FilterOverlayLine {
+            content: filter_overlay_search_line("directory", &overlay.directory_query),
+            selected: false,
+        },
+        FilterOverlayLine {
+            content: filter_overlay_scope_line(
+                overlay.directory_query.as_str(),
+                selected_directory_count(filters, &directories),
+                directories.len(),
+                overlay.directory_selected == 0,
+            ),
+            selected: overlay.directory_selected == 0,
+        },
+    ];
+
+    if directories.is_empty() {
+        rows.push(FilterOverlayLine {
+            content: "No directories".to_string(),
+            selected: false,
+        });
+    } else {
+        rows.extend(directories.into_iter().enumerate().map(|(idx, directory)| {
+            let checked = if filters.directory_enabled(&directory) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            FilterOverlayLine {
+                content: format!("{} {}", checked, directory),
+                selected: idx + 1 == overlay.directory_selected,
+            }
+        }));
+    }
+
+    rows
+}
+
+fn filter_overlay_search_line(label: &str, query: &str) -> String {
+    if query.is_empty() {
+        format!("Search {}: _", label)
+    } else {
+        format!("Search {}: {}", label, query)
+    }
+}
+
+fn draw_filter_overlay_backdrop(
+    stdout: &mut io::Stdout,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    cols: usize,
+    rows: usize,
+) -> io::Result<()> {
+    let (clear_x, clear_y, clear_width, clear_height) =
+        filter_overlay_backdrop_bounds(x, y, width, height, cols, rows);
+
+    for row in 0..clear_height {
+        execute!(
+            stdout,
+            cursor::MoveTo(clear_x as u16, (clear_y + row) as u16),
+            Print(" ".repeat(clear_width)),
+            ResetColor
+        )?;
+    }
+
+    Ok(())
+}
+
+fn filter_overlay_backdrop_bounds(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize, usize, usize) {
+    let clear_x = x.saturating_sub(FILTER_OVERLAY_INNER_PADDING);
+    let clear_y = y.saturating_sub(FILTER_OVERLAY_VERTICAL_PADDING);
+    let clear_right = (x + width + FILTER_OVERLAY_INNER_PADDING).min(cols);
+    let clear_bottom = (y + height + FILTER_OVERLAY_VERTICAL_PADDING).min(rows);
+
+    (
+        clear_x,
+        clear_y,
+        clear_right.saturating_sub(clear_x),
+        clear_bottom.saturating_sub(clear_y),
+    )
+}
+
+fn draw_filter_overlay_border(
+    stdout: &mut io::Stdout,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    section: FilterSection,
+) -> io::Result<()> {
+    if width < 2 || height < 2 {
+        return Ok(());
+    }
+
+    let title = filter_overlay_title(section);
+    let top_line = filter_overlay_top_border(width, title);
+    let bottom_line = format!("└{}┘", "─".repeat(width.saturating_sub(2)));
+
+    execute!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        SetBackgroundColor(Color::Black),
+        cursor::MoveTo(x as u16, y as u16),
+        Print(top_line)
+    )?;
+
+    for row in 1..height.saturating_sub(1) {
+        execute!(
+            stdout,
+            cursor::MoveTo(x as u16, (y + row) as u16),
+            Print("│"),
+            Print(" ".repeat(width.saturating_sub(2))),
+            Print("│")
+        )?;
+    }
+
+    execute!(
+        stdout,
+        cursor::MoveTo(x as u16, (y + height - 1) as u16),
+        Print(bottom_line),
+        ResetColor
+    )?;
+
+    Ok(())
+}
+
+fn filter_overlay_title(section: FilterSection) -> &'static str {
+    match section {
+        FilterSection::Agent => " Search · agent ",
+        FilterSection::Directory => " Search · directory ",
+    }
+}
+
+fn filter_overlay_top_border(width: usize, title: &str) -> String {
+    if width <= 2 {
+        return "─".repeat(width);
+    }
+
+    let available = width.saturating_sub(2);
+    let title = truncate(title, available);
+    let remainder = available.saturating_sub(title.chars().count());
+    format!("┌{}{}┐", title, "─".repeat(remainder))
+}
+
+fn draw_filter_overlay_nav(
+    stdout: &mut io::Stdout,
+    x: usize,
+    y: usize,
+    width: usize,
+    panel: &FilterOverlayPanel,
+    overlay: &FilterOverlayState,
+) -> io::Result<()> {
+    let rows = [
+        (
+            format!("agent   {}", panel.agent_summary),
+            overlay.section == FilterSection::Agent,
+        ),
+        (
+            format!("directory {}", panel.directory_summary),
+            overlay.section == FilterSection::Directory,
+        ),
+        ("".to_string(), false),
+        ("Esc close".to_string(), false),
+        ("←/→ section".to_string(), false),
+        ("type narrow".to_string(), false),
+        ("Space toggle".to_string(), false),
+    ];
+
+    for (idx, (content, selected)) in rows.into_iter().enumerate() {
+        execute!(
+            stdout,
+            cursor::MoveTo(x as u16, (y + idx) as u16),
+            SetBackgroundColor(Color::Black)
+        )?;
+        if selected {
+            execute!(stdout, SetAttribute(Attribute::Reverse))?;
+        } else if idx >= 3 {
+            execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        }
+
+        let text = truncate(&content, width);
+        execute!(stdout, Print(format!("{:<width$}", text)))?;
+
+        if selected {
+            execute!(stdout, SetAttribute(Attribute::NoReverse))?;
+        }
+        execute!(stdout, ResetColor)?;
+    }
+
+    Ok(())
+}
+
+fn draw_filter_overlay_divider(
+    stdout: &mut io::Stdout,
+    x: usize,
+    y: usize,
+    height: usize,
+) -> io::Result<()> {
+    execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+    for row in 0..height {
+        execute!(
+            stdout,
+            cursor::MoveTo(x as u16, (y + row) as u16),
+            SetBackgroundColor(Color::Black),
+            Print("│")
+        )?;
+    }
+    execute!(stdout, ResetColor)?;
+    Ok(())
+}
+
+fn filter_overlay_nav_width(width: usize) -> usize {
+    let available = width.saturating_sub(4);
+    available
+        .min(FILTER_OVERLAY_MAX_NAV_WIDTH)
+        .max(available.min(FILTER_OVERLAY_MIN_NAV_WIDTH))
+}
+
+fn filter_overlay_scope_line(
+    query: &str,
+    selected_count: usize,
+    total_count: usize,
+    selected: bool,
+) -> String {
+    let label = if query.trim().is_empty() {
+        "all".to_string()
+    } else {
+        query.to_string()
+    };
+    let marker = if selected { ">" } else { " " };
+    format!(
+        "{} {} · {}/{} selected",
+        marker, label, selected_count, total_count
+    )
+}
+
+fn selected_source_count(
+    filters: &crate::filters::SessionFilters,
+    overlay: &FilterOverlayState,
+) -> usize {
+    filtered_overlay_sources(overlay)
+        .into_iter()
+        .filter(|source| filters.source_enabled(*source))
+        .count()
+}
+
+fn selected_directory_count(
+    filters: &crate::filters::SessionFilters,
+    directories: &[String],
+) -> usize {
+    directories
+        .iter()
+        .filter(|directory| filters.directory_enabled(directory))
+        .count()
+}
+
+fn filter_overlay_bounds(
+    cols: usize,
+    rows: usize,
+    line_count: usize,
+) -> (usize, usize, usize, usize) {
+    let width = cols.min(80).max(cols.min(52));
+    let max_height = rows.saturating_sub(2).max(1);
+    let height = line_count.min(max_height);
+    let x = cols.saturating_sub(width) / 2;
+    let y = rows.saturating_sub(height) / 2;
+
+    (x, y, width, height)
+}
+
+fn draw_picker_column_header(
+    stdout: &mut io::Stdout,
+    max_width: usize,
+    hierarchy_width: usize,
+    focused_column: PickerColumn,
+) -> io::Result<()> {
+    let fixed_cells = [
+        HeaderCell::spacer(1),
+        HeaderCell::new(
+            "agent",
+            PICKER_SOURCE_WIDTH,
+            focused_column == PickerColumn::Agent,
+            HeaderAlign::Left,
+        ),
+        HeaderCell::spacer(1),
+        HeaderCell::new(
+            "age",
+            PICKER_AGE_WIDTH,
+            focused_column == PickerColumn::Age,
+            HeaderAlign::Right,
+        ),
+        HeaderCell::spacer(2),
+        HeaderCell::spacer(hierarchy_width),
+        HeaderCell::new(
+            "directory",
+            PICKER_DIRECTORY_WIDTH,
+            focused_column == PickerColumn::Directory,
+            HeaderAlign::Left,
+        ),
+        HeaderCell::spacer(2),
+        HeaderCell::new(
+            "model",
+            PICKER_MODEL_WIDTH,
+            focused_column == PickerColumn::Model,
+            HeaderAlign::Left,
+        ),
+        HeaderCell::spacer(2),
+    ];
+    draw_picker_header_cells(stdout, &fixed_cells)?;
+
+    let fixed_width = picker_row_fixed_width(hierarchy_width);
+    if max_width > fixed_width {
+        let preview_width = max_width - fixed_width;
+        let preview = HeaderCell::new(
+            "preview",
+            preview_width,
+            focused_column == PickerColumn::Preview,
+            HeaderAlign::Left,
+        );
+        draw_picker_header_cells(stdout, &[preview])?;
+    }
+
+    execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct HeaderCell<'a> {
+    label: &'a str,
+    width: usize,
+    focused: bool,
+    align: HeaderAlign,
+}
+
+impl<'a> HeaderCell<'a> {
+    fn new(label: &'a str, width: usize, focused: bool, align: HeaderAlign) -> Self {
+        Self {
+            label,
+            width,
+            focused,
+            align,
+        }
+    }
+
+    fn spacer(width: usize) -> Self {
+        Self::new("", width, false, HeaderAlign::Left)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HeaderAlign {
+    Left,
+    Right,
+}
+
+fn draw_picker_header_cells(stdout: &mut io::Stdout, cells: &[HeaderCell<'_>]) -> io::Result<()> {
+    for cell in cells {
+        draw_picker_header_cell(stdout, cell.label, cell.width, cell.focused, cell.align)?;
+    }
+    Ok(())
+}
+
+fn draw_picker_header_cell(
+    stdout: &mut io::Stdout,
+    label: &str,
+    width: usize,
+    focused: bool,
+    align: HeaderAlign,
+) -> io::Result<()> {
+    let label = truncate(label, width);
+    let text = match align {
+        HeaderAlign::Left => format!("{:<width$}", label, width = width),
+        HeaderAlign::Right => format!("{:>width$}", label, width = width),
+    };
+
+    execute!(
+        stdout,
+        SetForegroundColor(if focused {
+            Color::Yellow
+        } else {
+            Color::DarkGrey
+        }),
+        SetAttribute(if focused {
+            Attribute::Bold
+        } else {
+            Attribute::NormalIntensity
+        }),
+        Print(text),
+    )?;
+    Ok(())
+}
+
+fn picker_row_fixed_width(hierarchy_width: usize) -> usize {
+    1 + PICKER_SOURCE_WIDTH
+        + 1
+        + PICKER_AGE_WIDTH
+        + 2
+        + hierarchy_width
+        + PICKER_DIRECTORY_WIDTH
+        + 2
+        + PICKER_MODEL_WIDTH
+        + 2
+}
+
+fn picker_hierarchy_gutter_width(
+    conversations: &[Conversation],
+    filtered_indices: &[usize],
+    scroll: usize,
+    visible: usize,
+    expanded_tree_roots: &HashSet<String>,
+    collapse_enabled: bool,
+) -> usize {
+    filtered_indices
+        .iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|idx| {
+            picker_hierarchy_marker(&conversations[*idx], expanded_tree_roots, collapse_enabled)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+        .clamp(PICKER_MIN_HIERARCHY_GUTTER_WIDTH, HIERARCHY_GUTTER_WIDTH)
 }
 
 fn draw_session_line(
     stdout: &mut io::Stdout,
     conv: &Conversation,
     max_width: usize,
+    hierarchy_width: usize,
     is_selected: bool,
     expanded_tree_roots: &HashSet<String>,
     collapse_enabled: bool,
@@ -770,38 +1917,27 @@ fn draw_session_line(
 
     let age = format_relative_time(conv.timestamp);
     let hierarchy = picker_hierarchy_marker(conv, expanded_tree_roots, collapse_enabled);
-    let project = format_project_label(conv);
+    let directory = format_directory_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
-    let sid = short_id(&conv.session_id);
 
-    let model_display = format!("({:<12})", model);
-    // fixed columns: " " + 8 (source) + " " + 5 (age) + "  " + hierarchy gutter + 20 (project) + "  " + 14 (model) + "  " + 8 (sid) + " " + 2 (quotes)
-    let fixed_len =
-        1 + 8 + 1 + 5 + 2 + HIERARCHY_GUTTER_WIDTH + 20 + 2 + model_display.len() + 2 + 8 + 1 + 2;
-    let preview_max = max_width.saturating_sub(fixed_len);
+    let model_inner_width = PICKER_MODEL_WIDTH.saturating_sub(2);
+    let model_display = format!(
+        "({:<inner_width$})",
+        truncate(&model, model_inner_width),
+        inner_width = model_inner_width
+    );
+    let preview_max = max_width.saturating_sub(picker_row_fixed_width(hierarchy_width));
     let preview = truncate(&title, preview_max.max(10));
 
     execute!(
         stdout,
         Print(" "),
         SetForegroundColor(source_color),
-        Print(format!("{:<8}", format!("[{}]", source_tag))),
-        ResetColor,
-    )?;
-    if is_selected {
-        execute!(stdout, SetAttribute(Attribute::Reverse))?;
-    }
-
-    execute!(stdout, Print(format!(" {:>5}  ", age)))?;
-
-    execute!(
-        stdout,
-        SetForegroundColor(Color::Cyan),
         Print(format!(
             "{:<width$}",
-            hierarchy,
-            width = HIERARCHY_GUTTER_WIDTH
+            format!("[{}]", source_tag),
+            width = PICKER_SOURCE_WIDTH
         )),
         ResetColor,
     )?;
@@ -809,11 +1945,30 @@ fn draw_session_line(
         execute!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    let proj_display: String = project.chars().take(20).collect();
+    execute!(
+        stdout,
+        Print(format!(" {:>width$}  ", age, width = PICKER_AGE_WIDTH))
+    )?;
+
     execute!(
         stdout,
         SetForegroundColor(Color::Cyan),
-        Print(format!("{:<20}", proj_display)),
+        Print(format!("{:<width$}", hierarchy, width = hierarchy_width)),
+        ResetColor,
+    )?;
+    if is_selected {
+        execute!(stdout, SetAttribute(Attribute::Reverse))?;
+    }
+
+    let dir_display: String = directory.chars().take(PICKER_DIRECTORY_WIDTH).collect();
+    execute!(
+        stdout,
+        SetForegroundColor(Color::Cyan),
+        Print(format!(
+            "{:<width$}",
+            dir_display,
+            width = PICKER_DIRECTORY_WIDTH
+        )),
         ResetColor,
     )?;
     if is_selected {
@@ -823,17 +1978,11 @@ fn draw_session_line(
     execute!(
         stdout,
         SetForegroundColor(Color::DarkGrey),
-        Print(format!("  {}", model_display)),
-        ResetColor,
-    )?;
-    if is_selected {
-        execute!(stdout, SetAttribute(Attribute::Reverse))?;
-    }
-
-    execute!(
-        stdout,
-        SetForegroundColor(Color::DarkGrey),
-        Print(format!("  {} ", sid)),
+        Print(format!(
+            "  {:<width$}",
+            model_display,
+            width = PICKER_MODEL_WIDTH
+        )),
         ResetColor,
     )?;
     if is_selected {
@@ -847,20 +1996,7 @@ fn draw_session_line(
     execute!(stdout, Print(format!("\"{}\"", clean_preview)))?;
 
     if is_selected {
-        let line_so_far = 1
-            + 8
-            + 1
-            + 5
-            + 2
-            + HIERARCHY_GUTTER_WIDTH
-            + 20
-            + 2
-            + model_display.len()
-            + 2
-            + 8
-            + 1
-            + clean_preview.len()
-            + 2;
+        let line_so_far = picker_row_fixed_width(hierarchy_width) + clean_preview.len();
         let padding = max_width.saturating_sub(line_so_far);
         if padding > 0 {
             execute!(stdout, Print(" ".repeat(padding)))?;
@@ -877,9 +2013,9 @@ fn picker_hierarchy_marker(
 ) -> String {
     if collapse_enabled && conv.hierarchy_depth == 0 && conv.hierarchy_has_children {
         if expanded_tree_roots.contains(&conv.session_id) {
-            "▾─".to_string()
+            "▾".to_string()
         } else {
-            "▸─".to_string()
+            "▸".to_string()
         }
     } else {
         format_hierarchy_marker(conv)
@@ -910,7 +2046,7 @@ mod tests {
             timestamp: Local::now(),
             preview: session_id.to_string(),
             full_text: String::new(),
-            project_name: Some("project".to_string()),
+            directory_name: Some("directory".to_string()),
             cwd: None,
             message_count: 1,
             model: Some("gpt-5.5".to_string()),
@@ -976,100 +2112,432 @@ mod tests {
     }
 
     #[test]
-    fn first_query_refilter_does_not_build_full_index() {
+    fn initial_filtered_indices_keep_full_conversations_and_narrow_visible_rows() {
+        let conversations = vec![conversation("matching", 0, false), {
+            let mut conv = conversation("other", 0, false);
+            conv.directory_name = Some("other".to_string());
+            conv
+        }];
+        let mut filters = crate::filters::SessionFilters::all();
+        filters.only_directory("directory");
+        let expanded = HashSet::new();
+
+        let visible = initial_filtered_indices(&conversations, &filters, &expanded);
+
+        assert_eq!(visible, vec![0]);
+        assert_eq!(conversations.len(), 2);
+    }
+
+    #[test]
+    fn refilter_applies_source_filter_before_search() {
+        let conversations = vec![
+            {
+                let mut conv = conversation("codex-match", 0, false);
+                conv.source = SessionSource::Codex;
+                conv.preview = "match".to_string();
+                conv
+            },
+            {
+                let mut conv = conversation("claude-match", 0, false);
+                conv.source = SessionSource::Claude;
+                conv.preview = "match".to_string();
+                conv
+            },
+        ];
+        let mut state = PickerState::for_test(
+            &conversations,
+            crate::filters::SessionFilters::source_only(SessionSource::Codex),
+        );
+        state.query = "match".to_string();
+
+        refilter(&conversations, &mut state);
+
+        assert_eq!(state.filtered_indices, vec![0]);
+    }
+
+    #[test]
+    fn slash_opens_search_overlay_for_focused_agent_column() {
+        let conversations = vec![conversation("codex", 0, false)];
+        let mut state =
+            PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
+        state.focused_column = PickerColumn::Agent;
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        handle_picker_key_action(&conversations, &mut state, picker_key_action(&event));
+
+        assert_eq!(
+            state.filter_overlay,
+            Some(FilterOverlayState {
+                section: FilterSection::Agent,
+                agent_selected: 0,
+                agent_query: String::new(),
+                directory_selected: 0,
+                directory_query: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn slash_opens_search_overlay_for_focused_directory_column() {
+        let conversations = vec![conversation("codex", 0, false)];
+        let mut state =
+            PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
+        state.focused_column = PickerColumn::Directory;
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        handle_picker_key_action(&conversations, &mut state, picker_key_action(&event));
+
+        assert_eq!(
+            state.filter_overlay,
+            Some(FilterOverlayState {
+                section: FilterSection::Directory,
+                agent_selected: 0,
+                agent_query: String::new(),
+                directory_selected: 0,
+                directory_query: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn slash_opens_directory_search_for_default_preview_column() {
+        let conversations = vec![conversation("codex", 0, false)];
+        let mut state =
+            PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        handle_picker_key_action(&conversations, &mut state, picker_key_action(&event));
+
+        assert_eq!(
+            state.filter_overlay.as_ref().map(|overlay| overlay.section),
+            Some(FilterSection::Directory)
+        );
+    }
+
+    #[test]
+    fn slash_opens_directory_search_for_focused_age_and_model_columns() {
+        let conversations = vec![conversation("codex", 0, false)];
+        let mut state =
+            PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        state.focused_column = PickerColumn::Age;
+        handle_picker_key_action(&conversations, &mut state, picker_key_action(&event));
+        assert_eq!(
+            state.filter_overlay.as_ref().map(|overlay| overlay.section),
+            Some(FilterSection::Directory)
+        );
+
+        state.filter_overlay = None;
+        state.focused_column = PickerColumn::Model;
+        handle_picker_key_action(&conversations, &mut state, picker_key_action(&event));
+        assert_eq!(
+            state.filter_overlay.as_ref().map(|overlay| overlay.section),
+            Some(FilterSection::Directory)
+        );
+    }
+
+    #[test]
+    fn filter_overlay_escape_closes_without_resetting_filters() {
+        let conversations = vec![conversation("codex", 0, false)];
+        let mut state = PickerState::for_test(
+            &conversations,
+            crate::filters::SessionFilters::source_only(SessionSource::Codex),
+        );
+        state.filter_overlay = Some(FilterOverlayState::new(FilterSection::Agent));
+
+        let mutated = handle_filter_overlay_key_action(
+            &conversations,
+            &mut state,
+            FilterOverlayKeyAction::Close,
+        );
+
+        assert!(!mutated);
+        assert!(state.filter_overlay.is_none());
+        assert!(state.filters.source_enabled(SessionSource::Codex));
+        assert!(!state.filters.source_enabled(SessionSource::Claude));
+    }
+
+    #[test]
+    fn directory_overlay_scope_row_toggles_all_and_none() {
+        let conversations = vec![conversation("frontend", 0, false), {
+            let mut conv = conversation("backend", 0, false);
+            conv.directory_name = Some("backend".to_string());
+            conv
+        }];
+        let mut state =
+            PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
+        state.filter_overlay = Some(FilterOverlayState {
+            section: FilterSection::Directory,
+            agent_selected: 0,
+            agent_query: String::new(),
+            directory_selected: 0,
+            directory_query: String::new(),
+        });
+
+        let disabled_all = handle_filter_overlay_key_action(
+            &conversations,
+            &mut state,
+            filter_overlay_key_action(&Event::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+            ))),
+        );
+        assert!(disabled_all);
+        assert_eq!(state.filtered_indices, Vec::<usize>::new());
+
+        let enabled_all = handle_filter_overlay_key_action(
+            &conversations,
+            &mut state,
+            filter_overlay_key_action(&Event::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+            ))),
+        );
+        assert!(enabled_all);
+        assert_eq!(state.filtered_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn directory_overlay_plain_a_types_query() {
+        let conversations = vec![conversation("alpha", 0, false)];
+        let mut state =
+            PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
+        state.filter_overlay = Some(FilterOverlayState {
+            section: FilterSection::Directory,
+            agent_selected: 0,
+            agent_query: String::new(),
+            directory_selected: 0,
+            directory_query: String::new(),
+        });
+
+        let mutated = handle_filter_overlay_key_action(
+            &conversations,
+            &mut state,
+            filter_overlay_key_action(&Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            ))),
+        );
+
+        assert!(!mutated);
+        assert_eq!(
+            state.filter_overlay.as_ref().unwrap().directory_query,
+            "a".to_string()
+        );
+    }
+
+    #[test]
+    fn directory_toggle_from_all_uses_specific_known_directory_set() {
+        let conversations = vec![
+            {
+                let mut conv = conversation("a", 0, false);
+                conv.directory_name = Some("a".to_string());
+                conv
+            },
+            {
+                let mut conv = conversation("b", 0, false);
+                conv.directory_name = Some("b".to_string());
+                conv
+            },
+        ];
+        let mut state =
+            PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
+        state.filter_overlay = Some(FilterOverlayState {
+            section: FilterSection::Directory,
+            agent_selected: 0,
+            agent_query: String::new(),
+            directory_selected: 1,
+            directory_query: String::new(),
+        });
+
+        let mutated = handle_filter_overlay_key_action(
+            &conversations,
+            &mut state,
+            FilterOverlayKeyAction::Toggle,
+        );
+
+        let mut later_directory = conversation("c", 0, false);
+        later_directory.directory_name = Some("c".to_string());
+
+        assert!(mutated);
+        assert!(!state.filters.directory_enabled("a"));
+        assert!(state.filters.directory_enabled("b"));
+        assert!(!state.filters.directory_enabled("c"));
+        assert!(state.filters.matches(&conversations[1]));
+        assert!(!state.filters.matches(&later_directory));
+    }
+
+    #[test]
+    fn overlay_source_toggle_allows_empty_sources() {
+        let conversations = vec![conversation("codex", 0, false)];
+        let mut state = PickerState::for_test(
+            &conversations,
+            crate::filters::SessionFilters::source_only(SessionSource::Codex),
+        );
+        state.filter_overlay = Some(FilterOverlayState {
+            section: FilterSection::Agent,
+            agent_selected: 2,
+            agent_query: String::new(),
+            directory_selected: 0,
+            directory_query: String::new(),
+        });
+
+        let mutated = handle_filter_overlay_key_action(
+            &conversations,
+            &mut state,
+            FilterOverlayKeyAction::Toggle,
+        );
+
+        assert!(mutated);
+        assert!(!state.filters.source_enabled(SessionSource::Codex));
+        assert_eq!(state.filtered_indices, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn filter_overlay_bounds_centers_actual_rendered_height() {
+        let (_, y, _, height) = filter_overlay_bounds(80, 24, 13);
+
+        assert_eq!(y, 5);
+        assert_eq!(height, 13);
+    }
+
+    #[test]
+    fn filter_overlay_panel_uses_left_nav_summaries_and_search_row() {
+        let conversations = vec![
+            {
+                let mut conv = conversation("wors-alpha", 0, false);
+                conv.directory_name = Some("wors-alpha".to_string());
+                conv
+            },
+            {
+                let mut conv = conversation("wors-beta", 0, false);
+                conv.directory_name = Some("wors-beta".to_string());
+                conv
+            },
+        ];
+        let mut overlay = FilterOverlayState {
+            section: FilterSection::Directory,
+            agent_selected: 0,
+            agent_query: String::new(),
+            directory_selected: 0,
+            directory_query: "wors".to_string(),
+        };
+        let filters = crate::filters::SessionFilters::all();
+
+        let panel = filter_overlay_panel(&conversations, &filters, &overlay);
+
+        assert_eq!(panel.agent_summary, "2/2");
+        assert_eq!(panel.directory_summary, "2/2");
+        assert_eq!(panel.right_rows[0].content, "Search directory: wors");
+        assert_eq!(panel.right_rows[1].content, "> wors · 2/2 selected");
+        assert!(panel.right_rows[1].selected);
+
+        overlay.directory_query = String::new();
+        let panel = filter_overlay_panel(&conversations, &filters, &overlay);
+        assert_eq!(panel.right_rows[0].content, "Search directory: _");
+        assert_eq!(panel.right_rows[1].content, "> all · 2/2 selected");
+    }
+
+    #[test]
+    fn filter_overlay_nav_width_fits_directory_count() {
+        let content_width =
+            filter_overlay_nav_width(80).saturating_sub(FILTER_OVERLAY_INNER_PADDING * 2);
+
+        assert!(content_width >= "directory 99/99".len());
+    }
+
+    #[test]
+    fn filter_overlay_nav_width_does_not_exceed_available_width() {
+        assert!(filter_overlay_nav_width(10) <= 6);
+    }
+
+    #[test]
+    fn filter_overlay_border_title_is_embedded_in_top_rule() {
+        assert_eq!(
+            filter_overlay_top_border(24, filter_overlay_title(FilterSection::Directory)),
+            "┌ Search · directory ──┐"
+        );
+    }
+
+    #[test]
+    fn filter_overlay_backdrop_adds_clipped_padding() {
+        assert_eq!(
+            filter_overlay_backdrop_bounds(10, 5, 40, 8, 80, 24),
+            (8, 4, 44, 10)
+        );
+        assert_eq!(
+            filter_overlay_backdrop_bounds(0, 0, 40, 8, 42, 9),
+            (0, 0, 42, 9)
+        );
+    }
+
+    #[test]
+    fn picker_status_line_never_exceeds_terminal_width() {
+        let line = picker_status_line(
+            "  123/456",
+            "  Enter: view",
+            Some("Loaded claude,codex"),
+            20,
+        );
+
+        assert_eq!(line.len(), 20);
+    }
+
+    #[test]
+    fn picker_header_rows_include_column_header() {
+        assert_eq!(PICKER_HEADER_ROWS, 4);
+    }
+
+    #[test]
+    fn picker_row_fixed_width_matches_column_widths() {
+        let hierarchy_width = 4;
+        let expected = 1
+            + PICKER_SOURCE_WIDTH
+            + 1
+            + PICKER_AGE_WIDTH
+            + 2
+            + hierarchy_width
+            + PICKER_DIRECTORY_WIDTH
+            + 2
+            + PICKER_MODEL_WIDTH
+            + 2;
+
+        assert_eq!(picker_row_fixed_width(hierarchy_width), expected);
+    }
+
+    #[test]
+    fn picker_hierarchy_gutter_width_tracks_visible_rows() {
         let conversations = vec![
             conversation("root", 0, true),
-            conversation("needle", 0, false),
+            conversation("child", 1, false),
+            conversation("nested", 2, false),
+            conversation("plain", 0, false),
         ];
-        let mut state = PickerState {
-            query: "needle".to_string(),
-            selected: 0,
-            scroll: 0,
-            filtered_indices: (0..conversations.len()).collect(),
-            searchable: precompute_search_text(&conversations),
-            full_search_index: None,
-            full_search_index_rx: None,
-            full_search_query_tx: None,
-            full_search_result_rx: None,
-            full_search_pending: false,
-            expanded_tree_roots: HashSet::new(),
-            flash: None,
-        };
+        let expanded = HashSet::from(["root".to_string()]);
 
-        refilter(&conversations, &mut state);
-
-        assert_eq!(state.filtered_indices, vec![1]);
-        assert!(state.full_search_index.is_none());
-        assert!(state.full_search_index_rx.is_none());
+        assert_eq!(
+            picker_hierarchy_gutter_width(&conversations, &[0], 0, 1, &HashSet::new(), true),
+            3
+        );
+        assert_eq!(
+            picker_hierarchy_gutter_width(&conversations, &[0, 1], 0, 2, &expanded, true),
+            3
+        );
+        assert_eq!(
+            picker_hierarchy_gutter_width(&conversations, &[2], 0, 1, &expanded, true),
+            4
+        );
+        assert_eq!(
+            picker_hierarchy_gutter_width(&conversations, &[3], 0, 1, &expanded, true),
+            3
+        );
     }
 
     #[test]
-    fn refilter_stays_lightweight_and_queues_full_search() {
-        let conversations = vec![conversation("row", 0, false)];
-        let (query_tx, query_rx) = mpsc::channel();
-        let mut state = PickerState {
-            query: "'hidden".to_string(),
-            selected: 0,
-            scroll: 0,
-            filtered_indices: (0..conversations.len()).collect(),
-            searchable: precompute_search_text(&conversations),
-            full_search_index: Some(FullSearchIndex::InMemory(vec![SearchableConversation {
-                text_lower: "hidden".to_string(),
-                index: 0,
-            }])),
-            full_search_index_rx: None,
-            full_search_query_tx: Some(query_tx),
-            full_search_result_rx: None,
-            full_search_pending: false,
-            expanded_tree_roots: HashSet::new(),
-            flash: None,
-        };
-
-        refilter(&conversations, &mut state);
-        request_full_search(&mut state);
-
-        assert!(state.filtered_indices.is_empty());
-        assert_eq!(query_rx.try_recv().unwrap(), "'hidden");
-    }
-
-    #[test]
-    fn full_search_result_applies_only_current_query() {
-        let conversations = vec![
-            conversation("stale", 0, false),
-            conversation("current", 0, false),
-        ];
-        let (result_tx, result_rx) = mpsc::channel();
-        result_tx
-            .send(FullSearchResult {
-                query: "old".to_string(),
-                indices: vec![0],
-            })
-            .unwrap();
-        result_tx
-            .send(FullSearchResult {
-                query: "'current".to_string(),
-                indices: vec![1],
-            })
-            .unwrap();
-
-        let mut state = PickerState {
-            query: "'current".to_string(),
-            selected: 0,
-            scroll: 0,
-            filtered_indices: Vec::new(),
-            searchable: precompute_search_text(&conversations),
-            full_search_index: None,
-            full_search_index_rx: None,
-            full_search_query_tx: None,
-            full_search_result_rx: Some(result_rx),
-            full_search_pending: true,
-            expanded_tree_roots: HashSet::new(),
-            flash: None,
-        };
-
-        poll_full_search_result(&conversations, &mut state);
-
-        assert_eq!(state.filtered_indices, vec![1]);
+    fn truncates_header_text_by_display_width() {
+        assert_eq!(truncate_to_display_width("ab界c", 3), "ab");
+        assert_eq!(truncate_to_display_width("ab界c", 4), "ab界");
     }
 
     #[test]
@@ -1081,11 +2549,11 @@ mod tests {
 
         assert_eq!(
             picker_hierarchy_marker(&root, &collapsed, true),
-            "▸─".to_string()
+            "▸".to_string()
         );
         assert_eq!(
             picker_hierarchy_marker(&root, &expanded, true),
-            "▾─".to_string()
+            "▾".to_string()
         );
         assert_eq!(
             picker_hierarchy_marker(&child, &collapsed, true),
@@ -1094,10 +2562,37 @@ mod tests {
     }
 
     #[test]
-    fn right_arrow_is_ignored_in_picker() {
-        let event = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    fn picker_column_focus_defaults_to_preview() {
+        let conversations = vec![conversation("session", 0, false)];
+        let state = PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
 
-        assert_eq!(picker_key_action(&event), PickerKeyAction::Ignore);
+        assert_eq!(state.focused_column, PickerColumn::Preview);
+    }
+
+    #[test]
+    fn picker_column_focus_moves_across_visible_columns() {
+        assert_eq!(PickerColumn::Preview.next(), PickerColumn::Agent);
+        assert_eq!(PickerColumn::Preview.previous(), PickerColumn::Model);
+        assert_eq!(PickerColumn::Directory.next(), PickerColumn::Model);
+        assert_eq!(PickerColumn::Directory.previous(), PickerColumn::Age);
+    }
+
+    #[test]
+    fn picker_keymap_supports_column_navigation() {
+        assert_eq!(
+            picker_key_action(&Event::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE
+            ))),
+            PickerKeyAction::PreviousColumn
+        );
+        assert_eq!(
+            picker_key_action(&Event::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::NONE
+            ))),
+            PickerKeyAction::NextColumn
+        );
     }
 
     #[test]
@@ -1887,7 +3382,7 @@ fn pager_loop(
                 let new_max = lines.len().saturating_sub(visible);
                 if let Some(line) = search.as_ref().and_then(ViewerSearch::current_line) {
                     scroll = scroll_to_match(line, visible, new_max);
-                } else if (was_at_bottom && lines.len() > old_len) || scroll > new_max {
+                } else if scroll > new_max || (was_at_bottom && lines.len() > old_len) {
                     scroll = new_max;
                 }
             }
@@ -1975,77 +3470,62 @@ fn draw_pager(
     let rows = rows as usize;
     let content_rows = rows.saturating_sub(1); // reserve last row for status
 
-    draw_frame(stdout, |stdout| {
-        for i in 0..content_rows {
-            clear_row(stdout, i)?;
-            let line_idx = scroll + i;
-            if line_idx >= lines.len() {
-                continue;
-            }
-
-            render_styled_line(
-                stdout,
-                &lines[line_idx],
-                pager_body_width(cols),
-                search,
-                line_idx,
-            )?;
-        }
-
-        // Status bar: session details on left, keys + progress on right
-        let progress = if lines.is_empty() {
-            100
-        } else {
-            ((scroll + content_rows).min(lines.len()) * 100) / lines.len()
-        };
-        let project = format_project_label(conv);
-        let model = format_model_short(conv.model.as_deref());
-        let age = format_relative_time(conv.timestamp);
-        let sid = short_id(&conv.session_id);
-        let left = format!(" {} ({}) {} {}", project, model, age, sid);
-        let search_status = if search_input_mode {
-            format!(" /{} ", search_query)
-        } else {
-            search
-                .map(|search| format!(" \u{2191}\u{2193}/nN:{} /:search ", search.status_label()))
-                .unwrap_or_else(|| " /:search ".to_string())
-        };
-        let right = format!(
-            "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
-            search_status, progress
-        );
-        let gap = cols.saturating_sub(left.len() + right.len());
-        let status = format!("{}{}{}", left, " ".repeat(gap), right);
-        clear_row(stdout, rows - 1)?;
-        execute!(
-            stdout,
-            SetAttribute(Attribute::Reverse),
-            Print(format!("{:<width$}", status, width = cols)),
-            SetAttribute(Attribute::NoReverse),
-        )?;
-
-        Ok(())
-    })
-}
-
-fn draw_frame(
-    stdout: &mut io::Stdout,
-    render: impl FnOnce(&mut io::Stdout) -> io::Result<()>,
-) -> io::Result<()> {
-    execute!(stdout, terminal::BeginSynchronizedUpdate)?;
-    let render_result = render(stdout);
-    let end_result = execute!(stdout, terminal::EndSynchronizedUpdate);
-    render_result?;
-    end_result?;
-    stdout.flush()
-}
-
-fn clear_row(stdout: &mut io::Stdout, row: usize) -> io::Result<()> {
     execute!(
         stdout,
-        cursor::MoveTo(0, row as u16),
-        terminal::Clear(ClearType::CurrentLine)
-    )
+        cursor::MoveTo(0, 0),
+        terminal::Clear(ClearType::All)
+    )?;
+
+    for i in 0..content_rows {
+        let line_idx = scroll + i;
+        if line_idx >= lines.len() {
+            break;
+        }
+
+        execute!(stdout, cursor::MoveTo(0, i as u16))?;
+        render_styled_line(
+            stdout,
+            &lines[line_idx],
+            pager_body_width(cols),
+            search,
+            line_idx,
+        )?;
+    }
+
+    // Status bar: session details on left, keys + progress on right
+    let progress = if lines.is_empty() {
+        100
+    } else {
+        ((scroll + content_rows).min(lines.len()) * 100) / lines.len()
+    };
+    let directory = format_directory_label(conv);
+    let model = format_model_short(conv.model.as_deref());
+    let age = format_relative_time(conv.timestamp);
+    let sid = short_id(&conv.session_id);
+    let left = format!(" {} ({}) {} {}", directory, model, age, sid);
+    let search_status = if search_input_mode {
+        format!(" /{} ", search_query)
+    } else {
+        search
+            .map(|search| format!(" \u{2191}\u{2193}/nN:{} /:search ", search.status_label()))
+            .unwrap_or_else(|| " /:search ".to_string())
+    };
+    let right = format!(
+        "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
+        search_status, progress
+    );
+    let gap = cols.saturating_sub(left.len() + right.len());
+    let status = format!("{}{}{}", left, " ".repeat(gap), right);
+    execute!(
+        stdout,
+        cursor::MoveTo(0, (rows - 1) as u16),
+        SetAttribute(Attribute::Reverse),
+        Print(format!("{:<width$}", status, width = cols)),
+        SetAttribute(Attribute::NoReverse),
+    )?;
+
+    stdout.flush()?;
+    Ok(())
 }
 
 fn render_styled_line<W: Write>(

@@ -281,7 +281,7 @@ pub fn process_claude_file_with_options(
         timestamp,
         preview,
         full_text,
-        project_name: None,
+        directory_name: None,
         cwd: extracted_cwd,
         message_count,
         model: extracted_model,
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn process_claude_file_filters_sdk_cli_private_tmp_attachment_session() {
-        let user = normal_user_line("/Users/igor/work/project");
+        let user = normal_user_line("/Users/igor/work/directory");
         let file = write_jsonl(&[
             r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-05-27T09:10:59.493Z","sessionId":"generated-session","content":"generated prompt"}"#,
             r#"{"type":"attachment","timestamp":"2026-05-27T09:10:59.191Z","entrypoint":"sdk-cli","cwd":"/private/tmp","sessionId":"generated-session","attachment":{"type":"hook_non_blocking_error"}}"#,
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn process_claude_file_filters_sdk_cli_private_tmp_unknown_entry_session() {
-        let user = normal_user_line("/Users/igor/work/project");
+        let user = normal_user_line("/Users/igor/work/directory");
         let file = write_jsonl(&[
             r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-05-27T09:10:59.493Z","entrypoint":"sdk-cli","cwd":"/private/tmp","sessionId":"generated-session","content":"generated prompt"}"#,
             &user,
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn process_claude_file_filters_sdk_cli_private_tmp_progress_session() {
-        let user = normal_user_line("/Users/igor/work/project");
+        let user = normal_user_line("/Users/igor/work/directory");
         let file = write_jsonl(&[
             r#"{"type":"progress","entrypoint":"sdk-cli","cwd":"/private/tmp","data":{"status":"running"},"timestamp":"2026-05-27T09:10:59.191Z"}"#,
             &user,
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn process_claude_file_filters_sdk_cli_private_tmp_system_session() {
-        let user = normal_user_line("/Users/igor/work/project");
+        let user = normal_user_line("/Users/igor/work/directory");
         let file = write_jsonl(&[
             r#"{"type":"system","subtype":"init","entrypoint":"sdk-cli","cwd":"/private/tmp","level":"info","timestamp":"2026-05-27T09:10:59.191Z"}"#,
             &user,
@@ -649,9 +649,9 @@ mod tests {
 
     #[test]
     fn process_claude_file_keeps_cli_private_session() {
-        let user = normal_user_line("/private/tmp/manual-project");
+        let user = normal_user_line("/private/tmp/manual-directory");
         let file = write_jsonl(&[
-            r#"{"type":"attachment","timestamp":"2026-05-27T09:10:59.191Z","entrypoint":"cli","cwd":"/private/tmp/manual-project","sessionId":"manual-session","attachment":{"type":"hook_success"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-05-27T09:10:59.191Z","entrypoint":"cli","cwd":"/private/tmp/manual-directory","sessionId":"manual-session","attachment":{"type":"hook_success"}}"#,
             &user,
             normal_assistant_line(),
         ]);
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn process_claude_file_keeps_cli_private_session_without_queue_operation() {
-        let user = normal_user_line("/private/tmp/manual-project");
+        let user = normal_user_line("/private/tmp/manual-directory");
         let file = write_jsonl(&[&user, normal_assistant_line()]);
 
         let parsed = process_claude_file(file.path().to_path_buf(), None).unwrap();
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn process_claude_file_keeps_queue_operation_non_temp_session() {
-        let user = normal_user_line("/Users/igor/work/project");
+        let user = normal_user_line("/Users/igor/work/directory");
         let file = write_jsonl(&[
             r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-05-27T09:10:59.493Z","sessionId":"generated-session","content":"generated prompt"}"#,
             &user,
@@ -687,9 +687,9 @@ mod tests {
 
     #[test]
     fn process_claude_file_keeps_sdk_cli_non_temp_session() {
-        let user = normal_user_line("/Users/igor/work/project");
+        let user = normal_user_line("/Users/igor/work/directory");
         let file = write_jsonl(&[
-            r#"{"type":"attachment","timestamp":"2026-05-27T09:10:59.191Z","entrypoint":"sdk-cli","cwd":"/Users/igor/work/project","sessionId":"sdk-project-session","attachment":{"type":"hook_success"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-05-27T09:10:59.191Z","entrypoint":"sdk-cli","cwd":"/Users/igor/work/directory","sessionId":"sdk-directory-session","attachment":{"type":"hook_success"}}"#,
             &user,
             normal_assistant_line(),
         ]);

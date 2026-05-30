@@ -16,7 +16,7 @@ pub enum CodexItem {
 }
 
 pub fn read_codex_lines<R: BufRead>(reader: R) -> Vec<String> {
-    reader.lines().map_while(Result::ok).collect()
+    reader.lines().map_while(std::result::Result::ok).collect()
 }
 
 pub fn codex_items(lines: &[String]) -> Vec<CodexItem> {

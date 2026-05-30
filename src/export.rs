@@ -20,12 +20,12 @@ pub fn to_markdown(conv: &Conversation) -> Result<String> {
         "# Session: {} ({})\n",
         conv.session_id, conv.source
     ));
-    let project = conv.project_name.as_deref().unwrap_or("unknown");
+    let directory = conv.directory_name.as_deref().unwrap_or("unknown");
     let model = format_model_short(conv.model.as_deref());
     let date = conv.timestamp.format("%Y-%m-%d %H:%M");
     md.push_str(&format!(
-        "**Project:** {} | **Model:** {} | **Date:** {}\n",
-        project, model, date
+        "**Directory:** {} | **Model:** {} | **Date:** {}\n",
+        directory, model, date
     ));
     md.push_str("\n---\n\n");
 
@@ -173,7 +173,7 @@ mod tests {
             timestamp: Local::now(),
             preview: String::new(),
             full_text: String::new(),
-            project_name: Some("project".to_string()),
+            directory_name: Some("directory".to_string()),
             cwd: None,
             message_count: 0,
             model: None,

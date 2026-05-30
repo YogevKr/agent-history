@@ -37,18 +37,18 @@ fn build_resume_command(conv: &Conversation) -> Command {
 
 fn resume_cwd(conv: &Conversation) -> Option<PathBuf> {
     match conv.source {
-        SessionSource::Claude => conv.cwd.clone().or_else(|| claude_project_path(conv)),
+        SessionSource::Claude => conv.cwd.clone().or_else(|| claude_directory_path(conv)),
         SessionSource::Codex => None,
     }
 }
 
-fn claude_project_path(conv: &Conversation) -> Option<PathBuf> {
+fn claude_directory_path(conv: &Conversation) -> Option<PathBuf> {
     if conv.source != SessionSource::Claude {
         return None;
     }
 
-    let encoded_project = conv.path.parent()?.file_name()?.to_str()?;
-    Some(decode_project_dir_name_to_path(encoded_project))
+    let encoded_directory = conv.path.parent()?.file_name()?.to_str()?;
+    Some(decode_project_dir_name_to_path(encoded_directory))
 }
 
 #[cfg(test)]
@@ -65,7 +65,7 @@ mod tests {
             timestamp: Local::now(),
             preview: String::new(),
             full_text: String::new(),
-            project_name: None,
+            directory_name: None,
             cwd,
             message_count: 0,
             model: None,
@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_resume_falls_back_to_project_directory() {
+    fn claude_resume_falls_back_to_directory() {
         let conv = conversation(
             SessionSource::Claude,
             PathBuf::from("/Users/yogev/.claude/projects/-Users-yogev-repos-app/session.jsonl"),

@@ -45,7 +45,7 @@ pub fn format_result(conv: &Conversation) -> String {
     };
     let age = format_relative_time(conv.timestamp);
     let hierarchy = format_hierarchy_marker(conv);
-    let project = format_project_label(conv);
+    let directory = format_directory_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
     let preview = truncate(&title, 60);
@@ -55,7 +55,7 @@ pub fn format_result(conv: &Conversation) -> String {
         source_tag,
         age,
         hierarchy,
-        project,
+        directory,
         model,
         sid,
         preview,
@@ -63,12 +63,12 @@ pub fn format_result(conv: &Conversation) -> String {
     )
 }
 
-pub fn format_project_label(conv: &Conversation) -> String {
+pub fn format_directory_label(conv: &Conversation) -> String {
     if let Some(subagent_name) = conv.subagent_name.as_deref() {
         return subagent_name.to_string();
     }
 
-    conv.project_name
+    conv.directory_name
         .as_deref()
         .unwrap_or("unknown")
         .to_string()
@@ -86,7 +86,7 @@ pub fn format_hierarchy_marker(conv: &Conversation) -> String {
             "└─"
         };
         let mut marker = String::new();
-        for _ in 0..conv.hierarchy_depth {
+        for _ in 1..conv.hierarchy_depth {
             marker.push_str("│ ");
         }
         marker.push_str(connector);
@@ -177,7 +177,7 @@ mod tests {
             timestamp,
             preview: "Review this".to_string(),
             full_text: String::new(),
-            project_name: Some("project".to_string()),
+            directory_name: Some("directory".to_string()),
             cwd: None,
             message_count: 1,
             model: Some("gpt-5.5".to_string()),
@@ -205,7 +205,7 @@ mod tests {
             timestamp,
             preview: "Review this".to_string(),
             full_text: String::new(),
-            project_name: Some("project".to_string()),
+            directory_name: Some("directory".to_string()),
             cwd: None,
             message_count: 1,
             model: Some("gpt-5.5".to_string()),
@@ -228,14 +228,14 @@ mod tests {
     fn format_result_labels_parent_rows_with_children() {
         let rendered = format_result(&parent_conversation());
 
-        assert!(rendered.contains("┬─        project"));
+        assert!(rendered.contains("┬─        directory"));
     }
 
     #[test]
     fn format_result_labels_subagent_rows() {
         let rendered = format_result(&conversation());
 
-        assert!(rendered.contains("│ └─      review"));
+        assert!(rendered.contains("└─        review"));
     }
 
     #[test]
