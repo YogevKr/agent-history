@@ -1,9 +1,17 @@
 use clap::Parser;
 
+use crate::search::SearchScope;
+
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum SourceFilter {
     Claude,
     Codex,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum SearchGroup {
+    Sessions,
+    Messages,
 }
 
 /// Unified search across Claude Code and Codex CLI session history
@@ -33,6 +41,18 @@ pub struct Cli {
     #[arg(long, default_value = "20")]
     pub limit: usize,
 
+    /// Group search output by sessions or individual messages
+    #[arg(long, value_enum, default_value = "sessions")]
+    pub group: SearchGroup,
+
+    /// Search scope for message grouped output
+    #[arg(long, value_enum, default_value = "visible")]
+    pub scope: SearchScope,
+
+    /// Neighboring messages to include around each message hit
+    #[arg(long, default_value = "0")]
+    pub context: usize,
+
     /// List all sessions (no search)
     #[arg(long)]
     pub list: bool,
@@ -45,9 +65,29 @@ pub struct Cli {
     #[arg(long)]
     pub resume: Option<String>,
 
+    /// Export a session as Markdown by full ID or unique prefix
+    #[arg(long)]
+    pub export: Option<String>,
+
+    /// Output directory for --export
+    #[arg(long)]
+    pub out: Option<String>,
+
     /// Only sessions from current directory
     #[arg(long)]
     pub local: bool,
+
+    /// Print source/cache status and exit
+    #[arg(long)]
+    pub status: bool,
+
+    /// Run health checks and exit
+    #[arg(long)]
+    pub doctor: bool,
+
+    /// Emit machine-readable JSON where supported
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Parse a duration string like "7d", "2w", "1m" into seconds

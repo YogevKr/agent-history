@@ -50,9 +50,87 @@ pub fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 
 /// Export markdown to a file. Returns the path written.
 pub fn export_to_file(conv: &Conversation, md: &str) -> std::io::Result<String> {
-    let filename = format!("{}.md", conv.session_id);
-    std::fs::write(&filename, md)?;
+    let filename = markdown_filename(conv);
+    write_private_file(Path::new(&filename), md.as_bytes())?;
     Ok(filename)
+}
+
+/// Export markdown to a directory. Returns the path written.
+pub fn export_to_dir(conv: &Conversation, md: &str, out_dir: &str) -> std::io::Result<String> {
+    let out_dir = Path::new(out_dir);
+    ensure_export_dir(out_dir)?;
+    let path = out_dir.join(markdown_filename(conv));
+    write_private_file(&path, md.as_bytes())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn ensure_export_dir(out_dir: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(out_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "export path exists and is not a directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(out_dir)?;
+            set_private_dir_permissions(out_dir)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    set_private_file_permissions(path)?;
+    file.write_all(data)
+}
+
+fn markdown_filename(conv: &Conversation) -> String {
+    let id = safe_filename_part(&conv.session_id, "session");
+    format!("{}-{}.md", conv.source, id)
+}
+
+fn safe_filename_part(value: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches(|ch| matches!(ch, '-' | '_' | '.'));
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        out.chars().take(120).collect()
+    }
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn render_claude_md(path: &Path, md: &mut String) -> Result<()> {
@@ -155,7 +233,7 @@ mod tests {
     use super::*;
     use chrono::Local;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
 
     fn make_jsonl(lines: &[&str]) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
@@ -218,5 +296,36 @@ mod tests {
         assert!(md.contains("Response only"));
         assert!(md.contains("Duplicated"));
         assert_eq!(md.matches("Duplicated").count(), 1);
+    }
+
+    #[test]
+    fn export_to_dir_uses_safe_filename() {
+        let file = make_jsonl(&[]);
+        let mut conv = codex_conversation(file.path());
+        conv.session_id = "../unsafe/session:id".to_string();
+        let out_dir = tempdir().unwrap();
+
+        let path = export_to_dir(&conv, "private", out_dir.path().to_str().unwrap()).unwrap();
+
+        assert!(path.ends_with("codex-unsafe-session-id.md"));
+        assert!(Path::new(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_to_dir_writes_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = make_jsonl(&[]);
+        let conv = codex_conversation(file.path());
+        let root = tempdir().unwrap();
+        let out_dir = root.path().join("exports");
+
+        let path = export_to_dir(&conv, "private", out_dir.to_str().unwrap()).unwrap();
+
+        let dir_mode = std::fs::metadata(&out_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 }
