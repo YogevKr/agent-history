@@ -311,6 +311,7 @@ fn collect_file_index(
             custom_title: None,
             git_branch,
             subagent_name: None,
+            hierarchy_root_id: None,
             hierarchy_has_children: false,
             hierarchy_has_next_sibling: false,
             hierarchy_marker: None,
@@ -637,6 +638,7 @@ fn annotate_hierarchy(
 
         if participates_in_thread_group {
             let root_session_id = root_session_id(session_id, &parent_by_session_id);
+            conversation.hierarchy_root_id = Some(root_session_id.clone());
             if let Some(timestamp) = thread_group_timestamps.get(&root_session_id) {
                 conversation.hierarchy_sort_timestamp = *timestamp;
             }
@@ -678,9 +680,18 @@ fn annotate_hierarchy(
             .iter()
             .any(|key| legacy_inputs.subagent_counts.get(key).copied().unwrap_or(0) > 0);
         let primary_key = metadata.task_key();
+        let legacy_root_id = keys.iter().find_map(|key| {
+            legacy_inputs
+                .root_session_by_key
+                .get(key)
+                .map(|(session_id, _)| session_id.clone())
+        });
         let has_legacy_parent = primary_key
             .as_ref()
             .is_some_and(|key| legacy_inputs.root_counts.get(key).copied().unwrap_or(0) > 0);
+        if has_legacy_subagents || (metadata.subagent_name.is_some() && has_legacy_parent) {
+            conversation.hierarchy_root_id = legacy_root_id;
+        }
 
         if let Some(timestamp) = legacy_group_timestamp {
             conversation.hierarchy_sort_timestamp = timestamp;
@@ -1180,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_legacy_subagent_with_later_parent_turn() {
+    fn keeps_legacy_hierarchy_metadata_while_sorting_latest_first() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         let root = tempdir().unwrap();
@@ -1235,9 +1246,17 @@ mod tests {
             .iter()
             .position(|session| session.session_id == "child-b")
             .unwrap();
-        assert!(parent_position < child_a_position);
+        assert!(child_b_position < parent_position);
         assert!(child_a_position < child_b_position);
         assert!(sessions[parent_position].hierarchy_has_children);
+        assert_eq!(
+            sessions[child_a_position].hierarchy_root_id.as_deref(),
+            Some("parent-session")
+        );
+        assert_eq!(
+            sessions[child_b_position].hierarchy_root_id.as_deref(),
+            Some("parent-session")
+        );
         assert_eq!(format_hierarchy_marker(&sessions[child_a_position]), "├─");
         assert_eq!(format_hierarchy_marker(&sessions[child_b_position]), "└─");
     }
@@ -1420,7 +1439,7 @@ mod tests {
     }
 
     #[test]
-    fn orders_exec_wrapper_before_matching_subagent() {
+    fn orders_exec_wrapper_and_matching_subagent_latest_first() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         let root = tempdir().unwrap();
@@ -1461,7 +1480,7 @@ mod tests {
             .iter()
             .position(|session| session.session_id == "child-session")
             .unwrap();
-        assert!(parent_position < child_position);
+        assert!(child_position < parent_position);
     }
 
     #[test]
@@ -1498,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_thread_spawn_subagents_after_parent_session() {
+    fn keeps_thread_spawn_hierarchy_metadata_while_sorting_latest_first() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         let root = tempdir().unwrap();
@@ -1539,10 +1558,15 @@ mod tests {
             .iter()
             .position(|session| session.session_id == "child-session")
             .unwrap();
-        assert!(parent_position < child_position);
+        assert!(child_position < parent_position);
 
         let parent = &sessions[parent_position];
         assert!(parent.hierarchy_has_children);
+        assert_eq!(parent.hierarchy_root_id.as_deref(), Some("parent-session"));
+        assert_eq!(
+            sessions[child_position].hierarchy_root_id.as_deref(),
+            Some("parent-session")
+        );
         assert_eq!(
             parent.hierarchy_sort_timestamp,
             sessions[child_position].hierarchy_sort_timestamp
@@ -1550,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn orders_thread_spawn_subtrees_by_latest_activity() {
+    fn orders_thread_spawn_rows_latest_first() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         let root = tempdir().unwrap();
@@ -1603,10 +1627,10 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "parent-session",
-                "active-child",
                 "grandchild",
-                "stale-child"
+                "active-child",
+                "stale-child",
+                "parent-session"
             ]
         );
     }
@@ -1671,10 +1695,10 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                ("parent-session", "┬─".to_string()),
                 ("child-a", "├─".to_string()),
                 ("child-b", "├─".to_string()),
                 ("child-c", "└─".to_string()),
+                ("parent-session", "┬─".to_string()),
             ]
         );
     }
@@ -1747,11 +1771,11 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                ("parent-session", "┬─".to_string()),
-                ("child-a", "├─".to_string()),
-                ("grandchild", "│ └─".to_string()),
                 ("great-grandchild", "│   └─".to_string()),
+                ("grandchild", "│ └─".to_string()),
+                ("child-a", "├─".to_string()),
                 ("child-b", "└─".to_string()),
+                ("parent-session", "┬─".to_string()),
             ]
         );
     }

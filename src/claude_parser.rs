@@ -291,6 +291,7 @@ pub fn process_claude_file_with_options(
         custom_title: extracted_custom_title,
         git_branch: extracted_git_branch,
         subagent_name: None,
+        hierarchy_root_id: None,
         hierarchy_has_children: false,
         hierarchy_has_next_sibling: false,
         hierarchy_marker: None,

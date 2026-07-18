@@ -790,8 +790,8 @@ fn delete_indexed_path(conn: &Connection, path: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Filter and score conversations based on query.
-/// Returns indices into the original conversations vec, sorted by score descending.
+/// Filter conversations based on query.
+/// Returns indices into the original conversations vec, newest first.
 pub fn search(
     conversations: &[Conversation],
     searchable: &[SearchableConversation],
@@ -830,11 +830,10 @@ pub fn search(
         })
         .collect();
 
-    // Sort by score descending, then by timestamp descending for stability
+    // Keep all result surfaces chronological; relevance only breaks timestamp ties.
     scored.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.2.cmp(&a.2))
+        b.2.cmp(&a.2)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
     });
 
     scored.into_iter().map(|(idx, _, _)| idx).collect()
@@ -1069,13 +1068,13 @@ fn search_sqlite_messages(
     }
 
     hits.sort_unstable_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        conversations[b.conversation_index]
+            .timestamp
+            .cmp(&conversations[a.conversation_index].timestamp)
             .then_with(|| {
-                conversations[b.conversation_index]
-                    .timestamp
-                    .cmp(&conversations[a.conversation_index].timestamp)
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| a.conversation_index.cmp(&b.conversation_index))
             .then_with(|| a.message_index.cmp(&b.message_index))
@@ -1172,9 +1171,8 @@ fn search_sqlite(
     }
 
     scored.sort_unstable_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.2.cmp(&a.2))
+        b.2.cmp(&a.2)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     });
 
     Ok(scored.into_iter().map(|(idx, _, _)| idx).collect())
@@ -1225,9 +1223,8 @@ fn search_sqlite_exact(
     }
 
     scored.sort_unstable_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.2.cmp(&a.2))
+        b.2.cmp(&a.2)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     });
 
     Ok(scored.into_iter().map(|(idx, _, _)| idx).collect())
@@ -1458,6 +1455,7 @@ mod tests {
             custom_title: None,
             git_branch: None,
             subagent_name: None,
+            hierarchy_root_id: None,
             hierarchy_has_children: false,
             hierarchy_has_next_sibling: false,
             hierarchy_marker: None,
@@ -1577,6 +1575,41 @@ mod tests {
 
         assert_eq!(results, vec![0]);
         assert!(index_path.exists());
+    }
+
+    #[test]
+    fn full_search_results_are_newest_first_even_when_older_match_ranks_higher() {
+        let now = Local::now();
+        let older_file = NamedTempFile::new().unwrap();
+        let newer_file = NamedTempFile::new().unwrap();
+        let mut older = conversation(
+            SessionSource::Codex,
+            older_file.path().to_path_buf(),
+            "needle needle needle needle needle",
+            "needle needle needle needle needle",
+        );
+        older.session_id = "older".to_string();
+        older.timestamp = now - Duration::days(2);
+        older.hierarchy_sort_timestamp = older.timestamp;
+        let mut newer = conversation(
+            SessionSource::Codex,
+            newer_file.path().to_path_buf(),
+            "needle",
+            "needle",
+        );
+        newer.session_id = "newer".to_string();
+        newer.timestamp = now - Duration::minutes(1);
+        newer.hierarchy_sort_timestamp = newer.timestamp;
+        let conversations = vec![older, newer];
+        let cache_dir = tempdir().unwrap();
+        let index_path = cache_dir.path().join("search-index.sqlite");
+
+        let index = precompute_full_search_index_with_db_path(&conversations, &index_path);
+
+        assert_eq!(
+            search_full(&conversations, &index, "needle", now),
+            vec![1, 0]
+        );
     }
 
     #[test]

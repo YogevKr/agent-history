@@ -261,6 +261,7 @@ mod tests {
             custom_title: None,
             git_branch: None,
             subagent_name: None,
+            hierarchy_root_id: None,
             hierarchy_has_children: false,
             hierarchy_has_next_sibling: false,
             hierarchy_marker: None,

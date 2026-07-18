@@ -227,6 +227,7 @@ pub fn process_codex_file(
         custom_title: None,
         git_branch,
         subagent_name: None,
+        hierarchy_root_id: None,
         hierarchy_has_children: false,
         hierarchy_has_next_sibling: false,
         hierarchy_marker: None,

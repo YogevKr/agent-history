@@ -37,6 +37,7 @@ pub struct Conversation {
     pub custom_title: Option<String>,
     pub git_branch: Option<String>,
     pub subagent_name: Option<String>,
+    pub hierarchy_root_id: Option<String>,
     pub hierarchy_has_children: bool,
     pub hierarchy_has_next_sibling: bool,
     pub hierarchy_marker: Option<String>,
@@ -46,9 +47,9 @@ pub struct Conversation {
 }
 
 pub fn compare_conversations(a: &Conversation, b: &Conversation) -> Ordering {
-    b.hierarchy_sort_timestamp
-        .cmp(&a.hierarchy_sort_timestamp)
+    b.timestamp
+        .cmp(&a.timestamp)
+        .then_with(|| b.hierarchy_sort_timestamp.cmp(&a.hierarchy_sort_timestamp))
         .then_with(|| a.hierarchy_order.cmp(&b.hierarchy_order))
-        .then_with(|| b.timestamp.cmp(&a.timestamp))
         .then_with(|| a.session_id.cmp(&b.session_id))
 }

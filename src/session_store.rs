@@ -127,6 +127,7 @@ mod tests {
             custom_title: None,
             git_branch: None,
             subagent_name: None,
+            hierarchy_root_id: None,
             hierarchy_has_children: false,
             hierarchy_has_next_sibling: false,
             hierarchy_marker: None,
@@ -152,6 +153,39 @@ mod tests {
         assert_eq!(store.conversations()[1].source, SessionSource::Codex);
         assert_eq!(store.conversations()[1].timestamp, duplicate_new.timestamp);
         assert_eq!(store.conversations().len(), 2);
+    }
+
+    #[test]
+    fn from_loaded_sorts_each_row_latest_first_even_with_hierarchy() {
+        let mut parent = conversation("parent", SessionSource::Codex, 60);
+        let mut child = conversation("child", SessionSource::Codex, 1);
+        let standalone = conversation("standalone", SessionSource::Claude, 5);
+
+        parent.hierarchy_root_id = Some(parent.session_id.clone());
+        parent.hierarchy_has_children = true;
+        parent.hierarchy_sort_timestamp = child.timestamp;
+        child.hierarchy_root_id = Some(parent.session_id.clone());
+        child.hierarchy_depth = 1;
+        child.hierarchy_order = 1;
+        child.hierarchy_sort_timestamp = child.timestamp;
+
+        let store = SessionStore::from_loaded(
+            vec![parent, standalone, child],
+            [SessionSource::Codex, SessionSource::Claude],
+        );
+
+        assert_eq!(
+            store
+                .conversations()
+                .iter()
+                .map(|conversation| conversation.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child", "standalone", "parent"]
+        );
+        assert!(store
+            .conversations()
+            .windows(2)
+            .all(|rows| rows[0].timestamp >= rows[1].timestamp));
     }
 
     #[test]

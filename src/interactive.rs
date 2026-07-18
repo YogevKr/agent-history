@@ -1086,24 +1086,15 @@ fn toggle_tree_expansion(conversations: &[Conversation], state: &mut PickerState
 
 fn tree_root_id(conversations: &[Conversation], index: usize) -> Option<String> {
     let conversation = conversations.get(index)?;
-    if conversation.hierarchy_depth == 0 {
-        return conversation
-            .hierarchy_has_children
-            .then(|| conversation.session_id.clone());
-    }
-
-    let mut cursor = index;
-    while cursor > 0 {
-        cursor -= 1;
-        let candidate = &conversations[cursor];
-        if candidate.hierarchy_depth == 0 {
-            return candidate
-                .hierarchy_has_children
-                .then(|| candidate.session_id.clone());
-        }
-    }
-
-    None
+    let root_id = conversation.hierarchy_root_id.as_ref()?;
+    conversations
+        .iter()
+        .any(|candidate| {
+            candidate.session_id == *root_id
+                && candidate.hierarchy_depth == 0
+                && candidate.hierarchy_has_children
+        })
+        .then(|| root_id.clone())
 }
 
 fn collapse_visible_indices(
@@ -1116,18 +1107,26 @@ fn collapse_visible_indices(
         return base_indices;
     }
 
+    let visible_roots: HashSet<&str> = base_indices
+        .iter()
+        .filter_map(|&index| {
+            let conversation = &conversations[index];
+            (conversation.hierarchy_depth == 0 && conversation.hierarchy_has_children)
+                .then_some(conversation.session_id.as_str())
+        })
+        .collect();
     let mut visible = Vec::with_capacity(base_indices.len());
-    let mut current_tree_expanded = false;
-    let mut current_tree_root = false;
 
     for index in base_indices {
         let conversation = &conversations[index];
-        if conversation.hierarchy_depth == 0 {
-            current_tree_root = conversation.hierarchy_has_children;
-            current_tree_expanded =
-                current_tree_root && expanded_tree_roots.contains(&conversation.session_id);
-            visible.push(index);
-        } else if current_tree_expanded || !current_tree_root {
+        let hidden_by_collapsed_root = conversation.hierarchy_depth > 0
+            && conversation
+                .hierarchy_root_id
+                .as_deref()
+                .is_some_and(|root_id| {
+                    visible_roots.contains(root_id) && !expanded_tree_roots.contains(root_id)
+                });
+        if !hidden_by_collapsed_root {
             visible.push(index);
         }
     }
@@ -2056,6 +2055,7 @@ mod tests {
             custom_title: None,
             git_branch: None,
             subagent_name: (depth > 0).then(|| session_id.to_string()),
+            hierarchy_root_id: (has_children || depth > 0).then(|| "root".to_string()),
             hierarchy_has_children: has_children,
             hierarchy_has_next_sibling: false,
             hierarchy_marker: None,
@@ -2095,6 +2095,63 @@ mod tests {
         let visible = collapse_visible_indices(&conversations, base_indices, &expanded, true);
 
         assert_eq!(visible, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn collapse_tracks_tree_identity_after_chronological_sort() {
+        let conversations = vec![
+            conversation("child", 1, false),
+            conversation("plain", 0, false),
+            conversation("root", 0, true),
+        ];
+        let base_indices = vec![0, 1, 2];
+
+        let collapsed =
+            collapse_visible_indices(&conversations, base_indices.clone(), &HashSet::new(), true);
+        let expanded = collapse_visible_indices(
+            &conversations,
+            base_indices,
+            &HashSet::from(["root".to_string()]),
+            true,
+        );
+
+        assert_eq!(tree_root_id(&conversations, 0).as_deref(), Some("root"));
+        assert_eq!(collapsed, vec![1, 2]);
+        assert_eq!(expanded, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn collapse_keeps_child_visible_when_its_root_is_filtered_out() {
+        let conversations = vec![
+            conversation("child", 1, false),
+            conversation("root", 0, true),
+        ];
+
+        let visible = collapse_visible_indices(&conversations, vec![0], &HashSet::new(), true);
+
+        assert_eq!(visible, vec![0]);
+    }
+
+    #[test]
+    fn collapse_does_not_mix_interleaved_trees() {
+        let mut child_a = conversation("child-a", 1, false);
+        child_a.hierarchy_root_id = Some("root-a".to_string());
+        let mut child_b = conversation("child-b", 1, false);
+        child_b.hierarchy_root_id = Some("root-b".to_string());
+        let mut root_a = conversation("root-a", 0, true);
+        root_a.hierarchy_root_id = Some("root-a".to_string());
+        let mut root_b = conversation("root-b", 0, true);
+        root_b.hierarchy_root_id = Some("root-b".to_string());
+        let conversations = vec![child_a, child_b, root_a, root_b];
+
+        let visible = collapse_visible_indices(
+            &conversations,
+            vec![0, 1, 2, 3],
+            &HashSet::from(["root-a".to_string()]),
+            true,
+        );
+
+        assert_eq!(visible, vec![0, 2, 3]);
     }
 
     #[test]
