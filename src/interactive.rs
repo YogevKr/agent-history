@@ -40,6 +40,7 @@ const PICKER_DIRECTORY_WIDTH: usize = 20;
 const PICKER_MODEL_WIDTH: usize = 22;
 const PICKER_MIN_HIERARCHY_GUTTER_WIDTH: usize = 3;
 const PICKER_MIN_PREVIEW_WIDTH: usize = 10;
+const PICKER_PREVIEW_CONTEXT_LOOKAHEAD_BYTES: usize = 1_024;
 const FILTER_OVERLAY_MIN_NAV_WIDTH: usize = 12;
 const FILTER_OVERLAY_MAX_NAV_WIDTH: usize = 20;
 
@@ -2094,11 +2095,43 @@ fn draw_session_line(
 }
 
 fn picker_preview(title: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    // Session titles can contain an entire first message. A bounded contextual
+    // lookahead keeps picker rendering predictable while leaving ample room for
+    // zero-width marks and ligatures around the visible prefix.
+    let scan_bytes = picker_preview_scan_bytes(max_width);
+    let title = bounded_grapheme_prefix(title, scan_bytes);
     let sanitized: String = title
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect();
     truncate_to_display_width(&sanitized, max_width)
+}
+
+fn picker_preview_scan_bytes(max_width: usize) -> usize {
+    max_width
+        .saturating_mul(4)
+        .saturating_add(PICKER_PREVIEW_CONTEXT_LOOKAHEAD_BYTES)
+}
+
+fn bounded_grapheme_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut cutoff = max_bytes;
+    while cutoff > 0 && !text.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    let candidate = &text[..cutoff];
+    // Drop the last display unit because it may continue beyond the byte cap.
+    // Display units are grapheme-safe and also keep contextual ligatures whole.
+    let safe_end = contextual_display_units(candidate)
+        .last()
+        .map_or(0, |unit| unit.start);
+    &candidate[..safe_end]
 }
 
 fn picker_display_timestamp(
@@ -2803,6 +2836,81 @@ mod tests {
 
         assert_eq!(display_width_prefix("❤️x", 1), ("", 0));
         assert_eq!(display_width_prefix("🇮🇱x", 1), ("", 0));
+
+        let biconsonant = "\u{2D4F}\u{2D7F}\u{2D3E}";
+        let contextual = format!("x{biconsonant}y");
+        let expected = format!("x{biconsonant}");
+        assert_eq!(display_width_prefix(&contextual, 2), (expected.as_str(), 2));
+    }
+
+    #[test]
+    fn display_width_prefix_scans_large_ascii_linearly() {
+        let text = "x".repeat(50_000);
+        let mut scanned_bytes = 0;
+
+        let (prefix, width) = display_width_prefix_with_width(&text, 80, |slice| {
+            scanned_bytes += slice.len();
+            UnicodeWidthStr::width(slice)
+        });
+
+        assert_eq!(prefix, &text[..80]);
+        assert_eq!(width, 80);
+        assert!(
+            scanned_bytes <= text.len() * 3,
+            "scanned {scanned_bytes} bytes"
+        );
+
+        let mut width_called = false;
+        assert_eq!(
+            display_width_prefix_with_width(&text, 0, |_| {
+                width_called = true;
+                1
+            }),
+            ("", 0)
+        );
+        assert!(!width_called);
+    }
+
+    #[test]
+    fn display_width_prefix_matches_contextual_reference() {
+        fn reference(text: &str, max_width: usize) -> (&str, usize) {
+            if max_width == 0 {
+                return ("", 0);
+            }
+            let mut used = 0;
+            let mut end = 0;
+            for (start, grapheme) in text.grapheme_indices(true) {
+                let next_end = start + grapheme.len();
+                let next_width = UnicodeWidthStr::width(&text[..next_end]);
+                if next_width <= max_width {
+                    used = next_width;
+                    end = next_end;
+                }
+            }
+            (&text[..end], used)
+        }
+
+        let corpus = [
+            "xلاy",
+            "xא\u{200D}לy",
+            "x\u{2D4F}\u{2D7F}\u{2D3E}y",
+            "x👨‍👩‍👧‍👦y",
+            "x🇮🇱y",
+            "x❤️y",
+            "xa\u{301}y",
+            "x\u{17D2}\u{1780}y",
+        ];
+
+        for text in corpus {
+            let full_width = UnicodeWidthStr::width(text);
+            for max_width in 0..=full_width + 2 {
+                assert_eq!(
+                    display_width_prefix(text, max_width),
+                    reference(text, max_width),
+                    "text={text:?}, max_width={max_width}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2899,6 +3007,28 @@ mod tests {
         assert_eq!(preview, "    123456");
         assert_eq!(UnicodeWidthStr::width(preview.as_str()), 10);
         assert!(!preview.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn picker_preview_bounds_huge_titles_at_a_grapheme_boundary() {
+        let max_width = 10;
+        let scan_bytes = picker_preview_scan_bytes(max_width);
+        let title = format!(
+            "{}a\u{301}{}",
+            "x".repeat(scan_bytes - 1),
+            "z".repeat(100_000)
+        );
+        let bounded = bounded_grapheme_prefix(&title, scan_bytes);
+
+        assert_eq!(bounded.len(), scan_bytes - 1);
+        assert_eq!(
+            picker_preview(&format!("\r\n{title}"), max_width),
+            "  xxxxxxxx"
+        );
+
+        let huge_grapheme = format!("a{}z", "\u{301}".repeat(100_000));
+        assert!(bounded_grapheme_prefix(&huge_grapheme, scan_bytes).is_empty());
+        assert!(picker_preview(&huge_grapheme, max_width).is_empty());
     }
 
     #[test]
@@ -3718,6 +3848,48 @@ struct StyledGrapheme {
     width: usize,
 }
 
+#[derive(Clone, Copy)]
+struct DisplayUnit {
+    start: usize,
+    end: usize,
+    width: usize,
+}
+
+fn contextual_display_units(text: &str) -> Vec<DisplayUnit> {
+    contextual_display_units_with_width(text, UnicodeWidthStr::width)
+}
+
+fn contextual_display_units_with_width<F>(text: &str, mut width_of: F) -> Vec<DisplayUnit>
+where
+    F: FnMut(&str) -> usize,
+{
+    let mut units: Vec<DisplayUnit> = Vec::new();
+    for (start, grapheme) in text.grapheme_indices(true) {
+        units.push(DisplayUnit {
+            start,
+            end: start + grapheme.len(),
+            width: width_of(grapheme),
+        });
+        while units.len() >= 2 {
+            let right = units[units.len() - 1];
+            let left = units[units.len() - 2];
+            debug_assert_eq!(left.end, right.start);
+            let combined_width = width_of(&text[left.start..right.end]);
+            if left.width + right.width == combined_width {
+                break;
+            }
+
+            units.pop();
+            let left = units.last_mut().expect("left display unit");
+            left.end = right.end;
+            left.width = combined_width;
+            // Re-check the merged unit against its predecessor so contextual
+            // chains become one indivisible, additive display unit.
+        }
+    }
+    units
+}
+
 impl StyledGrapheme {
     fn is_whitespace(&self, text: &str) -> bool {
         text[self.start..self.end].chars().all(char::is_whitespace)
@@ -3791,51 +3963,23 @@ fn styled_line_graphemes(line: &StyledLine) -> (String, Vec<StyledGrapheme>) {
     }
 
     let mut style_idx = 0;
-    let graphemes = text
-        .grapheme_indices(true)
-        .map(|(start, grapheme)| {
-            while style_idx + 1 < styles.len() && styles[style_idx + 1].0 <= start {
+    let graphemes = contextual_display_units(&text)
+        .into_iter()
+        .map(|unit| {
+            while style_idx + 1 < styles.len() && styles[style_idx + 1].0 <= unit.start {
                 style_idx += 1;
             }
             StyledGrapheme {
-                start,
-                end: start + grapheme.len(),
-                // A terminal grapheme is indivisible. If its scalars crossed an
-                // input span boundary, preserve the first scalar's style.
+                start: unit.start,
+                end: unit.end,
+                // A terminal display unit is indivisible. If it crossed an input
+                // span boundary, preserve the first scalar's style.
                 style: styles[style_idx].1,
-                width: UnicodeWidthStr::width(grapheme),
+                width: unit.width,
             }
         })
         .collect();
-    let graphemes = normalize_contextual_display_units(&text, graphemes);
     (text, graphemes)
-}
-
-fn normalize_contextual_display_units(
-    text: &str,
-    graphemes: Vec<StyledGrapheme>,
-) -> Vec<StyledGrapheme> {
-    let mut units: Vec<StyledGrapheme> = Vec::with_capacity(graphemes.len());
-    for grapheme in graphemes {
-        units.push(grapheme);
-        while units.len() >= 2 {
-            let right = units[units.len() - 1];
-            let left = units[units.len() - 2];
-            debug_assert_eq!(left.end, right.start);
-            let combined_width = UnicodeWidthStr::width(&text[left.start..right.end]);
-            if left.width + right.width == combined_width {
-                break;
-            }
-
-            units.pop();
-            let left = units.last_mut().expect("left display unit");
-            left.end = right.end;
-            left.width = combined_width;
-            // Preserve the first scalar's style, then re-check the merged unit
-            // against its predecessor so contextual chains coalesce.
-        }
-    }
-    units
 }
 
 fn trim_leading_whitespace(text: &str, graphemes: &mut Vec<StyledGrapheme>) {
@@ -4306,16 +4450,26 @@ fn print_highlight_segment<W: Write>(stdout: &mut W, text: &str, active: bool) -
 }
 
 fn display_width_prefix(text: &str, max_width: usize) -> (&str, usize) {
+    display_width_prefix_with_width(text, max_width, UnicodeWidthStr::width)
+}
+
+fn display_width_prefix_with_width<F>(text: &str, max_width: usize, width_of: F) -> (&str, usize)
+where
+    F: FnMut(&str) -> usize,
+{
+    if max_width == 0 {
+        return ("", 0);
+    }
     let mut used = 0;
     let mut end = 0;
 
-    for (idx, grapheme) in text.grapheme_indices(true) {
-        let next_end = idx + grapheme.len();
-        let next_width = UnicodeWidthStr::width(&text[..next_end]);
-        if next_width <= max_width {
-            used = next_width;
-            end = next_end;
+    for unit in contextual_display_units_with_width(text, width_of) {
+        let next_width = used + unit.width;
+        if next_width > max_width {
+            break;
         }
+        used = next_width;
+        end = unit.end;
     }
 
     (&text[..end], used)
