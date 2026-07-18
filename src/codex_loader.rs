@@ -97,7 +97,7 @@ fn collect_file_index(
         .and_then(|metadata| metadata.modified())
         .ok();
     let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut task_turn_id: Option<String> = None;
     let mut task_turn_ids: Vec<String> = Vec::new();
@@ -115,15 +115,21 @@ fn collect_file_index(
     let mut total_tokens: u64 = 0;
     let mut latest_activity_timestamp: Option<DateTime<Local>> = None;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => continue,
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(bytes_read) => bytes_read,
+            Err(_) => break,
         };
+        if bytes_read == 0 {
+            break;
+        }
+        let record_delimited = line.ends_with('\n');
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(timestamp) = codex_activity_timestamp(&line) {
+        if let Some(timestamp) = codex_activity_timestamp(&line, record_delimited) {
             record_latest_activity_timestamp(&mut latest_activity_timestamp, timestamp);
         }
         if !should_parse_codex_index_line(&line) {
@@ -342,7 +348,7 @@ fn should_parse_codex_index_line(line: &str) -> bool {
     line_has_json_type(header, "response_item") && line_has_json_type(header, "message")
 }
 
-fn codex_activity_timestamp(line: &str) -> Option<&str> {
+fn codex_activity_timestamp(line: &str, record_delimited: bool) -> Option<&str> {
     let line = line.trim();
     // Codex writes the envelope before the potentially very large payload.
     // Inspect only that prefix so tool outputs advance activity without making
@@ -354,7 +360,10 @@ fn codex_activity_timestamp(line: &str) -> Option<&str> {
         return None;
     }
     let timestamp = json_string_field(envelope, r#""timestamp""#)?;
-    has_complete_json_structure(line).then_some(timestamp)
+    // A newline is the JSONL record boundary written by Codex. Only the final
+    // unterminated record needs an O(payload) structural check, so large tool
+    // payloads on normal records stay on the prefix-only path.
+    (record_delimited || has_complete_json_structure(line)).then_some(timestamp)
 }
 
 fn has_complete_json_structure(json: &str) -> bool {
@@ -1544,15 +1553,44 @@ mod tests {
     }
 
     #[test]
-    fn activity_timestamp_requires_complete_json_structure() {
+    fn activity_timestamp_only_validates_an_undelimited_final_record() {
         let valid = r#"{"timestamp":"2026-05-20T22:45:33Z","type":"response_item","payload":{"type":"function_call_output","output":"escaped \" brace }"}}"#;
         assert_eq!(
-            codex_activity_timestamp(valid),
+            codex_activity_timestamp(valid, true),
+            Some("2026-05-20T22:45:33Z")
+        );
+        assert_eq!(
+            codex_activity_timestamp(valid, false),
             Some("2026-05-20T22:45:33Z")
         );
 
         let truncated = r#"{"timestamp":"2026-05-24T12:00:00Z","type":"response_item","payload":{"type":"function_call_output","output":"truncated }"#;
-        assert_eq!(codex_activity_timestamp(truncated), None);
+        assert_eq!(codex_activity_timestamp(truncated, false), None);
+    }
+
+    #[test]
+    fn truncated_undelimited_final_response_does_not_advance_index_activity() {
+        let root = tempdir().unwrap();
+        let name = "rollout-truncated-final.jsonl";
+        write_session(
+            root.path(),
+            name,
+            &[
+                r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"truncated-final-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"Run the tool"}}"#,
+                r#"{"timestamp":"2026-05-23T12:00:00Z","type":"response_item","payload":{"type":"function_call_output","output":"complete"}}"#,
+                r#"{"timestamp":"2026-05-24T12:00:00Z","type":"response_item","payload":{"type":"function_call_output","output":"truncated }"#,
+            ],
+        );
+        let path = root.path().join("sessions/2026/05/20").join(name);
+
+        let (_, _, conversation) = collect_file_index(&path).unwrap();
+        let conversation = conversation.unwrap();
+        let expected = DateTime::parse_from_rfc3339("2026-05-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Local);
+
+        assert_eq!(conversation.timestamp, expected);
     }
 
     #[test]

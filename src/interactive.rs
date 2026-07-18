@@ -2744,19 +2744,38 @@ mod tests {
 
     #[test]
     fn pager_status_line_avoids_bottom_right_cell() {
-        let left = " /Users/yogev/פרויקט (gpt-5.5) 2m abc12345";
-        let right =
-            "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh /:search q:back  100% ";
+        let identity = " abc12345 ";
+        let details = "/Users/yogev/פרויקט (gpt-5.5) 2m ";
+        let activity = " /:search 100% ";
+        let help = "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh q:back ";
 
         for cols in [40, 80, 120] {
-            let line = pager_status_line(left, right, cols);
+            let line = pager_status_line(identity, details, activity, help, cols);
             assert_eq!(UnicodeWidthStr::width(line.as_str()), cols - 1);
+            assert!(line.contains("abc12345"));
+            assert!(line.contains("/:search"));
         }
-        assert!(pager_status_line(left, right, 1).is_empty());
+        assert!(pager_status_line(identity, details, activity, help, 1).is_empty());
 
-        let emoji_line = pager_status_line("", "❤️x", 3);
+        let emoji_line = pager_status_line("", "", "❤️x", "", 3);
         assert_eq!(emoji_line, "❤️");
         assert_eq!(UnicodeWidthStr::width(emoji_line.as_str()), 2);
+    }
+
+    #[test]
+    fn pager_status_line_prioritizes_identity_and_active_search_when_narrow() {
+        let line = pager_status_line(
+            " abc12345 ",
+            "/a/very/long/session/directory (gpt-5.5) 2m ",
+            " /needle match 1/2 42% ",
+            "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh q:back ",
+            40,
+        );
+
+        assert_eq!(UnicodeWidthStr::width(line.as_str()), 39);
+        assert!(line.contains("abc12345"));
+        assert!(line.contains("/needle"));
+        assert!(line.contains("42%"));
     }
 
     #[test]
@@ -3190,6 +3209,24 @@ mod tests {
 
         assert_eq!(wrapped_text, vec!["لا"]);
         assert_eq!(UnicodeWidthStr::width(wrapped_text[0]), 1);
+    }
+
+    #[test]
+    fn pager_soft_wrap_waits_for_non_monotonic_tifinagh_width() {
+        let biconsonant = "\u{2D4F}\u{2D7F}\u{2D3E}";
+        let text = format!("x{biconsonant}");
+        assert_eq!(
+            UnicodeWidthStr::width(&text[.."x\u{2D4F}\u{2D7F}".len()]),
+            3
+        );
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 2);
+        let raw_lines = vec![vec![test_span(&text)]];
+
+        let wrapped = wrap_styled_lines(&raw_lines, 2);
+        let wrapped_text: Vec<&str> = wrapped.iter().map(|line| line.text.as_str()).collect();
+
+        assert_eq!(wrapped_text, vec![text]);
+        assert_eq!(wrapped[0].width, 2);
     }
 
     #[test]
@@ -3678,6 +3715,7 @@ struct StyledGrapheme {
     start: usize,
     end: usize,
     style: SpanStyle,
+    width: usize,
 }
 
 impl StyledGrapheme {
@@ -3697,11 +3735,11 @@ fn wrap_styled_lines(lines: &[StyledLine], max_width: usize) -> Vec<PagerLine> {
     for line in lines {
         let (text, graphemes) = styled_line_graphemes(line);
         let mut current = Vec::new();
+        let mut current_width = 0;
         let mut last_break = None;
 
         for grapheme in graphemes {
-            let mut candidate_width =
-                styled_graphemes_with_candidate_width(&text, &current, grapheme);
+            let mut candidate_width = current_width + grapheme.width;
             while !current.is_empty() && candidate_width > max_width {
                 if let Some(break_idx) = last_break.filter(|idx| *idx > 0) {
                     wrapped.push(styled_graphemes_to_line(&text, &current[..break_idx]));
@@ -3711,14 +3749,16 @@ fn wrap_styled_lines(lines: &[StyledLine], max_width: usize) -> Vec<PagerLine> {
                     wrapped.push(styled_graphemes_to_line(&text, &current));
                     current.clear();
                 }
+                current_width = current.iter().map(|unit| unit.width).sum();
                 last_break = current.iter().rposition(|unit| unit.is_whitespace(&text));
-                candidate_width = styled_graphemes_with_candidate_width(&text, &current, grapheme);
+                candidate_width = current_width + grapheme.width;
             }
 
             if current.is_empty() && grapheme.is_whitespace(&text) {
                 continue;
             }
             current.push(grapheme);
+            current_width = candidate_width;
             if current.last().is_some_and(|unit| unit.is_whitespace(&text)) {
                 last_break = Some(current.len() - 1);
             }
@@ -3763,10 +3803,39 @@ fn styled_line_graphemes(line: &StyledLine) -> (String, Vec<StyledGrapheme>) {
                 // A terminal grapheme is indivisible. If its scalars crossed an
                 // input span boundary, preserve the first scalar's style.
                 style: styles[style_idx].1,
+                width: UnicodeWidthStr::width(grapheme),
             }
         })
         .collect();
+    let graphemes = normalize_contextual_display_units(&text, graphemes);
     (text, graphemes)
+}
+
+fn normalize_contextual_display_units(
+    text: &str,
+    graphemes: Vec<StyledGrapheme>,
+) -> Vec<StyledGrapheme> {
+    let mut units: Vec<StyledGrapheme> = Vec::with_capacity(graphemes.len());
+    for grapheme in graphemes {
+        units.push(grapheme);
+        while units.len() >= 2 {
+            let right = units[units.len() - 1];
+            let left = units[units.len() - 2];
+            debug_assert_eq!(left.end, right.start);
+            let combined_width = UnicodeWidthStr::width(&text[left.start..right.end]);
+            if left.width + right.width == combined_width {
+                break;
+            }
+
+            units.pop();
+            let left = units.last_mut().expect("left display unit");
+            left.end = right.end;
+            left.width = combined_width;
+            // Preserve the first scalar's style, then re-check the merged unit
+            // against its predecessor so contextual chains coalesce.
+        }
+    }
+    units
 }
 
 fn trim_leading_whitespace(text: &str, graphemes: &mut Vec<StyledGrapheme>) {
@@ -3777,20 +3846,6 @@ fn trim_leading_whitespace(text: &str, graphemes: &mut Vec<StyledGrapheme>) {
     if first_non_whitespace > 0 {
         graphemes.drain(..first_non_whitespace);
     }
-}
-
-fn styled_graphemes_with_candidate_width(
-    text: &str,
-    graphemes: &[StyledGrapheme],
-    candidate: StyledGrapheme,
-) -> usize {
-    let start = graphemes
-        .first()
-        .map_or(candidate.start, |first| first.start);
-    if let Some(last) = graphemes.last() {
-        debug_assert_eq!(last.end, candidate.start);
-    }
-    UnicodeWidthStr::width(&text[start..candidate.end])
 }
 
 fn styled_graphemes_to_line(text: &str, graphemes: &[StyledGrapheme]) -> PagerLine {
@@ -4063,19 +4118,22 @@ fn draw_pager_frame(
     let model = format_model_short(conv.model.as_deref());
     let age = format_relative_time(conv.timestamp);
     let sid = short_id(&conv.session_id);
-    let left = format!(" {} ({}) {} {}", directory, model, age, sid);
-    let search_status = if search_input_mode {
-        format!(" /{} ", search_query)
+    let identity = format!(" {sid} ");
+    let details = format!("{directory} ({model}) {age} ");
+    let activity = if search_input_mode {
+        format!(" /{search_query} {progress}% ")
     } else {
         search
-            .map(|search| format!(" \u{2191}\u{2193}/nN:{} /:search ", search.status_label()))
-            .unwrap_or_else(|| " /:search ".to_string())
+            .map(|search| {
+                format!(
+                    " \u{2191}\u{2193}/nN:{} /:search {progress}% ",
+                    search.status_label()
+                )
+            })
+            .unwrap_or_else(|| format!(" /:search {progress}% "))
     };
-    let right = format!(
-        "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
-        search_status, progress
-    );
-    let status = pager_status_line(&left, &right, cols);
+    let help = "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh q:back ";
+    let status = pager_status_line(&identity, &details, &activity, help, cols);
     clear_row(stdout, rows - 1)?;
     queue!(
         stdout,
@@ -4087,7 +4145,13 @@ fn draw_pager_frame(
     Ok(())
 }
 
-fn pager_status_line(left: &str, right: &str, cols: usize) -> String {
+fn pager_status_line(
+    identity: &str,
+    details: &str,
+    activity: &str,
+    help: &str,
+    cols: usize,
+) -> String {
     // Leave the final terminal column untouched. Writing to the bottom-right
     // cell can trigger an automatic wrap and scroll the alternate screen.
     let max_width = cols.saturating_sub(1);
@@ -4095,13 +4159,22 @@ fn pager_status_line(left: &str, right: &str, cols: usize) -> String {
         return String::new();
     }
 
-    let right = truncate_to_display_width(right, max_width);
-    let right_width = UnicodeWidthStr::width(right.as_str());
-    let left = truncate_to_display_width(left, max_width.saturating_sub(right_width));
-    let left_width = UnicodeWidthStr::width(left.as_str());
-    let gap = max_width.saturating_sub(left_width + right_width);
+    // Identity and live search/progress are the useful state. Fit those first;
+    // directory/model details and the key legend consume only leftover space.
+    let identity = truncate_to_display_width(identity, max_width);
+    let identity_width = UnicodeWidthStr::width(identity.as_str());
+    let activity = truncate_to_display_width(activity, max_width.saturating_sub(identity_width));
+    let activity_width = UnicodeWidthStr::width(activity.as_str());
+    let optional_width = max_width.saturating_sub(identity_width + activity_width);
+    let details_width = optional_width.div_ceil(2);
+    let details = truncate_to_display_width(details, details_width);
+    let details_width = UnicodeWidthStr::width(details.as_str());
+    let help = truncate_to_display_width(help, optional_width.saturating_sub(details_width));
+    let help_width = UnicodeWidthStr::width(help.as_str());
+    let gap =
+        max_width.saturating_sub(identity_width + details_width + activity_width + help_width);
 
-    format!("{}{}{}", left, " ".repeat(gap), right)
+    format!("{identity}{details}{}{activity}{help}", " ".repeat(gap))
 }
 
 fn render_styled_line<W: Write>(
