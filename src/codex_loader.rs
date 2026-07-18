@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Local};
 use rayon::prelude::*;
 
 use crate::codex::{CodexLine, EventMsg, ResponseItem, SessionMeta, TurnContext};
@@ -113,8 +113,7 @@ fn collect_file_index(
     let mut preview = String::new();
     let mut message_count: usize = 0;
     let mut total_tokens: u64 = 0;
-    let mut first_timestamp: Option<String> = None;
-    let mut session_timestamp: Option<String> = None;
+    let mut latest_activity_timestamp: Option<DateTime<Local>> = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -123,6 +122,9 @@ fn collect_file_index(
         };
         if line.trim().is_empty() {
             continue;
+        }
+        if let Some(timestamp) = codex_activity_timestamp(&line) {
+            record_latest_activity_timestamp(&mut latest_activity_timestamp, timestamp);
         }
         if !should_parse_codex_index_line(&line) {
             continue;
@@ -133,17 +135,12 @@ fn collect_file_index(
             Err(_) => continue,
         };
 
-        if first_timestamp.is_none() {
-            first_timestamp = Some(codex_line.timestamp.clone());
-        }
-
         match codex_line.line_type.as_str() {
             "session_meta" => {
                 if let Ok(meta) = serde_json::from_value::<SessionMeta>(codex_line.payload) {
                     if session_id.is_none() {
                         session_id = Some(meta.id);
                     }
-                    session_timestamp = Some(codex_line.timestamp);
                     if cwd.is_none() {
                         cwd = meta.cwd.clone();
                     }
@@ -192,6 +189,10 @@ fn collect_file_index(
             }
             "event_msg" => {
                 if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
+                    record_latest_activity_timestamp(
+                        &mut latest_activity_timestamp,
+                        &codex_line.timestamp,
+                    );
                     if evt.event_type == "task_started" {
                         if let Some(turn_id) = evt.turn_id.as_ref() {
                             if task_turn_id.is_none() {
@@ -235,6 +236,10 @@ fn collect_file_index(
             "response_item" => {
                 if let Ok(item) = serde_json::from_value::<ResponseItem>(codex_line.payload) {
                     if let Some((is_user, text)) = response_item_message_text(&item) {
+                        record_latest_activity_timestamp(
+                            &mut latest_activity_timestamp,
+                            &codex_line.timestamp,
+                        );
                         message_count += 1;
                         if preview.is_empty()
                             && (is_user || subagent_dispatch_content(&text).is_some())
@@ -280,11 +285,7 @@ fn collect_file_index(
                     .unwrap_or("unknown")
                     .to_string()
             });
-        let timestamp = parse_conversation_timestamp(
-            session_timestamp.as_deref(),
-            first_timestamp.as_deref(),
-            modified,
-        );
+        let timestamp = conversation_timestamp(latest_activity_timestamp, modified);
         let directory_name = cwd.as_ref().and_then(|path| {
             PathBuf::from(path)
                 .file_name()
@@ -339,6 +340,102 @@ fn should_parse_codex_index_line(line: &str) -> bool {
     }
 
     line_has_json_type(header, "response_item") && line_has_json_type(header, "message")
+}
+
+fn codex_activity_timestamp(line: &str) -> Option<&str> {
+    let line = line.trim();
+    // Codex writes the envelope before the potentially very large payload.
+    // Inspect only that prefix so tool outputs advance activity without making
+    // startup deserialize their arguments/output into serde_json::Value.
+    let header = line_prefix(line, 2048);
+    let envelope = &header[..header.find(r#""payload""#)?];
+    let line_type = json_string_field(envelope, r#""type""#)?;
+    if !matches!(line_type, "event_msg" | "response_item") {
+        return None;
+    }
+    let timestamp = json_string_field(envelope, r#""timestamp""#)?;
+    has_complete_json_structure(line).then_some(timestamp)
+}
+
+fn has_complete_json_structure(json: &str) -> bool {
+    const MAX_DEPTH: usize = 128;
+
+    let mut stack = [0_u8; MAX_DEPTH];
+    let mut depth = 0;
+    let mut started = false;
+    let mut complete = false;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for byte in json.bytes() {
+        if complete {
+            if !byte.is_ascii_whitespace() {
+                return false;
+            }
+            continue;
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else {
+                match byte {
+                    b'\\' => escaped = true,
+                    b'"' => in_string = false,
+                    0..=0x1f => return false,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        if !started {
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            if byte != b'{' {
+                return false;
+            }
+            started = true;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                if depth == MAX_DEPTH {
+                    return false;
+                }
+                stack[depth] = byte;
+                depth += 1;
+            }
+            b'}' | b']' => {
+                let expected = if byte == b'}' { b'{' } else { b'[' };
+                if depth == 0 || stack[depth - 1] != expected {
+                    return false;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    complete = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    started && complete && depth == 0 && !in_string && !escaped
+}
+
+fn json_string_field<'a>(json: &'a str, field: &str) -> Option<&'a str> {
+    let value = json[json.find(field)? + field.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start()
+        .strip_prefix('"')?;
+    let end = value.find('"')?;
+    if value[..end].contains('\\') {
+        return None;
+    }
+    Some(&value[..end])
 }
 
 fn line_prefix(line: &str, max_bytes: usize) -> &str {
@@ -432,24 +529,25 @@ fn preview_text(text: &str, is_user: bool) -> String {
     preview.chars().take(200).collect()
 }
 
-fn parse_conversation_timestamp(
-    session_timestamp: Option<&str>,
-    first_timestamp: Option<&str>,
+fn record_latest_activity_timestamp(latest: &mut Option<DateTime<Local>>, raw: &str) {
+    let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) else {
+        return;
+    };
+    let timestamp = timestamp.with_timezone(&Local);
+    if match latest.as_ref() {
+        Some(current) => timestamp > *current,
+        None => true,
+    } {
+        *latest = Some(timestamp);
+    }
+}
+
+fn conversation_timestamp(
+    latest_activity_timestamp: Option<DateTime<Local>>,
     modified: Option<SystemTime>,
 ) -> DateTime<Local> {
-    session_timestamp
-        .or(first_timestamp)
-        .and_then(|timestamp| {
-            DateTime::parse_from_rfc3339(timestamp)
-                .ok()
-                .map(|timestamp| timestamp.with_timezone(&Local))
-        })
-        .or_else(|| {
-            modified.and_then(|modified| {
-                let duration = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
-                Local.timestamp_opt(duration.as_secs() as i64, 0).single()
-            })
-        })
+    latest_activity_timestamp
+        .or_else(|| modified.map(DateTime::<Local>::from))
         .unwrap_or_else(Local::now)
 }
 
@@ -1060,6 +1158,14 @@ pub fn load_codex_sessions_with_options(options: CodexLoadOptions) -> Result<Vec
         .iter()
         .map(|(path, metadata, _)| (path.clone(), metadata.clone()))
         .collect();
+    let indexed_timestamps: HashMap<PathBuf, DateTime<Local>> = indexed
+        .iter()
+        .filter_map(|(path, _, conversation)| {
+            conversation
+                .as_ref()
+                .map(|conversation| (path.clone(), conversation.timestamp))
+        })
+        .collect();
     let mut conversations: Vec<Conversation> = if options.include_full_text {
         files
             .into_par_iter()
@@ -1074,6 +1180,15 @@ pub fn load_codex_sessions_with_options(options: CodexLoadOptions) -> Result<Vec
             .filter_map(|(_, _, conversation)| conversation)
             .collect()
     };
+
+    // The full-text parser has its own legacy timestamp calculation. Keep both
+    // loading modes on the activity timestamp established by the lightweight index.
+    for conversation in &mut conversations {
+        if let Some(timestamp) = indexed_timestamps.get(&conversation.path) {
+            conversation.timestamp = *timestamp;
+            conversation.hierarchy_sort_timestamp = *timestamp;
+        }
+    }
 
     backfill_missing_models(&mut conversations, &metadata_by_path);
     annotate_hierarchy(&mut conversations, &metadata_by_path);
@@ -1103,6 +1218,113 @@ mod tests {
         let dir = root.join("sessions/2026/05/20");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(name), lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn resumed_old_session_uses_latest_event_timestamp_and_sorts_first() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+
+        write_session(
+            root.path(),
+            "rollout-resumed.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"resumed-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"Initial question"}}"#,
+                r#"{"timestamp":"2026-05-23T12:00:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Resumed answer"}}"#,
+            ],
+        );
+        write_session(
+            root.path(),
+            "rollout-inactive.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-22T10:00:00Z","type":"session_meta","payload":{"id":"inactive-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-22T10:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"Inactive question"}}"#,
+                r#"{"timestamp":"2026-05-22T10:02:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Inactive answer"}}"#,
+            ],
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+        let results = [false, true].map(|include_full_text| {
+            load_codex_sessions_with_options(CodexLoadOptions { include_full_text }).unwrap()
+        });
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        let expected = DateTime::parse_from_rfc3339("2026-05-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Local);
+        for sessions in results {
+            assert_eq!(sessions.len(), 2);
+            assert_eq!(sessions[0].session_id, "resumed-session");
+            assert_eq!(sessions[0].timestamp, expected);
+            assert!(sessions[0].timestamp > sessions[1].timestamp);
+        }
+    }
+
+    #[test]
+    fn conversation_timestamp_falls_back_to_file_mtime() {
+        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+
+        assert_eq!(
+            conversation_timestamp(None, Some(modified)),
+            DateTime::<Local>::from(modified)
+        );
+    }
+
+    #[test]
+    fn tool_response_items_advance_latest_activity_without_full_payload_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+        let large_value = "x".repeat(10_000);
+
+        write_session_strings(
+            root.path(),
+            "rollout-active-tool.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"active-tool-session","cwd":"/tmp/project","originator":"codex-tui"}}"#.to_string(),
+                r#"{"timestamp":"2026-05-20T10:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"Run the tool"}}"#.to_string(),
+                format!(
+                    r#"{{"timestamp":"2026-05-23T11:59:00Z","type":"response_item","payload":{{"type":"function_call","name":"exec_command","arguments":"{large_value}"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"2026-05-23T12:00:00Z","type":"response_item","payload":{{"type":"function_call_output","output":"{large_value}"}}}}"#
+                ),
+                r#"{"timestamp":"2026-05-24T12:00:00Z","type":"response_item","payload":{"type":"function_call_output","output":"truncated }"#.to_string(),
+            ],
+        );
+        write_session(
+            root.path(),
+            "rollout-inactive.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-22T10:00:00Z","type":"session_meta","payload":{"id":"inactive-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-22T10:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"Inactive question"}}"#,
+            ],
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+        let results = [false, true].map(|include_full_text| {
+            load_codex_sessions_with_options(CodexLoadOptions { include_full_text }).unwrap()
+        });
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        let expected = DateTime::parse_from_rfc3339("2026-05-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Local);
+        for sessions in results {
+            assert_eq!(sessions.len(), 2);
+            assert_eq!(sessions[0].session_id, "active-tool-session");
+            assert_eq!(sessions[0].timestamp, expected);
+        }
     }
 
     #[test]
@@ -1246,8 +1468,8 @@ mod tests {
             .iter()
             .position(|session| session.session_id == "child-b")
             .unwrap();
-        assert!(child_b_position < parent_position);
-        assert!(child_a_position < child_b_position);
+        assert!(child_a_position < parent_position);
+        assert!(parent_position < child_b_position);
         assert!(sessions[parent_position].hierarchy_has_children);
         assert_eq!(
             sessions[child_a_position].hierarchy_root_id.as_deref(),
@@ -1319,6 +1541,18 @@ mod tests {
             r#"{{"timestamp":"2026-05-20T22:45:33Z","type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
             "x".repeat(10_000)
         )));
+    }
+
+    #[test]
+    fn activity_timestamp_requires_complete_json_structure() {
+        let valid = r#"{"timestamp":"2026-05-20T22:45:33Z","type":"response_item","payload":{"type":"function_call_output","output":"escaped \" brace }"}}"#;
+        assert_eq!(
+            codex_activity_timestamp(valid),
+            Some("2026-05-20T22:45:33Z")
+        );
+
+        let truncated = r#"{"timestamp":"2026-05-24T12:00:00Z","type":"response_item","payload":{"type":"function_call_output","output":"truncated }"#;
+        assert_eq!(codex_activity_timestamp(truncated), None);
     }
 
     #[test]
@@ -1480,7 +1714,7 @@ mod tests {
             .iter()
             .position(|session| session.session_id == "child-session")
             .unwrap();
-        assert!(child_position < parent_position);
+        assert!(parent_position < child_position);
     }
 
     #[test]

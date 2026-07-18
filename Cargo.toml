@@ -21,6 +21,7 @@ syntect = { version = "5.2", default-features = false, features = ["default-fanc
 textwrap = "0.16"
 terminal-light = "1.0"
 unicode-width = "0.2"
+unicode-segmentation = "1.12"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [dev-dependencies]

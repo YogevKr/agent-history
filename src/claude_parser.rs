@@ -90,14 +90,11 @@ pub fn process_claude_file_with_options(
                 timestamp,
                 ..
             } => {
-                if let Some(ref ts_str) = timestamp {
-                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-                        if first_timestamp.is_none() {
-                            first_timestamp = Some(ts);
-                        }
-                        last_timestamp = Some(ts);
-                    }
-                }
+                record_message_timestamp(
+                    timestamp.as_deref(),
+                    &mut first_timestamp,
+                    &mut last_timestamp,
+                );
 
                 if extracted_cwd.is_none() {
                     if let Some(cwd_str) = cwd {
@@ -149,14 +146,11 @@ pub fn process_claude_file_with_options(
             LogEntry::Assistant {
                 message, timestamp, ..
             } => {
-                if let Some(ref ts_str) = timestamp {
-                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-                        if first_timestamp.is_none() {
-                            first_timestamp = Some(ts);
-                        }
-                        last_timestamp = Some(ts);
-                    }
-                }
+                record_message_timestamp(
+                    timestamp.as_deref(),
+                    &mut first_timestamp,
+                    &mut last_timestamp,
+                );
 
                 if extracted_model.is_none() {
                     if let Some(model) = &message.model {
@@ -224,8 +218,10 @@ pub fn process_claude_file_with_options(
         return Ok(None);
     }
 
-    let timestamp = modified
-        .map(DateTime::<Local>::from)
+    let timestamp = last_timestamp
+        .as_ref()
+        .map(|timestamp| timestamp.with_timezone(&Local))
+        .or_else(|| modified.map(DateTime::<Local>::from))
         .unwrap_or_else(Local::now);
 
     let preview = preview_parts
@@ -299,6 +295,32 @@ pub fn process_claude_file_with_options(
         hierarchy_order: 0,
         hierarchy_sort_timestamp: timestamp,
     }))
+}
+
+fn record_message_timestamp(
+    raw: Option<&str>,
+    earliest: &mut Option<chrono::DateTime<chrono::FixedOffset>>,
+    latest: &mut Option<chrono::DateTime<chrono::FixedOffset>>,
+) {
+    let Some(raw) = raw else {
+        return;
+    };
+    let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(raw) else {
+        return;
+    };
+
+    if match earliest.as_ref() {
+        Some(current) => timestamp < *current,
+        None => true,
+    } {
+        *earliest = Some(timestamp);
+    }
+    if match latest.as_ref() {
+        Some(current) => timestamp > *current,
+        None => true,
+    } {
+        *latest = Some(timestamp);
+    }
 }
 
 #[derive(Default)]
@@ -470,7 +492,9 @@ fn truncate_to_char_boundary(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::compare_conversations;
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::NamedTempFile;
 
     fn write_jsonl(lines: &[&str]) -> NamedTempFile {
@@ -497,6 +521,58 @@ mod tests {
             r#"{{"type":"user","timestamp":"2026-05-27T10:00:00Z","entrypoint":"cli","cwd":"{}","message":{{"role":"user","content":"hello"}}}}"#,
             cwd
         )
+    }
+
+    #[test]
+    fn resumed_old_session_uses_latest_message_timestamp_and_sorts_first() {
+        let resumed_file = write_jsonl(&[
+            r#"{"type":"user","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp/project","message":{"role":"user","content":"Initial question"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-05-23T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Resumed answer"}]}}"#,
+        ]);
+        let inactive_file = write_jsonl(&[
+            r#"{"type":"user","timestamp":"2026-05-22T10:00:00Z","cwd":"/tmp/project","message":{"role":"user","content":"Inactive question"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-05-22T10:02:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Inactive answer"}]}}"#,
+        ]);
+        let resumed_path = resumed_file.path().to_path_buf();
+
+        // Deliberately reverse mtimes: event activity, not file metadata, must win.
+        let resumed = process_claude_file(
+            resumed_path.clone(),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000)),
+        )
+        .unwrap()
+        .unwrap();
+        let inactive = process_claude_file(
+            inactive_file.path().to_path_buf(),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000)),
+        )
+        .unwrap()
+        .unwrap();
+
+        let expected = DateTime::parse_from_rfc3339("2026-05-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Local);
+        assert_eq!(resumed.timestamp, expected);
+
+        let mut sessions = [inactive, resumed];
+        sessions.sort_by(compare_conversations);
+        assert_eq!(sessions[0].path, resumed_path);
+        assert!(sessions[0].timestamp > sessions[1].timestamp);
+    }
+
+    #[test]
+    fn process_claude_file_falls_back_to_mtime_without_valid_message_timestamp() {
+        let file = write_jsonl(&[
+            r#"{"type":"user","cwd":"/tmp/project","message":{"role":"user","content":"Question"}}"#,
+            r#"{"type":"assistant","timestamp":"invalid","message":{"role":"assistant","content":[{"type":"text","text":"Answer"}]}}"#,
+        ]);
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000);
+
+        let conversation = process_claude_file(file.path().to_path_buf(), Some(modified))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(conversation.timestamp, DateTime::<Local>::from(modified));
     }
 
     #[test]

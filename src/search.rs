@@ -44,20 +44,15 @@ pub struct SqliteSearchIndex {
     message_rowid_to_ref: HashMap<i64, IndexedMessageRef>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum SearchScope {
+    #[default]
     Visible,
     Transcript,
     Tools,
     Internal,
     All,
-}
-
-impl Default for SearchScope {
-    fn default() -> Self {
-        Self::Visible
-    }
 }
 
 impl SearchScope {

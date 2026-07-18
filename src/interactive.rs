@@ -9,33 +9,37 @@ use crate::search::{
     precompute_full_search_index, precompute_search_text, search, search_full, FullSearchIndex,
     SearchableConversation,
 };
-use crate::viewer::{self, Span, StyledLine};
+use crate::viewer::{self, StyledLine};
 use chrono::Local;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
+    execute as execute_now, queue,
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
     terminal::{self, ClearType},
+    SynchronizedUpdate,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const PICKER_HINT: &str =
     "  Enter: view  Left/Right: column  PgUp/PgDn Home/End  Tab: expand/collapse";
 const PICKER_HEADER_ROWS: usize = 4;
+const PICKER_MIN_ROWS: usize = PICKER_HEADER_ROWS + 1;
 const PICKER_SOURCE_WIDTH: usize = 8;
 const PICKER_AGE_WIDTH: usize = 5;
 const PICKER_DIRECTORY_WIDTH: usize = 20;
 const PICKER_MODEL_WIDTH: usize = 22;
 const PICKER_MIN_HIERARCHY_GUTTER_WIDTH: usize = 3;
+const PICKER_MIN_PREVIEW_WIDTH: usize = 10;
 const FILTER_OVERLAY_MIN_NAV_WIDTH: usize = 12;
 const FILTER_OVERLAY_MAX_NAV_WIDTH: usize = 20;
 
@@ -73,13 +77,13 @@ pub fn run(
 
     terminal::enable_raw_mode().map_err(crate::error::AppError::Io)?;
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)
+    execute_now!(stdout, terminal::EnterAlternateScreen, cursor::Hide)
         .map_err(crate::error::AppError::Io)?;
 
     let result = main_loop(&mut stdout, &mut store, &mut state);
 
     // Always restore terminal
-    let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
+    let _ = execute_now!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
 
     result?;
@@ -229,7 +233,7 @@ fn main_loop(
                     PagerAction::Back => continue,
                     PagerAction::CopyId => idx,
                     PagerAction::Resume => {
-                        let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
+                        let _ = execute_now!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
                         let _ = terminal::disable_raw_mode();
                         return crate::resume::resume_session(&store.conversations()[idx]);
                     }
@@ -747,25 +751,30 @@ fn picker_loop(
     store: &mut crate::session_store::SessionStore,
     state: &mut PickerState,
 ) -> PickerAction {
+    let mut needs_redraw = true;
+
     loop {
         let conversations = store.conversations();
-        poll_full_search_index(conversations, state);
-        poll_full_search_result(conversations, state);
+        let background_changed = poll_full_search_index(conversations, state)
+            | poll_full_search_result(conversations, state);
 
-        let render_state = PickerRenderState {
-            query: &state.query,
-            filters: &state.filters,
-            filter_overlay: state.filter_overlay.as_ref(),
-            expanded_tree_roots: &state.expanded_tree_roots,
-            selected: state.selected,
-            scroll: state.scroll,
-            flash: state.flash.as_deref(),
-            focused_column: state.focused_column,
-        };
-        if draw_picker(stdout, conversations, &state.filtered_indices, render_state).is_err() {
-            return PickerAction::Quit;
+        if needs_redraw || background_changed {
+            let render_state = PickerRenderState {
+                query: &state.query,
+                filters: &state.filters,
+                filter_overlay: state.filter_overlay.as_ref(),
+                expanded_tree_roots: &state.expanded_tree_roots,
+                selected: state.selected,
+                scroll: state.scroll,
+                flash: state.flash.as_deref(),
+                focused_column: state.focused_column,
+            };
+            if draw_picker(stdout, conversations, &state.filtered_indices, render_state).is_err() {
+                return PickerAction::Quit;
+            }
+            state.flash = None;
+            needs_redraw = false;
         }
-        state.flash = None;
 
         let waiting_for_background =
             state.full_search_index_rx.is_some() || state.full_search_pending;
@@ -784,6 +793,7 @@ fn picker_loop(
                 Err(_) => return PickerAction::Quit,
             }
         };
+        needs_redraw = true;
 
         if state.filter_overlay.is_some() {
             let action = filter_overlay_key_action(&evt);
@@ -941,7 +951,7 @@ fn start_full_search_index(conversations: &[Conversation], state: &mut PickerSta
     state.flash = Some("Indexing full context".to_string());
 }
 
-fn poll_full_search_index(conversations: &[Conversation], state: &mut PickerState) {
+fn poll_full_search_index(conversations: &[Conversation], state: &mut PickerState) -> bool {
     let result = state.full_search_index_rx.as_ref().map(|rx| rx.try_recv());
 
     match result {
@@ -953,11 +963,13 @@ fn poll_full_search_index(conversations: &[Conversation], state: &mut PickerStat
                 state.flash = Some("Indexed full context".to_string());
                 request_full_search(state);
             }
+            true
         }
         Some(Err(TryRecvError::Disconnected)) => {
             state.full_search_index_rx = None;
+            true
         }
-        Some(Err(TryRecvError::Empty)) | None => {}
+        Some(Err(TryRecvError::Empty)) | None => false,
     }
 }
 
@@ -1011,7 +1023,7 @@ fn request_full_search(state: &mut PickerState) {
     }
 }
 
-fn poll_full_search_result(conversations: &[Conversation], state: &mut PickerState) {
+fn poll_full_search_result(conversations: &[Conversation], state: &mut PickerState) -> bool {
     let mut latest = None;
     let mut disconnected = false;
 
@@ -1035,13 +1047,16 @@ fn poll_full_search_result(conversations: &[Conversation], state: &mut PickerSta
     }
 
     let Some(result) = latest else {
-        return;
+        return disconnected;
     };
 
     if result.query == state.query {
         apply_filtered_indices(conversations, state, result.indices);
         state.full_search_pending = false;
         state.flash = Some("Searched full context".to_string());
+        true
+    } else {
+        disconnected
     }
 }
 
@@ -1107,29 +1122,46 @@ fn collapse_visible_indices(
         return base_indices;
     }
 
-    let visible_roots: HashSet<&str> = base_indices
+    let visible_roots: HashMap<&str, usize> = base_indices
         .iter()
         .filter_map(|&index| {
             let conversation = &conversations[index];
             (conversation.hierarchy_depth == 0 && conversation.hierarchy_has_children)
-                .then_some(conversation.session_id.as_str())
+                .then_some((conversation.session_id.as_str(), index))
         })
         .collect();
     let mut visible = Vec::with_capacity(base_indices.len());
+    let mut emitted_collapsed_roots = HashSet::new();
 
     for index in base_indices {
         let conversation = &conversations[index];
-        let hidden_by_collapsed_root = conversation.hierarchy_depth > 0
-            && conversation
-                .hierarchy_root_id
-                .as_deref()
-                .is_some_and(|root_id| {
-                    visible_roots.contains(root_id) && !expanded_tree_roots.contains(root_id)
-                });
-        if !hidden_by_collapsed_root {
+        let root_id = if conversation.hierarchy_depth == 0 && conversation.hierarchy_has_children {
+            Some(conversation.session_id.as_str())
+        } else {
+            conversation.hierarchy_root_id.as_deref()
+        };
+        let Some((root_id, &root_index)) =
+            root_id.and_then(|root_id| visible_roots.get_key_value(root_id))
+        else {
             visible.push(index);
+            continue;
+        };
+
+        if expanded_tree_roots.contains(*root_id) {
+            visible.push(index);
+        } else if emitted_collapsed_roots.insert(*root_id) {
+            visible.push(root_index);
         }
     }
+
+    // Collapsed roots display the whole tree's latest timestamp. Filtering can
+    // remove that newest child, so sort representatives by the same timestamp
+    // the picker renders rather than by the first surviving member's position.
+    visible.sort_by(|a, b| {
+        picker_display_timestamp(&conversations[*b], expanded_tree_roots, true).cmp(
+            &picker_display_timestamp(&conversations[*a], expanded_tree_roots, true),
+        )
+    });
 
     visible
 }
@@ -1151,51 +1183,26 @@ fn draw_picker(
     filtered_indices: &[usize],
     render_state: PickerRenderState<'_>,
 ) -> io::Result<()> {
+    stdout.sync_update(|stdout| {
+        draw_picker_frame(stdout, conversations, filtered_indices, render_state)
+    })?
+}
+
+fn draw_picker_frame(
+    stdout: &mut io::Stdout,
+    conversations: &[Conversation],
+    filtered_indices: &[usize],
+    render_state: PickerRenderState<'_>,
+) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
     let cols = cols as usize;
     let rows = rows as usize;
+    if cols == 0 || rows == 0 {
+        return Ok(());
+    }
 
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 0),
-        terminal::Clear(ClearType::All)
-    )?;
-
-    // Line 0: search scope summary
-    let filter_line =
-        truncate_to_width_text(&format!("search: {}", render_state.filters.summary()), cols);
-    execute!(
-        stdout,
-        SetForegroundColor(Color::DarkGrey),
-        Print(filter_line),
-        ResetColor,
-    )?;
-
-    // Line 1: search prompt
-    let query_width = cols.saturating_sub(2);
-    let query_text = truncate_to_width_text(render_state.query, query_width);
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 1),
-        SetForegroundColor(Color::Yellow),
-        SetAttribute(Attribute::Bold),
-        Print("> "),
-        ResetColor,
-        Print(&query_text),
-    )?;
-
-    // Line 2: match count + hint + flash
-    let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
-    let status_line = picker_status_line(&count, PICKER_HINT, render_state.flash, cols);
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 2),
-        SetForegroundColor(Color::DarkGrey),
-        Print(status_line),
-        ResetColor,
-    )?;
-
-    // Lines 4..rows: session list
+    // Reserve the last terminal column so a row can never trigger auto-wrap.
+    let content_cols = cols.saturating_sub(1);
     let list_start = PICKER_HEADER_ROWS;
     let visible = rows.saturating_sub(list_start);
     let selected = render_state
@@ -1215,29 +1222,76 @@ fn draw_picker(
         render_state.expanded_tree_roots,
         render_state.query.is_empty(),
     );
+    let minimum_cols = picker_minimum_terminal_width(hierarchy_width);
+    if picker_terminal_too_small(cols, rows, hierarchy_width) {
+        return draw_small_picker(stdout, cols, rows, minimum_cols);
+    }
+
+    // Line 0: search scope summary
+    let filter_line = truncate_to_width_text(
+        &format!("search: {}", render_state.filters.summary()),
+        content_cols,
+    );
+    clear_row(stdout, 0)?;
+    queue!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print(filter_line),
+        ResetColor,
+    )?;
+
+    // Line 1: search prompt
+    let query_width = content_cols.saturating_sub(2);
+    let query_text = truncate_to_width_text(render_state.query, query_width);
+    clear_row(stdout, 1)?;
+    queue!(
+        stdout,
+        cursor::MoveTo(0, 1),
+        SetForegroundColor(Color::Yellow),
+        SetAttribute(Attribute::Bold),
+        Print("> "),
+        ResetColor,
+        Print(&query_text),
+    )?;
+
+    // Line 2: match count + hint + flash
+    let count = format!("  {}/{}", filtered_indices.len(), conversations.len());
+    let status_line = picker_status_line(&count, PICKER_HINT, render_state.flash, content_cols);
+    clear_row(stdout, 2)?;
+    queue!(
+        stdout,
+        cursor::MoveTo(0, 2),
+        SetForegroundColor(Color::DarkGrey),
+        Print(status_line),
+        ResetColor,
+    )?;
 
     // Line 3: session table header
-    execute!(stdout, cursor::MoveTo(0, 3))?;
-    draw_picker_column_header(stdout, cols, hierarchy_width, render_state.focused_column)?;
+    clear_row(stdout, 3)?;
+    draw_picker_column_header(
+        stdout,
+        content_cols,
+        hierarchy_width,
+        render_state.focused_column,
+    )?;
 
     for i in 0..visible {
+        clear_row(stdout, list_start + i)?;
         let list_idx = scroll + i;
         if list_idx >= filtered_indices.len() {
-            break;
+            continue;
         }
         let conv = &conversations[filtered_indices[list_idx]];
         let is_selected = list_idx == selected;
 
-        execute!(stdout, cursor::MoveTo(0, (list_start + i) as u16))?;
-
         if is_selected {
-            execute!(stdout, SetAttribute(Attribute::Reverse))?;
+            queue!(stdout, SetAttribute(Attribute::Reverse))?;
         }
 
         draw_session_line(
             stdout,
             conv,
-            cols,
+            content_cols,
             hierarchy_width,
             is_selected,
             render_state.expanded_tree_roots,
@@ -1245,7 +1299,7 @@ fn draw_picker(
         )?;
 
         if is_selected {
-            execute!(stdout, SetAttribute(Attribute::NoReverse))?;
+            queue!(stdout, SetAttribute(Attribute::NoReverse))?;
         }
     }
 
@@ -1255,17 +1309,56 @@ fn draw_picker(
             conversations,
             render_state.filters,
             overlay,
-            cols,
+            content_cols,
             rows,
         )?;
     }
 
     let cursor_col = 2usize
         .saturating_add(UnicodeWidthStr::width(render_state.query))
-        .min(cols.saturating_sub(1));
-    execute!(stdout, cursor::MoveTo(cursor_col as u16, 1))?;
-    stdout.flush()?;
+        .min(content_cols.saturating_sub(1));
+    queue!(stdout, cursor::MoveTo(cursor_col as u16, 1))?;
     Ok(())
+}
+
+fn picker_minimum_terminal_width(hierarchy_width: usize) -> usize {
+    picker_row_fixed_width(hierarchy_width) + PICKER_MIN_PREVIEW_WIDTH + 1
+}
+
+fn picker_terminal_too_small(cols: usize, rows: usize, hierarchy_width: usize) -> bool {
+    rows < PICKER_MIN_ROWS || cols < picker_minimum_terminal_width(hierarchy_width)
+}
+
+fn draw_small_picker(
+    stdout: &mut io::Stdout,
+    cols: usize,
+    rows: usize,
+    minimum_cols: usize,
+) -> io::Result<()> {
+    for row in 0..rows {
+        clear_row(stdout, row)?;
+    }
+
+    let message = format!(
+        "Terminal too small: need at least {}x{} (got {}x{})",
+        minimum_cols, PICKER_MIN_ROWS, cols, rows
+    );
+    let message = truncate_to_display_width(&message, cols.saturating_sub(1));
+    queue!(
+        stdout,
+        cursor::MoveTo(0, 0),
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        Print(message)
+    )
+}
+
+fn clear_row(stdout: &mut io::Stdout, row: usize) -> io::Result<()> {
+    queue!(
+        stdout,
+        cursor::MoveTo(0, row as u16),
+        terminal::Clear(ClearType::CurrentLine)
+    )
 }
 
 fn picker_status_line(count: &str, hint: &str, flash: Option<&str>, cols: usize) -> String {
@@ -1286,19 +1379,14 @@ fn truncate_to_width_text(text: &str, cols: usize) -> String {
 }
 
 fn truncate_to_display_width(text: &str, max_width: usize) -> String {
-    let mut rendered_width = 0;
-    let mut clipped = String::new();
+    display_width_prefix(text, max_width).0.to_string()
+}
 
-    for ch in text.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if rendered_width + ch_width > max_width {
-            break;
-        }
-        rendered_width += ch_width;
-        clipped.push(ch);
-    }
-
-    clipped
+fn pad_to_display_width(text: &str, width: usize) -> String {
+    let mut text = truncate_to_display_width(text, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    text.push_str(&" ".repeat(padding));
+    text
 }
 
 fn draw_filter_overlay(
@@ -1317,34 +1405,31 @@ fn draw_filter_overlay(
     let nav_width = filter_overlay_nav_width(width);
     let nav_content_width = nav_width.saturating_sub(FILTER_OVERLAY_INNER_PADDING * 2);
     let right_width = width.saturating_sub(nav_width + FILTER_OVERLAY_INNER_PADDING * 3 + 3);
+    let (vertical_padding, body_rows) = filter_overlay_body_layout(height);
+    let body_y = y + 1 + vertical_padding;
 
     draw_filter_overlay_backdrop(stdout, x, y, width, height, cols, rows)?;
     draw_filter_overlay_border(stdout, x, y, width, height, overlay.section)?;
     draw_filter_overlay_nav(
         stdout,
         x + 1 + FILTER_OVERLAY_INNER_PADDING,
-        y + 1 + FILTER_OVERLAY_VERTICAL_PADDING,
+        body_y,
         nav_content_width,
+        body_rows,
         &panel,
         overlay,
     )?;
-    draw_filter_overlay_divider(
-        stdout,
-        x + 1 + nav_width,
-        y + 1 + FILTER_OVERLAY_VERTICAL_PADDING,
-        height.saturating_sub(2 + FILTER_OVERLAY_VERTICAL_PADDING * 2),
-    )?;
+    draw_filter_overlay_divider(stdout, x + 1 + nav_width, body_y, body_rows)?;
 
     let right_x = x + nav_width + FILTER_OVERLAY_INNER_PADDING * 2 + 2;
-    let body_rows = height.saturating_sub(2 + FILTER_OVERLAY_VERTICAL_PADDING * 2);
     for row in 0..body_rows {
-        let content_y = y + 1 + FILTER_OVERLAY_VERTICAL_PADDING + row;
+        let content_y = body_y + row;
         let (content, selected) = panel
             .right_rows
             .get(row)
             .map(|line| (line.content.as_str(), line.selected))
             .unwrap_or(("", false));
-        execute!(
+        queue!(
             stdout,
             cursor::MoveTo(right_x as u16, content_y as u16),
             SetBackgroundColor(Color::Black),
@@ -1352,16 +1437,15 @@ fn draw_filter_overlay(
             cursor::MoveTo(right_x as u16, content_y as u16),
         )?;
         if selected {
-            execute!(stdout, SetAttribute(Attribute::Reverse))?;
+            queue!(stdout, SetAttribute(Attribute::Reverse))?;
         }
 
-        let text = truncate(content, right_width);
-        execute!(stdout, Print(format!("{:<right_width$}", text)))?;
+        queue!(stdout, Print(pad_to_display_width(content, right_width)))?;
 
         if selected {
-            execute!(stdout, SetAttribute(Attribute::NoReverse))?;
+            queue!(stdout, SetAttribute(Attribute::NoReverse))?;
         }
-        execute!(stdout, ResetColor)?;
+        queue!(stdout, ResetColor)?;
     }
 
     Ok(())
@@ -1520,7 +1604,7 @@ fn draw_filter_overlay_backdrop(
         filter_overlay_backdrop_bounds(x, y, width, height, cols, rows);
 
     for row in 0..clear_height {
-        execute!(
+        queue!(
             stdout,
             cursor::MoveTo(clear_x as u16, (clear_y + row) as u16),
             Print(" ".repeat(clear_width)),
@@ -1568,7 +1652,7 @@ fn draw_filter_overlay_border(
     let top_line = filter_overlay_top_border(width, title);
     let bottom_line = format!("└{}┘", "─".repeat(width.saturating_sub(2)));
 
-    execute!(
+    queue!(
         stdout,
         SetForegroundColor(Color::DarkGrey),
         SetBackgroundColor(Color::Black),
@@ -1577,7 +1661,7 @@ fn draw_filter_overlay_border(
     )?;
 
     for row in 1..height.saturating_sub(1) {
-        execute!(
+        queue!(
             stdout,
             cursor::MoveTo(x as u16, (y + row) as u16),
             Print("│"),
@@ -1586,7 +1670,7 @@ fn draw_filter_overlay_border(
         )?;
     }
 
-    execute!(
+    queue!(
         stdout,
         cursor::MoveTo(x as u16, (y + height - 1) as u16),
         Print(bottom_line),
@@ -1619,6 +1703,7 @@ fn draw_filter_overlay_nav(
     x: usize,
     y: usize,
     width: usize,
+    max_rows: usize,
     panel: &FilterOverlayPanel,
     overlay: &FilterOverlayState,
 ) -> io::Result<()> {
@@ -1638,28 +1723,36 @@ fn draw_filter_overlay_nav(
         ("Space toggle".to_string(), false),
     ];
 
-    for (idx, (content, selected)) in rows.into_iter().enumerate() {
-        execute!(
+    for (idx, (content, selected)) in rows.into_iter().take(max_rows).enumerate() {
+        queue!(
             stdout,
             cursor::MoveTo(x as u16, (y + idx) as u16),
             SetBackgroundColor(Color::Black)
         )?;
         if selected {
-            execute!(stdout, SetAttribute(Attribute::Reverse))?;
+            queue!(stdout, SetAttribute(Attribute::Reverse))?;
         } else if idx >= 3 {
-            execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+            queue!(stdout, SetForegroundColor(Color::DarkGrey))?;
         }
 
-        let text = truncate(&content, width);
-        execute!(stdout, Print(format!("{:<width$}", text)))?;
+        queue!(stdout, Print(pad_to_display_width(&content, width)))?;
 
         if selected {
-            execute!(stdout, SetAttribute(Attribute::NoReverse))?;
+            queue!(stdout, SetAttribute(Attribute::NoReverse))?;
         }
-        execute!(stdout, ResetColor)?;
+        queue!(stdout, ResetColor)?;
     }
 
     Ok(())
+}
+
+fn filter_overlay_body_layout(height: usize) -> (usize, usize) {
+    let padded_rows = height.saturating_sub(2 + FILTER_OVERLAY_VERTICAL_PADDING * 2);
+    if padded_rows >= FILTER_OVERLAY_MIN_BODY_ROWS {
+        (FILTER_OVERLAY_VERTICAL_PADDING, padded_rows)
+    } else {
+        (0, height.saturating_sub(2))
+    }
 }
 
 fn draw_filter_overlay_divider(
@@ -1668,16 +1761,16 @@ fn draw_filter_overlay_divider(
     y: usize,
     height: usize,
 ) -> io::Result<()> {
-    execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+    queue!(stdout, SetForegroundColor(Color::DarkGrey))?;
     for row in 0..height {
-        execute!(
+        queue!(
             stdout,
             cursor::MoveTo(x as u16, (y + row) as u16),
             SetBackgroundColor(Color::Black),
             Print("│")
         )?;
     }
-    execute!(stdout, ResetColor)?;
+    queue!(stdout, ResetColor)?;
     Ok(())
 }
 
@@ -1792,7 +1885,7 @@ fn draw_picker_column_header(
         draw_picker_header_cells(stdout, &[preview])?;
     }
 
-    execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
@@ -1845,7 +1938,7 @@ fn draw_picker_header_cell(
         HeaderAlign::Right => format!("{:>width$}", label, width = width),
     };
 
-    execute!(
+    queue!(
         stdout,
         SetForegroundColor(if focused {
             Color::Yellow
@@ -1887,9 +1980,14 @@ fn picker_hierarchy_gutter_width(
         .skip(scroll)
         .take(visible)
         .map(|idx| {
-            picker_hierarchy_marker(&conversations[*idx], expanded_tree_roots, collapse_enabled)
-                .chars()
-                .count()
+            UnicodeWidthStr::width(
+                picker_hierarchy_marker(
+                    &conversations[*idx],
+                    expanded_tree_roots,
+                    collapse_enabled,
+                )
+                .as_str(),
+            )
         })
         .max()
         .unwrap_or(0)
@@ -1914,22 +2012,23 @@ fn draw_session_line(
         SessionSource::Codex => Color::Green,
     };
 
-    let age = format_relative_time(conv.timestamp);
+    let age = format_relative_time(picker_display_timestamp(
+        conv,
+        expanded_tree_roots,
+        collapse_enabled,
+    ));
     let hierarchy = picker_hierarchy_marker(conv, expanded_tree_roots, collapse_enabled);
+    let hierarchy_cell = picker_hierarchy_cell(&hierarchy, hierarchy_width);
     let directory = format_directory_label(conv);
     let model = format_model_short(conv.model.as_deref());
     let title = get_display_title(conv);
 
     let model_inner_width = PICKER_MODEL_WIDTH.saturating_sub(2);
-    let model_display = format!(
-        "({:<inner_width$})",
-        truncate(&model, model_inner_width),
-        inner_width = model_inner_width
-    );
+    let model_display = format!("({})", pad_to_display_width(&model, model_inner_width));
     let preview_max = max_width.saturating_sub(picker_row_fixed_width(hierarchy_width));
-    let preview = truncate(&title, preview_max.max(10));
+    let preview = picker_preview(&title, preview_max);
 
-    execute!(
+    queue!(
         stdout,
         Print(" "),
         SetForegroundColor(source_color),
@@ -1941,68 +2040,81 @@ fn draw_session_line(
         ResetColor,
     )?;
     if is_selected {
-        execute!(stdout, SetAttribute(Attribute::Reverse))?;
+        queue!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    execute!(
+    queue!(
         stdout,
         Print(format!(" {:>width$}  ", age, width = PICKER_AGE_WIDTH))
     )?;
 
-    execute!(
+    queue!(
         stdout,
         SetForegroundColor(Color::Cyan),
-        Print(format!("{:<width$}", hierarchy, width = hierarchy_width)),
+        Print(hierarchy_cell),
         ResetColor,
     )?;
     if is_selected {
-        execute!(stdout, SetAttribute(Attribute::Reverse))?;
+        queue!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    let dir_display: String = directory.chars().take(PICKER_DIRECTORY_WIDTH).collect();
-    execute!(
+    let dir_display = pad_to_display_width(&directory, PICKER_DIRECTORY_WIDTH);
+    queue!(
         stdout,
         SetForegroundColor(Color::Cyan),
-        Print(format!(
-            "{:<width$}",
-            dir_display,
-            width = PICKER_DIRECTORY_WIDTH
-        )),
+        Print(dir_display),
         ResetColor,
     )?;
     if is_selected {
-        execute!(stdout, SetAttribute(Attribute::Reverse))?;
+        queue!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    execute!(
+    queue!(
         stdout,
         SetForegroundColor(Color::DarkGrey),
-        Print(format!(
-            "  {:<width$}",
-            model_display,
-            width = PICKER_MODEL_WIDTH
-        )),
+        Print(format!("  {}", model_display)),
         ResetColor,
     )?;
     if is_selected {
-        execute!(stdout, SetAttribute(Attribute::Reverse))?;
+        queue!(stdout, SetAttribute(Attribute::Reverse))?;
     }
 
-    let clean_preview: String = preview
-        .chars()
-        .map(|c| if c == '\n' { ' ' } else { c })
-        .collect();
-    execute!(stdout, Print(format!("\"{}\"", clean_preview)))?;
+    queue!(stdout, Print(format!("\"{}\"", preview)))?;
 
     if is_selected {
-        let line_so_far = picker_row_fixed_width(hierarchy_width) + clean_preview.len();
+        let line_so_far =
+            picker_row_fixed_width(hierarchy_width) + UnicodeWidthStr::width(preview.as_str());
         let padding = max_width.saturating_sub(line_so_far);
         if padding > 0 {
-            execute!(stdout, Print(" ".repeat(padding)))?;
+            queue!(stdout, Print(" ".repeat(padding)))?;
         }
     }
 
     Ok(())
+}
+
+fn picker_preview(title: &str, max_width: usize) -> String {
+    let sanitized: String = title
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    truncate_to_display_width(&sanitized, max_width)
+}
+
+fn picker_display_timestamp(
+    conv: &Conversation,
+    expanded_tree_roots: &HashSet<String>,
+    collapse_enabled: bool,
+) -> chrono::DateTime<Local> {
+    if collapse_enabled
+        && conv.hierarchy_depth == 0
+        && conv.hierarchy_has_children
+        && !expanded_tree_roots.contains(&conv.session_id)
+    {
+        conv.hierarchy_sort_timestamp
+    } else {
+        conv.timestamp
+    }
 }
 
 fn picker_hierarchy_marker(
@@ -2021,6 +2133,23 @@ fn picker_hierarchy_marker(
     }
 }
 
+fn picker_hierarchy_cell(marker: &str, width: usize) -> String {
+    let marker = display_width_suffix(marker, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(marker));
+    format!("{marker}{}", " ".repeat(padding))
+}
+
+fn display_width_suffix(text: &str, max_width: usize) -> &str {
+    let mut start = text.len();
+    for (idx, _) in text.grapheme_indices(true).rev() {
+        if UnicodeWidthStr::width(&text[idx..]) > max_width {
+            break;
+        }
+        start = idx;
+    }
+    &text[start..]
+}
+
 fn copy_to_clipboard(text: &str) -> io::Result<()> {
     let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -2033,16 +2162,20 @@ fn copy_to_clipboard(text: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::viewer::Span;
     use chrono::Local;
     use std::collections::HashSet;
     use std::path::PathBuf;
 
     fn conversation(session_id: &str, depth: usize, has_children: bool) -> Conversation {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Local);
         Conversation {
             path: PathBuf::from(format!("{session_id}.jsonl")),
             source: SessionSource::Codex,
             session_id: session_id.to_string(),
-            timestamp: Local::now(),
+            timestamp,
             preview: session_id.to_string(),
             full_text: String::new(),
             directory_name: Some("directory".to_string()),
@@ -2061,7 +2194,7 @@ mod tests {
             hierarchy_marker: None,
             hierarchy_depth: depth,
             hierarchy_order: 0,
-            hierarchy_sort_timestamp: Local::now(),
+            hierarchy_sort_timestamp: timestamp,
         }
     }
 
@@ -2098,12 +2231,16 @@ mod tests {
     }
 
     #[test]
-    fn collapse_tracks_tree_identity_after_chronological_sort() {
-        let conversations = vec![
-            conversation("child", 1, false),
-            conversation("plain", 0, false),
-            conversation("root", 0, true),
-        ];
+    fn collapsed_tree_uses_latest_member_position_after_chronological_sort() {
+        let latest = Local::now();
+        let mut child = conversation("child", 1, false);
+        child.timestamp = latest;
+        let mut root = conversation("root", 0, true);
+        root.timestamp = latest - chrono::Duration::days(7);
+        root.hierarchy_sort_timestamp = latest;
+        let mut plain = conversation("plain", 0, false);
+        plain.timestamp = latest - chrono::Duration::days(1);
+        let conversations = vec![child, plain, root];
         let base_indices = vec![0, 1, 2];
 
         let collapsed =
@@ -2116,8 +2253,55 @@ mod tests {
         );
 
         assert_eq!(tree_root_id(&conversations, 0).as_deref(), Some("root"));
-        assert_eq!(collapsed, vec![1, 2]);
+        assert_eq!(collapsed, vec![2, 1]);
         assert_eq!(expanded, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn collapsed_root_displays_latest_tree_timestamp() {
+        let latest = Local::now();
+        let mut root = conversation("root", 0, true);
+        root.timestamp = latest - chrono::Duration::days(7);
+        root.hierarchy_sort_timestamp = latest;
+
+        assert_eq!(
+            picker_display_timestamp(&root, &HashSet::new(), true),
+            latest
+        );
+        assert_eq!(
+            picker_display_timestamp(&root, &HashSet::from(["root".to_string()]), true),
+            root.timestamp
+        );
+        assert_eq!(
+            picker_display_timestamp(&root, &HashSet::new(), false),
+            root.timestamp
+        );
+    }
+
+    #[test]
+    fn filtered_collapsed_rows_sort_by_their_displayed_timestamp() {
+        let latest = Local::now();
+        let mut hidden_child = conversation("child", 1, false);
+        hidden_child.timestamp = latest;
+        hidden_child.directory_name = Some("other".to_string());
+        let mut standalone = conversation("plain", 0, false);
+        standalone.timestamp = latest - chrono::Duration::hours(1);
+        let mut root = conversation("root", 0, true);
+        root.timestamp = latest - chrono::Duration::days(7);
+        root.hierarchy_sort_timestamp = latest;
+        let conversations = vec![hidden_child, standalone, root];
+        let mut filters = crate::filters::SessionFilters::all();
+        filters.only_directory("directory");
+
+        let base = filters.filter_indices(&conversations, vec![0, 1, 2]);
+        assert_eq!(base, vec![1, 2]);
+        let collapsed = collapse_visible_indices(&conversations, base, &HashSet::new(), true);
+
+        assert_eq!(collapsed, vec![2, 1]);
+        assert!(
+            picker_display_timestamp(&conversations[collapsed[0]], &HashSet::new(), true)
+                >= picker_display_timestamp(&conversations[collapsed[1]], &HashSet::new(), true)
+        );
     }
 
     #[test]
@@ -2151,7 +2335,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(visible, vec![0, 2, 3]);
+        assert_eq!(visible, vec![0, 3, 2]);
     }
 
     #[test]
@@ -2460,6 +2644,23 @@ mod tests {
     }
 
     #[test]
+    fn filter_overlay_body_stays_inside_short_terminal_bounds() {
+        for terminal_rows in 5..=13 {
+            let (_, y, _, height) = filter_overlay_bounds(80, terminal_rows, 11);
+            let (padding, body_rows) = filter_overlay_body_layout(height);
+            let body_start = y + 1 + padding;
+            let body_end = body_start + body_rows;
+
+            assert!(body_end <= y + height.saturating_sub(1));
+            assert!(body_end <= terminal_rows);
+            assert!(body_rows <= height.saturating_sub(2));
+        }
+
+        let (_, _, _, height) = filter_overlay_bounds(80, 11, 11);
+        assert!(filter_overlay_body_layout(height).1 >= FILTER_OVERLAY_MIN_BODY_ROWS);
+    }
+
+    #[test]
     fn filter_overlay_panel_uses_left_nav_summaries_and_search_row() {
         let conversations = vec![
             {
@@ -2542,6 +2743,67 @@ mod tests {
     }
 
     #[test]
+    fn pager_status_line_avoids_bottom_right_cell() {
+        let left = " /Users/yogev/פרויקט (gpt-5.5) 2m abc12345";
+        let right =
+            "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh /:search q:back  100% ";
+
+        for cols in [40, 80, 120] {
+            let line = pager_status_line(left, right, cols);
+            assert_eq!(UnicodeWidthStr::width(line.as_str()), cols - 1);
+        }
+        assert!(pager_status_line(left, right, 1).is_empty());
+
+        let emoji_line = pager_status_line("", "❤️x", 3);
+        assert_eq!(emoji_line, "❤️");
+        assert_eq!(UnicodeWidthStr::width(emoji_line.as_str()), 2);
+    }
+
+    #[test]
+    fn picker_minimum_width_reserves_preview_and_wrap_column() {
+        let hierarchy_width = PICKER_MIN_HIERARCHY_GUTTER_WIDTH;
+
+        assert_eq!(
+            picker_minimum_terminal_width(hierarchy_width),
+            picker_row_fixed_width(hierarchy_width) + PICKER_MIN_PREVIEW_WIDTH + 1
+        );
+        assert!(picker_terminal_too_small(40, 3, hierarchy_width));
+        assert!(picker_terminal_too_small(
+            picker_minimum_terminal_width(hierarchy_width),
+            PICKER_HEADER_ROWS,
+            hierarchy_width
+        ));
+        assert!(!picker_terminal_too_small(
+            picker_minimum_terminal_width(hierarchy_width),
+            PICKER_MIN_ROWS,
+            hierarchy_width
+        ));
+
+        let padded = pad_to_display_width("❤️ project", 12);
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 12);
+
+        assert_eq!(display_width_prefix("❤️x", 1), ("", 0));
+        assert_eq!(display_width_prefix("🇮🇱x", 1), ("", 0));
+    }
+
+    #[test]
+    fn full_search_poll_reports_only_visible_state_changes() {
+        let conversations = vec![conversation("session", 0, false)];
+        let mut state =
+            PickerState::for_test(&conversations, crate::filters::SessionFilters::all());
+
+        assert!(!poll_full_search_index(&conversations, &mut state));
+
+        let (tx, rx) = mpsc::channel();
+        state.full_search_index_rx = Some(rx);
+        assert!(!poll_full_search_index(&conversations, &mut state));
+
+        tx.send(FullSearchIndex::InMemory(Vec::new())).unwrap();
+        assert!(poll_full_search_index(&conversations, &mut state));
+        assert!(state.full_search_index.is_some());
+    }
+
+    #[test]
     fn picker_header_rows_include_column_header() {
         assert_eq!(PICKER_HEADER_ROWS, 4);
     }
@@ -2592,9 +2854,32 @@ mod tests {
     }
 
     #[test]
+    fn picker_hierarchy_cell_clips_deep_markers_to_the_fixed_gutter() {
+        let deep = conversation("deep", 6, false);
+        let marker = format_hierarchy_marker(&deep);
+
+        assert_eq!(UnicodeWidthStr::width(marker.as_str()), 12);
+        let cell = picker_hierarchy_cell(&marker, HIERARCHY_GUTTER_WIDTH);
+        assert_eq!(
+            UnicodeWidthStr::width(cell.as_str()),
+            HIERARCHY_GUTTER_WIDTH
+        );
+        assert!(cell.ends_with("└─"));
+    }
+
+    #[test]
     fn truncates_header_text_by_display_width() {
         assert_eq!(truncate_to_display_width("ab界c", 3), "ab");
         assert_eq!(truncate_to_display_width("ab界c", 4), "ab界");
+    }
+
+    #[test]
+    fn picker_preview_sanitizes_controls_before_width_truncation() {
+        let preview = picker_preview("\r\n\r\n12345678", 10);
+
+        assert_eq!(preview, "    123456");
+        assert_eq!(UnicodeWidthStr::width(preview.as_str()), 10);
+        assert!(!preview.chars().any(char::is_control));
     }
 
     #[test]
@@ -2745,10 +3030,7 @@ mod tests {
 
     #[test]
     fn viewer_search_finds_case_insensitive_matches() {
-        let lines = vec![
-            vec![test_span("User: Hidden Needle")],
-            vec![test_span("Assistant: another needle here")],
-        ];
+        let lines = test_pager_lines(&["User: Hidden Needle", "Assistant: another needle here"]);
 
         let search = ViewerSearch::new("needle", &lines).unwrap();
 
@@ -2772,10 +3054,7 @@ mod tests {
 
     #[test]
     fn viewer_search_navigation_wraps_between_matches() {
-        let lines = vec![
-            vec![test_span("first needle")],
-            vec![test_span("second needle")],
-        ];
+        let lines = test_pager_lines(&["first needle", "second needle"]);
         let mut search = ViewerSearch::new("needle", &lines).unwrap();
 
         assert_eq!(search.current_line(), Some(0));
@@ -2846,9 +3125,9 @@ mod tests {
     #[test]
     fn render_styled_line_clips_to_width_without_terminal_wrap() {
         let mut output = Vec::new();
-        let spans = vec![test_span("abcdef")];
+        let lines = test_pager_lines(&["abcdef"]);
 
-        render_styled_line(&mut output, &spans, 4, None, 0).unwrap();
+        render_styled_line(&mut output, &lines[0], 4, None, 0).unwrap();
 
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("abcd"));
@@ -2857,12 +3136,69 @@ mod tests {
     }
 
     #[test]
+    fn viewer_search_highlight_keeps_combining_grapheme_intact() {
+        let lines = test_pager_lines(&["a\u{301}b"]);
+        let search = ViewerSearch::new("a", &lines).unwrap();
+
+        assert_eq!(search.matches[0].start, 0);
+        assert_eq!(search.matches[0].end, "a\u{301}".len());
+
+        let mut output = Vec::new();
+        render_styled_line(&mut output, &lines[0], 1, Some(&search), 0).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("a\u{301}"));
+        assert!(!rendered.contains('b'));
+    }
+
+    #[test]
+    fn pager_soft_wrap_keeps_zwj_graphemes_intact() {
+        let family = "👨‍👩‍👧‍👦";
+        let raw_lines = vec![vec![test_span(&format!("{family}x"))]];
+
+        let wrapped = wrap_styled_lines(&raw_lines, 2);
+        let wrapped_text: Vec<&str> = wrapped.iter().map(|line| line.text.as_str()).collect();
+
+        assert_eq!(wrapped_text, vec![family, "x"]);
+    }
+
+    #[test]
+    fn pager_soft_wrap_normalizes_graphemes_across_style_boundaries() {
+        let raw_lines = vec![vec![
+            test_span("a"),
+            Span {
+                text: "\u{301}b".to_string(),
+                fg: None,
+                bold: true,
+                dim: false,
+            },
+        ]];
+
+        let wrapped = wrap_styled_lines(&raw_lines, 1);
+        let wrapped_text: Vec<&str> = wrapped.iter().map(|line| line.text.as_str()).collect();
+
+        assert_eq!(wrapped_text, vec!["a\u{301}", "b"]);
+        assert_eq!(wrapped[0].styles.len(), 1);
+        assert!(!wrapped[0].styles[0].style.bold);
+    }
+
+    #[test]
+    fn pager_soft_wrap_uses_contextual_unicode_width() {
+        let raw_lines = vec![vec![test_span("لا")]];
+
+        let wrapped = wrap_styled_lines(&raw_lines, 1);
+        let wrapped_text: Vec<&str> = wrapped.iter().map(|line| line.text.as_str()).collect();
+
+        assert_eq!(wrapped_text, vec!["لا"]);
+        assert_eq!(UnicodeWidthStr::width(wrapped_text[0]), 1);
+    }
+
+    #[test]
     fn viewer_search_can_navigate_matches_after_soft_wrapping_long_rows() {
         let raw_lines = vec![vec![test_span(
             "first memory_limiter second memory_limiter",
         )]];
         let wrapped = wrap_styled_lines(&raw_lines, 20);
-        let wrapped_text: Vec<String> = wrapped.iter().map(styled_line_text).collect();
+        let wrapped_text: Vec<&str> = wrapped.iter().map(|line| line.text.as_str()).collect();
 
         assert_eq!(wrapped.len(), 4);
         assert_eq!(
@@ -2876,6 +3212,42 @@ mod tests {
         assert_eq!(search.current_line(), Some(3));
     }
 
+    #[test]
+    fn pager_render_preserves_contextual_width_across_style_runs() {
+        let raw_lines = vec![vec![
+            test_span("ل"),
+            Span {
+                text: "ا".to_string(),
+                fg: None,
+                bold: true,
+                dim: false,
+            },
+        ]];
+        let lines = wrap_styled_lines(&raw_lines, 1);
+
+        assert_eq!(lines[0].text, "لا");
+        assert_eq!(lines[0].styles.len(), 1);
+        let mut output = Vec::new();
+        render_styled_line(&mut output, &lines[0], 1, None, 0).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("لا"));
+    }
+
+    #[test]
+    fn pager_render_preserves_contextual_width_across_search_highlight() {
+        let lines = test_pager_lines(&["لا"]);
+        for query in ["ل", "ا"] {
+            let search = ViewerSearch::new(query, &lines).unwrap();
+
+            assert_eq!(search.matches[0].start, 0);
+            assert_eq!(search.matches[0].end, "لا".len());
+            let mut output = Vec::new();
+            render_styled_line(&mut output, &lines[0], 1, Some(&search), 0).unwrap();
+            let rendered = String::from_utf8(output).unwrap();
+            assert!(rendered.contains("لا"));
+        }
+    }
+
     fn test_span(text: &str) -> Span {
         Span {
             text: text.to_string(),
@@ -2883,6 +3255,11 @@ mod tests {
             bold: false,
             dim: false,
         }
+    }
+
+    fn test_pager_lines(texts: &[&str]) -> Vec<PagerLine> {
+        let lines: Vec<StyledLine> = texts.iter().map(|text| vec![test_span(text)]).collect();
+        wrap_styled_lines(&lines, 1_000)
     }
 }
 
@@ -2911,7 +3288,7 @@ struct ViewerSearch {
 }
 
 impl ViewerSearch {
-    fn new(query: &str, lines: &[StyledLine]) -> Option<Self> {
+    fn new(query: &str, lines: &[PagerLine]) -> Option<Self> {
         let terms = viewer_search_terms(query);
         if terms.is_empty() {
             return None;
@@ -2919,8 +3296,7 @@ impl ViewerSearch {
 
         let mut matches = Vec::new();
         for (line_idx, line) in lines.iter().enumerate() {
-            let text = styled_line_text(line);
-            matches.extend(find_viewer_matches(line_idx, &text, &terms));
+            matches.extend(find_viewer_matches(line_idx, &line.text, &terms));
         }
         matches.sort_by_key(|m| (m.line, m.start, m.end));
 
@@ -3207,20 +3583,17 @@ fn viewer_search_terms(query: &str) -> Vec<String> {
         })
 }
 
-fn styled_line_text(line: &StyledLine) -> String {
-    line.iter().map(|span| span.text.as_str()).collect()
-}
-
 fn find_viewer_matches(line: usize, text: &str, terms: &[String]) -> Vec<ViewerMatch> {
     let lower = text.to_ascii_lowercase();
     let mut matches = Vec::new();
     for term in terms {
         let mut offset = 0;
         while let Some(found) = lower[offset..].find(term) {
-            let start = offset + found;
-            let end = start + term.len();
+            let raw_start = offset + found;
+            let raw_end = raw_start + term.len();
+            let (start, end) = expand_to_grapheme_boundaries(text, raw_start, raw_end);
             matches.push(ViewerMatch { line, start, end });
-            offset = end;
+            offset = raw_end;
             if offset >= lower.len() {
                 break;
             }
@@ -3241,6 +3614,41 @@ fn find_viewer_matches(line: usize, text: &str, terms: &[String]) -> Vec<ViewerM
     merged
 }
 
+fn expand_to_grapheme_boundaries(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut expanded_start = start;
+    let mut expanded_end = end;
+
+    for (grapheme_start, grapheme) in text.grapheme_indices(true) {
+        let grapheme_end = grapheme_start + grapheme.len();
+        if grapheme_end > start && grapheme_start < end {
+            expanded_start = expanded_start.min(grapheme_start);
+            expanded_end = expanded_end.max(grapheme_end);
+        }
+    }
+
+    while expanded_start > 0 && !display_width_boundary_is_safe(text, expanded_start) {
+        expanded_start = text[..expanded_start]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(start, _)| start);
+    }
+    while expanded_end < text.len() && !display_width_boundary_is_safe(text, expanded_end) {
+        expanded_end = text[expanded_end..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map_or(text.len(), |(end, _)| expanded_end + end);
+    }
+
+    (expanded_start, expanded_end)
+}
+
+fn display_width_boundary_is_safe(text: &str, boundary: usize) -> bool {
+    boundary == 0
+        || boundary == text.len()
+        || UnicodeWidthStr::width(&text[..boundary]) + UnicodeWidthStr::width(&text[boundary..])
+            == UnicodeWidthStr::width(text)
+}
+
 fn scroll_to_match(line: usize, visible: usize, max_scroll: usize) -> usize {
     line.saturating_sub(visible / 3).min(max_scroll)
 }
@@ -3252,115 +3660,192 @@ struct SpanStyle {
     dim: bool,
 }
 
-#[derive(Clone, Copy)]
-struct StyledChar {
-    ch: char,
+struct StyleRun {
+    start: usize,
+    end: usize,
     style: SpanStyle,
+}
+
+#[derive(Default)]
+struct PagerLine {
+    text: String,
+    styles: Vec<StyleRun>,
+    width: usize,
+}
+
+#[derive(Clone, Copy)]
+struct StyledGrapheme {
+    start: usize,
+    end: usize,
+    style: SpanStyle,
+}
+
+impl StyledGrapheme {
+    fn is_whitespace(&self, text: &str) -> bool {
+        text[self.start..self.end].chars().all(char::is_whitespace)
+    }
 }
 
 fn pager_body_width(cols: usize) -> usize {
     cols.saturating_sub(1).max(1)
 }
 
-fn wrap_styled_lines(lines: &[StyledLine], max_width: usize) -> Vec<StyledLine> {
+fn wrap_styled_lines(lines: &[StyledLine], max_width: usize) -> Vec<PagerLine> {
     let max_width = max_width.max(1);
     let mut wrapped = Vec::new();
 
     for line in lines {
+        let (text, graphemes) = styled_line_graphemes(line);
         let mut current = Vec::new();
-        let mut current_width = 0;
         let mut last_break = None;
 
-        for span in line {
-            let style = SpanStyle {
-                fg: span.fg,
-                bold: span.bold,
-                dim: span.dim,
-            };
+        for grapheme in graphemes {
+            let mut candidate_width =
+                styled_graphemes_with_candidate_width(&text, &current, grapheme);
+            while !current.is_empty() && candidate_width > max_width {
+                if let Some(break_idx) = last_break.filter(|idx| *idx > 0) {
+                    wrapped.push(styled_graphemes_to_line(&text, &current[..break_idx]));
+                    current = current[(break_idx + 1)..].to_vec();
+                    trim_leading_whitespace(&text, &mut current);
+                } else {
+                    wrapped.push(styled_graphemes_to_line(&text, &current));
+                    current.clear();
+                }
+                last_break = current.iter().rposition(|unit| unit.is_whitespace(&text));
+                candidate_width = styled_graphemes_with_candidate_width(&text, &current, grapheme);
+            }
 
-            for ch in span.text.chars() {
-                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-                while current_width > 0 && current_width + ch_width > max_width {
-                    if let Some(break_idx) = last_break.filter(|idx| *idx > 0) {
-                        wrapped.push(styled_chars_to_line(&current[..break_idx]));
-                        current = current[(break_idx + 1)..].to_vec();
-                        trim_leading_whitespace(&mut current);
-                        current_width = styled_chars_width(&current);
-                    } else {
-                        wrapped.push(styled_chars_to_line(&current));
-                        current.clear();
-                        current_width = 0;
-                    }
-                    last_break = current.iter().rposition(|unit| unit.ch.is_whitespace());
-                }
-
-                if current.is_empty() && ch.is_whitespace() {
-                    continue;
-                }
-                current.push(StyledChar { ch, style });
-                current_width += ch_width;
-                if ch.is_whitespace() {
-                    last_break = Some(current.len() - 1);
-                }
+            if current.is_empty() && grapheme.is_whitespace(&text) {
+                continue;
+            }
+            current.push(grapheme);
+            if current.last().is_some_and(|unit| unit.is_whitespace(&text)) {
+                last_break = Some(current.len() - 1);
             }
         }
 
-        wrapped.push(styled_chars_to_line(&current));
+        wrapped.push(styled_graphemes_to_line(&text, &current));
     }
 
     wrapped
 }
 
-fn trim_leading_whitespace(chars: &mut Vec<StyledChar>) {
-    let first_non_whitespace = chars
+fn styled_line_graphemes(line: &StyledLine) -> (String, Vec<StyledGrapheme>) {
+    let mut text = String::new();
+    let mut styles = Vec::new();
+
+    for span in line.iter().filter(|span| !span.text.is_empty()) {
+        styles.push((
+            text.len(),
+            SpanStyle {
+                fg: span.fg,
+                bold: span.bold,
+                dim: span.dim,
+            },
+        ));
+        text.push_str(&span.text);
+    }
+
+    if text.is_empty() {
+        return (text, Vec::new());
+    }
+
+    let mut style_idx = 0;
+    let graphemes = text
+        .grapheme_indices(true)
+        .map(|(start, grapheme)| {
+            while style_idx + 1 < styles.len() && styles[style_idx + 1].0 <= start {
+                style_idx += 1;
+            }
+            StyledGrapheme {
+                start,
+                end: start + grapheme.len(),
+                // A terminal grapheme is indivisible. If its scalars crossed an
+                // input span boundary, preserve the first scalar's style.
+                style: styles[style_idx].1,
+            }
+        })
+        .collect();
+    (text, graphemes)
+}
+
+fn trim_leading_whitespace(text: &str, graphemes: &mut Vec<StyledGrapheme>) {
+    let first_non_whitespace = graphemes
         .iter()
-        .position(|unit| !unit.ch.is_whitespace())
-        .unwrap_or(chars.len());
+        .position(|unit| !unit.is_whitespace(text))
+        .unwrap_or(graphemes.len());
     if first_non_whitespace > 0 {
-        chars.drain(..first_non_whitespace);
+        graphemes.drain(..first_non_whitespace);
     }
 }
 
-fn styled_chars_width(chars: &[StyledChar]) -> usize {
-    chars
-        .iter()
-        .map(|unit| UnicodeWidthChar::width(unit.ch).unwrap_or(0))
-        .sum()
+fn styled_graphemes_with_candidate_width(
+    text: &str,
+    graphemes: &[StyledGrapheme],
+    candidate: StyledGrapheme,
+) -> usize {
+    let start = graphemes
+        .first()
+        .map_or(candidate.start, |first| first.start);
+    if let Some(last) = graphemes.last() {
+        debug_assert_eq!(last.end, candidate.start);
+    }
+    UnicodeWidthStr::width(&text[start..candidate.end])
 }
 
-fn styled_chars_to_line(chars: &[StyledChar]) -> StyledLine {
-    let mut line = Vec::new();
-    let Some(first) = chars.first() else {
-        return line;
+fn styled_graphemes_to_line(text: &str, graphemes: &[StyledGrapheme]) -> PagerLine {
+    let Some(first) = graphemes.first() else {
+        return PagerLine::default();
     };
 
+    let base = first.start;
     let mut style = first.style;
-    let mut text = String::new();
+    let mut span_start = 0;
+    let mut span_end = first.end - base;
+    let mut styles = Vec::new();
 
-    for unit in chars {
+    for unit in &graphemes[1..] {
+        debug_assert_eq!(base + span_end, unit.start);
         if unit.style != style {
-            line.push(Span {
-                text,
-                fg: style.fg,
-                bold: style.bold,
-                dim: style.dim,
+            styles.push(StyleRun {
+                start: span_start,
+                end: span_end,
+                style,
             });
             style = unit.style;
-            text = String::new();
+            span_start = unit.start - base;
         }
-        text.push(unit.ch);
+        span_end = unit.end - base;
     }
 
-    if !text.is_empty() {
-        line.push(Span {
-            text,
-            fg: style.fg,
-            bold: style.bold,
-            dim: style.dim,
-        });
-    }
+    styles.push(StyleRun {
+        start: span_start,
+        end: span_end,
+        style,
+    });
 
-    line
+    let text = text[base..base + span_end].to_string();
+    normalize_contextual_style_runs(&text, &mut styles);
+    let width = UnicodeWidthStr::width(text.as_str());
+    PagerLine {
+        text,
+        styles,
+        width,
+    }
+}
+
+fn normalize_contextual_style_runs(text: &str, styles: &mut Vec<StyleRun>) {
+    let mut normalized: Vec<StyleRun> = Vec::with_capacity(styles.len());
+    for run in styles.drain(..) {
+        if let Some(previous) = normalized.last_mut() {
+            if previous.style == run.style || !display_width_boundary_is_safe(text, run.start) {
+                previous.end = run.end;
+                continue;
+            }
+        }
+        normalized.push(run);
+    }
+    *styles = normalized;
 }
 
 fn pager_loop(
@@ -3515,7 +4000,29 @@ fn pager_loop(
 
 fn draw_pager(
     stdout: &mut io::Stdout,
-    lines: &[StyledLine],
+    lines: &[PagerLine],
+    scroll: usize,
+    conv: &Conversation,
+    search: Option<&ViewerSearch>,
+    search_input_mode: bool,
+    search_query: &str,
+) -> io::Result<()> {
+    stdout.sync_update(|stdout| {
+        draw_pager_frame(
+            stdout,
+            lines,
+            scroll,
+            conv,
+            search,
+            search_input_mode,
+            search_query,
+        )
+    })?
+}
+
+fn draw_pager_frame(
+    stdout: &mut io::Stdout,
+    lines: &[PagerLine],
     scroll: usize,
     conv: &Conversation,
     search: Option<&ViewerSearch>,
@@ -3525,21 +4032,18 @@ fn draw_pager(
     let (cols, rows) = terminal::size()?;
     let cols = cols as usize;
     let rows = rows as usize;
+    if cols == 0 || rows == 0 {
+        return Ok(());
+    }
     let content_rows = rows.saturating_sub(1); // reserve last row for status
 
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 0),
-        terminal::Clear(ClearType::All)
-    )?;
-
     for i in 0..content_rows {
+        clear_row(stdout, i)?;
         let line_idx = scroll + i;
         if line_idx >= lines.len() {
-            break;
+            continue;
         }
 
-        execute!(stdout, cursor::MoveTo(0, i as u16))?;
         render_styled_line(
             stdout,
             &lines[line_idx],
@@ -3571,144 +4075,142 @@ fn draw_pager(
         "jk:scroll  g/G  y:id Y:copy e:export  o:resume  r:refresh{}q:back  {}% ",
         search_status, progress
     );
-    let gap = cols.saturating_sub(left.len() + right.len());
-    let status = format!("{}{}{}", left, " ".repeat(gap), right);
-    execute!(
+    let status = pager_status_line(&left, &right, cols);
+    clear_row(stdout, rows - 1)?;
+    queue!(
         stdout,
-        cursor::MoveTo(0, (rows - 1) as u16),
         SetAttribute(Attribute::Reverse),
-        Print(format!("{:<width$}", status, width = cols)),
+        Print(status),
         SetAttribute(Attribute::NoReverse),
     )?;
 
-    stdout.flush()?;
     Ok(())
+}
+
+fn pager_status_line(left: &str, right: &str, cols: usize) -> String {
+    // Leave the final terminal column untouched. Writing to the bottom-right
+    // cell can trigger an automatic wrap and scroll the alternate screen.
+    let max_width = cols.saturating_sub(1);
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let right = truncate_to_display_width(right, max_width);
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    let left = truncate_to_display_width(left, max_width.saturating_sub(right_width));
+    let left_width = UnicodeWidthStr::width(left.as_str());
+    let gap = max_width.saturating_sub(left_width + right_width);
+
+    format!("{}{}{}", left, " ".repeat(gap), right)
 }
 
 fn render_styled_line<W: Write>(
     stdout: &mut W,
-    spans: &[Span],
+    line: &PagerLine,
     max_width: usize,
     search: Option<&ViewerSearch>,
     line_idx: usize,
 ) -> io::Result<()> {
-    let line_matches = search
+    let visible_end = if line.width <= max_width {
+        line.text.len()
+    } else {
+        display_width_prefix(&line.text, max_width).0.len()
+    };
+    let (match_base, line_matches) = search
         .map(|search| search.line_matches(line_idx))
-        .unwrap_or_default();
-    let mut line_offset = 0;
-    let mut remaining_width = max_width;
-    for span in spans {
-        if remaining_width == 0 {
+        .unwrap_or((0, &[]));
+
+    for run in &line.styles {
+        if run.start >= visible_end {
             break;
         }
-        render_span_with_highlights(
+        render_style_run_with_highlights(
             stdout,
-            span,
-            line_offset,
-            &line_matches,
-            &mut remaining_width,
+            &line.text,
+            run,
+            visible_end,
+            line_matches,
+            match_base,
+            search.map_or(usize::MAX, |search| search.current),
         )?;
-        line_offset += span.text.len();
     }
     Ok(())
 }
 
 impl ViewerSearch {
-    fn line_matches(&self, line_idx: usize) -> Vec<(&ViewerMatch, bool)> {
-        self.matches
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.line == line_idx)
-            .map(|(idx, m)| (m, idx == self.current))
-            .collect()
+    fn line_matches(&self, line_idx: usize) -> (usize, &[ViewerMatch]) {
+        let start = self
+            .matches
+            .partition_point(|matched| matched.line < line_idx);
+        let end = self
+            .matches
+            .partition_point(|matched| matched.line <= line_idx);
+        (start, &self.matches[start..end])
     }
 }
 
-fn render_span_with_highlights<W: Write>(
+fn render_style_run_with_highlights<W: Write>(
     stdout: &mut W,
-    span: &Span,
-    span_start: usize,
-    line_matches: &[(&ViewerMatch, bool)],
-    remaining_width: &mut usize,
+    text: &str,
+    run: &StyleRun,
+    visible_end: usize,
+    line_matches: &[ViewerMatch],
+    match_base: usize,
+    active_match: usize,
 ) -> io::Result<()> {
-    let span_end = span_start + span.text.len();
-    let mut cursor = 0;
+    let run_end = run.end.min(visible_end);
+    let mut cursor = run.start;
 
-    for (matched, is_active) in line_matches {
-        if *remaining_width == 0 {
-            return Ok(());
-        }
-        if matched.end <= span_start || matched.start >= span_end {
+    for (match_offset, matched) in line_matches.iter().enumerate() {
+        if matched.end <= run.start || matched.start >= run_end {
             continue;
         }
-        let local_start = matched
-            .start
-            .saturating_sub(span_start)
-            .min(span.text.len());
-        let local_end = (matched.end.min(span_end) - span_start).min(span.text.len());
-        if local_start > cursor {
-            print_span_segment(
-                stdout,
-                span,
-                &span.text[cursor..local_start],
-                remaining_width,
-            )?;
+        let match_start = matched.start.max(run.start).min(run_end);
+        let match_end = matched.end.min(run_end);
+        if match_start > cursor {
+            print_styled_segment(stdout, run.style, &text[cursor..match_start])?;
         }
-        if local_end > local_start {
+        if match_end > match_start {
             print_highlight_segment(
                 stdout,
-                &span.text[local_start..local_end],
-                *is_active,
-                remaining_width,
+                &text[match_start..match_end],
+                match_base + match_offset == active_match,
             )?;
         }
-        cursor = local_end;
+        cursor = match_end;
     }
 
-    if cursor < span.text.len() {
-        print_span_segment(stdout, span, &span.text[cursor..], remaining_width)?;
+    if cursor < run_end {
+        print_styled_segment(stdout, run.style, &text[cursor..run_end])?;
     }
 
     Ok(())
 }
 
-fn print_span_segment<W: Write>(
-    stdout: &mut W,
-    span: &Span,
-    text: &str,
-    remaining_width: &mut usize,
-) -> io::Result<()> {
-    let (text, width) = display_width_prefix(text, *remaining_width);
+fn print_styled_segment<W: Write>(stdout: &mut W, style: SpanStyle, text: &str) -> io::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    if span.bold {
-        execute!(stdout, SetAttribute(Attribute::Bold))?;
+    if style.bold {
+        queue!(stdout, SetAttribute(Attribute::Bold))?;
     }
-    if span.dim {
-        execute!(stdout, SetAttribute(Attribute::Dim))?;
+    if style.dim {
+        queue!(stdout, SetAttribute(Attribute::Dim))?;
     }
-    if let Some((r, g, b)) = span.fg {
-        execute!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
+    if let Some((r, g, b)) = style.fg {
+        queue!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
     }
-    execute!(stdout, Print(text))?;
-    execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
-    *remaining_width = remaining_width.saturating_sub(width);
+    queue!(stdout, Print(text))?;
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
-fn print_highlight_segment<W: Write>(
-    stdout: &mut W,
-    text: &str,
-    active: bool,
-    remaining_width: &mut usize,
-) -> io::Result<()> {
-    let (text, width) = display_width_prefix(text, *remaining_width);
+fn print_highlight_segment<W: Write>(stdout: &mut W, text: &str, active: bool) -> io::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     if active {
-        execute!(
+        queue!(
             stdout,
             SetForegroundColor(Color::Black),
             SetBackgroundColor(Color::Yellow),
@@ -3718,7 +4220,7 @@ fn print_highlight_segment<W: Write>(
             SetAttribute(Attribute::Reset)
         )?;
     } else {
-        execute!(
+        queue!(
             stdout,
             SetForegroundColor(Color::Black),
             SetBackgroundColor(Color::DarkYellow),
@@ -3727,7 +4229,6 @@ fn print_highlight_segment<W: Write>(
             SetAttribute(Attribute::Reset)
         )?;
     }
-    *remaining_width = remaining_width.saturating_sub(width);
     Ok(())
 }
 
@@ -3735,13 +4236,13 @@ fn display_width_prefix(text: &str, max_width: usize) -> (&str, usize) {
     let mut used = 0;
     let mut end = 0;
 
-    for (idx, ch) in text.char_indices() {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + width > max_width {
-            break;
+    for (idx, grapheme) in text.grapheme_indices(true) {
+        let next_end = idx + grapheme.len();
+        let next_width = UnicodeWidthStr::width(&text[..next_end]);
+        if next_width <= max_width {
+            used = next_width;
+            end = next_end;
         }
-        used += width;
-        end = idx + ch.len_utf8();
     }
 
     (&text[..end], used)
