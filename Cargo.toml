@@ -1,6 +1,6 @@
 [package]
 name = "agent-history"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Unified Claude Code + Codex CLI session search"
 license = "MIT"
