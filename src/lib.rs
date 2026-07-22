@@ -16,6 +16,7 @@ mod path;
 mod resume;
 mod search;
 mod session_store;
+mod startup_cache;
 mod syntax;
 mod theme;
 mod viewer;

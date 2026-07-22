@@ -1,9 +1,10 @@
 use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
 /// Source of a session
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionSource {
     Claude,
     Codex,
@@ -19,7 +20,7 @@ impl std::fmt::Display for SessionSource {
 }
 
 /// Unified conversation representation across all session sources
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub path: PathBuf,
     pub source: SessionSource,

@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::codex::{CodexLine, EventMsg, ResponseItem, SessionMeta, TurnContext};
 use crate::codex_items::clean_user_message;
@@ -14,19 +15,20 @@ use crate::codex_parser::{
 };
 use crate::error::Result;
 use crate::history::{compare_conversations, Conversation, SessionSource};
+use crate::startup_cache::{file_fingerprint, FileFingerprint, StartupCache};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexLoadOptions {
     pub include_full_text: bool,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 struct TaskModelKey {
     cwd: String,
     turn_id: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct CodexFileMetadata {
     session_id: Option<String>,
     cwd: Option<String>,
@@ -1143,10 +1145,105 @@ fn subtree_latest(
 /// Checks CODEX_HOME env var, defaults to ~/.codex.
 /// Sessions live under {root}/sessions/ in YYYY/MM/DD/ subdirectories.
 pub fn load_codex_sessions() -> Result<Vec<Conversation>> {
-    load_codex_sessions_with_options(CodexLoadOptions::default())
+    load_codex_sessions_impl(CodexLoadOptions::default(), StartupCache::open_default())
 }
 
+#[cfg(test)]
 pub fn load_codex_sessions_with_options(options: CodexLoadOptions) -> Result<Vec<Conversation>> {
+    load_codex_sessions_impl(options, None)
+}
+
+#[cfg(test)]
+fn load_codex_sessions_with_cache(
+    options: CodexLoadOptions,
+    cache_db_path: &Path,
+) -> Result<Vec<Conversation>> {
+    load_codex_sessions_impl(options, StartupCache::open(cache_db_path))
+}
+
+/// Serialized form of one file's lightweight index result.
+#[derive(Serialize)]
+struct CodexIndexEntryRef<'a> {
+    metadata: &'a CodexFileMetadata,
+    conversation: &'a Option<Conversation>,
+}
+
+#[derive(Deserialize)]
+struct CodexIndexEntry {
+    metadata: CodexFileMetadata,
+    conversation: Option<Conversation>,
+}
+
+const CODEX_CACHE_SOURCE: &str = "codex";
+
+/// Index all rollout files, reusing cached results for files whose
+/// size+mtime fingerprint is unchanged since the last run.
+fn index_files_with_cache(
+    files: &[PathBuf],
+    cache: &mut Option<StartupCache>,
+) -> Vec<(PathBuf, CodexFileMetadata, Option<Conversation>)> {
+    let cached_entries = cache
+        .as_ref()
+        .map(|cache| cache.load_source_entries(CODEX_CACHE_SOURCE))
+        .unwrap_or_default();
+
+    let indexed: Vec<(
+        PathBuf,
+        CodexFileMetadata,
+        Option<Conversation>,
+        Option<FileFingerprint>,
+    )> = files
+        .par_iter()
+        .filter_map(|path| {
+            let fingerprint = file_fingerprint(path);
+            if let (Some(fingerprint), Some((cached_fingerprint, data))) = (
+                fingerprint,
+                cached_entries.get(path.to_string_lossy().as_ref()),
+            ) {
+                if *cached_fingerprint == fingerprint {
+                    if let Ok(entry) = serde_json::from_str::<CodexIndexEntry>(data) {
+                        return Some((path.clone(), entry.metadata, entry.conversation, None));
+                    }
+                }
+            }
+
+            let (path, metadata, conversation) = collect_file_index(path)?;
+            Some((path, metadata, conversation, fingerprint))
+        })
+        .collect();
+
+    if let Some(cache) = cache.as_mut() {
+        let fresh: Vec<(String, FileFingerprint, String)> = indexed
+            .iter()
+            .filter_map(|(path, metadata, conversation, fingerprint)| {
+                let fingerprint = (*fingerprint)?;
+                let data = serde_json::to_string(&CodexIndexEntryRef {
+                    metadata,
+                    conversation,
+                })
+                .ok()?;
+                Some((path.to_string_lossy().to_string(), fingerprint, data))
+            })
+            .collect();
+        cache.store_entries(CODEX_CACHE_SOURCE, &fresh);
+
+        let live_paths: HashSet<String> = files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        cache.prune_missing(CODEX_CACHE_SOURCE, &live_paths);
+    }
+
+    indexed
+        .into_iter()
+        .map(|(path, metadata, conversation, _)| (path, metadata, conversation))
+        .collect()
+}
+
+fn load_codex_sessions_impl(
+    options: CodexLoadOptions,
+    mut cache: Option<StartupCache>,
+) -> Result<Vec<Conversation>> {
     let root = match std::env::var("CODEX_HOME") {
         Ok(val) => PathBuf::from(val),
         Err(_) => {
@@ -1161,8 +1258,7 @@ pub fn load_codex_sessions_with_options(options: CodexLoadOptions) -> Result<Vec
     }
 
     let files = collect_jsonl_files(&sessions_dir);
-    let indexed: Vec<(PathBuf, CodexFileMetadata, Option<Conversation>)> =
-        files.par_iter().filter_map(collect_file_index).collect();
+    let indexed = index_files_with_cache(&files, &mut cache);
     let metadata_by_path: HashMap<PathBuf, CodexFileMetadata> = indexed
         .iter()
         .map(|(path, metadata, _)| (path.clone(), metadata.clone()))
@@ -1276,6 +1372,72 @@ mod tests {
     }
 
     #[test]
+    fn startup_cache_serves_unchanged_files_and_reparses_changed_ones() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let root = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let cache_db = cache_dir.path().join("startup-index.sqlite");
+
+        write_session(
+            root.path(),
+            "rollout-cached.jsonl",
+            &[
+                r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"cached-session","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"Real question"}}"#,
+            ],
+        );
+
+        std::env::set_var("CODEX_HOME", root.path());
+
+        let fresh = load_codex_sessions_with_cache(CodexLoadOptions::default(), &cache_db).unwrap();
+        let cached =
+            load_codex_sessions_with_cache(CodexLoadOptions::default(), &cache_db).unwrap();
+
+        // Prove the second load was served from the cache: rewrite the cached
+        // entry and observe the sentinel in the next load.
+        {
+            let conn = rusqlite::Connection::open(&cache_db).unwrap();
+            let changed = conn
+                .execute(
+                    "UPDATE file_index SET data = replace(data, 'Real question', 'CACHE SENTINEL')
+                     WHERE data LIKE '%Real question%'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
+        let poisoned =
+            load_codex_sessions_with_cache(CodexLoadOptions::default(), &cache_db).unwrap();
+
+        // Appending to the file changes its fingerprint and forces a reparse.
+        let session_path = root.path().join("sessions/2026/05/20/rollout-cached.jsonl");
+        let mut contents = fs::read_to_string(&session_path).unwrap();
+        contents.push_str("\n{\"timestamp\":\"2026-05-20T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Answer\"}}");
+        fs::write(&session_path, contents).unwrap();
+        let reparsed =
+            load_codex_sessions_with_cache(CodexLoadOptions::default(), &cache_db).unwrap();
+
+        if let Some(value) = previous_codex_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].session_id, fresh[0].session_id);
+        assert_eq!(cached[0].preview, fresh[0].preview);
+        assert_eq!(cached[0].timestamp, fresh[0].timestamp);
+        assert_eq!(cached[0].message_count, fresh[0].message_count);
+
+        assert_eq!(poisoned[0].preview, "CACHE SENTINEL");
+
+        assert_eq!(reparsed[0].preview, "Real question");
+        assert_eq!(reparsed[0].message_count, 2);
+    }
+
+    #[test]
     fn conversation_timestamp_falls_back_to_file_mtime() {
         let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
 
@@ -1365,7 +1527,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1404,7 +1566,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1458,7 +1620,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1510,7 +1672,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1618,7 +1780,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1696,7 +1858,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1737,7 +1899,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1773,7 +1935,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1815,7 +1977,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1885,7 +2047,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -1947,7 +2109,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
@@ -2023,7 +2185,7 @@ mod tests {
         );
 
         std::env::set_var("CODEX_HOME", root.path());
-        let sessions = load_codex_sessions().unwrap();
+        let sessions = load_codex_sessions_with_options(CodexLoadOptions::default()).unwrap();
         if let Some(value) = previous_codex_home {
             std::env::set_var("CODEX_HOME", value);
         } else {
