@@ -4,7 +4,7 @@ use crate::claude::{
 };
 use crate::claude_parser::process_claude_file;
 use crate::codex_items::{codex_items, read_codex_lines, CodexItem, CodexRole};
-use crate::codex_parser::process_codex_file;
+use crate::codex_parser::{process_codex_file, process_codex_file_with_items};
 use crate::history::{Conversation, SessionSource};
 use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
@@ -41,7 +41,6 @@ pub enum FullSearchIndex {
 pub struct SqliteSearchIndex {
     db_path: PathBuf,
     rowid_to_index: HashMap<i64, usize>,
-    message_rowid_to_ref: HashMap<i64, IndexedMessageRef>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, clap::ValueEnum)]
@@ -125,13 +124,6 @@ pub struct MessageSearchHit {
     pub role: SearchRole,
     pub snippet: String,
     pub score: f64,
-}
-
-#[derive(Clone)]
-struct IndexedMessageRef {
-    conversation_index: usize,
-    message_index: usize,
-    role: SearchRole,
 }
 
 /// Normalize text for search: lowercase, replace non-alphanumeric chars with spaces
@@ -229,6 +221,30 @@ fn uncached_full_search_text_lower(conv: &Conversation) -> String {
     hydrate_full_conversation(conv, modified)
         .map(|parsed| conversation_search_text_lower(&parsed))
         .unwrap_or_else(|| conversation_search_text_lower(conv))
+}
+
+/// Index body and message rows for one session. Codex rollouts can be huge
+/// and are re-indexed on every append, so parse them once for both outputs
+/// instead of hydrating the body and the messages in separate passes.
+fn indexed_body_and_messages(
+    conv: &Conversation,
+    modified: SystemTime,
+) -> (String, Vec<SearchMessage>) {
+    if conv.source == SessionSource::Codex && conv.full_text.is_empty() {
+        if let Ok(Some((parsed, items))) =
+            process_codex_file_with_items(conv.path.clone(), Some(modified))
+        {
+            return (
+                conversation_index_body(&parsed),
+                codex_messages_from_items(&items),
+            );
+        }
+    }
+
+    (
+        full_search_index_body_with_modified(conv, modified),
+        search_messages_for_conversation(conv),
+    )
 }
 
 fn full_search_index_body_with_modified(conv: &Conversation, modified: SystemTime) -> String {
@@ -407,31 +423,35 @@ fn codex_search_messages(path: &Path) -> std::io::Result<Vec<SearchMessage>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let lines = read_codex_lines(reader);
+    Ok(codex_messages_from_items(&codex_items(&lines)))
+}
+
+fn codex_messages_from_items(items: &[CodexItem]) -> Vec<SearchMessage> {
     let mut messages = Vec::new();
 
-    for item in codex_items(&lines) {
+    for item in items {
         match item {
             CodexItem::Message { role, text } => {
                 let role = match role {
                     CodexRole::User => SearchRole::User,
                     CodexRole::Assistant => SearchRole::Assistant,
                 };
-                push_search_message(&mut messages, role, truncate_indexed_message_text(&text));
+                push_search_message(&mut messages, role, truncate_indexed_message_text(text));
             }
             CodexItem::ToolCall { name } => {
-                push_search_message(&mut messages, SearchRole::Tool, name);
+                push_search_message(&mut messages, SearchRole::Tool, name.clone());
             }
             CodexItem::ToolOutput { output } => {
                 push_search_message(
                     &mut messages,
                     SearchRole::ToolOutput,
-                    truncate_indexed_message_text(&output),
+                    truncate_indexed_message_text(output),
                 );
             }
         }
     }
 
-    Ok(messages)
+    messages
 }
 
 fn push_search_message(messages: &mut Vec<SearchMessage>, role: SearchRole, text: String) {
@@ -487,13 +507,6 @@ struct SearchMeta {
     rowid: i64,
     session_id: String,
     fingerprint: SearchFileFingerprint,
-}
-
-struct SearchMessageMeta {
-    rowid: i64,
-    path: String,
-    message_index: usize,
-    role: SearchRole,
 }
 
 struct IndexedSession {
@@ -580,25 +593,10 @@ fn build_sqlite_search_index(
         .into_iter()
         .filter_map(|(path, meta)| path_to_index.get(&path).map(|idx| (meta.rowid, *idx)))
         .collect();
-    let message_rowid_to_ref = read_sqlite_message_meta(&conn)?
-        .into_iter()
-        .filter_map(|meta| {
-            let conversation_index = *path_to_index.get(&meta.path)?;
-            Some((
-                meta.rowid,
-                IndexedMessageRef {
-                    conversation_index,
-                    message_index: meta.message_index,
-                    role: meta.role,
-                },
-            ))
-        })
-        .collect();
 
     Ok(FullSearchIndex::Sqlite(SqliteSearchIndex {
         db_path: db_path.to_path_buf(),
         rowid_to_index,
-        message_rowid_to_ref,
     }))
 }
 
@@ -650,12 +648,13 @@ fn sync_sqlite_search_index(
                 return None;
             }
 
+            let (body, messages) = indexed_body_and_messages(conv, modified);
             Some(IndexChange::Upsert(IndexedSession {
                 path,
                 session_id: conv.session_id.clone(),
                 fingerprint,
-                body: full_search_index_body_with_modified(conv, modified),
-                messages: search_messages_for_conversation(conv)
+                body,
+                messages: messages
                     .into_iter()
                     .filter(|message| SearchScope::All.matches(message.role))
                     .map(|message| IndexedMessage {
@@ -746,27 +745,6 @@ fn read_sqlite_meta(conn: &Connection) -> rusqlite::Result<HashMap<String, Searc
     for row in rows {
         let (path, entry) = row?;
         meta.insert(path, entry);
-    }
-    Ok(meta)
-}
-
-fn read_sqlite_message_meta(conn: &Connection) -> rusqlite::Result<Vec<SearchMessageMeta>> {
-    let mut stmt = conn.prepare(
-        "SELECT rowid, path, message_index, role FROM message_meta ORDER BY path, message_index",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        let role: String = row.get(3)?;
-        Ok(SearchMessageMeta {
-            rowid: row.get(0)?,
-            path: row.get(1)?,
-            message_index: row.get::<_, i64>(2)?.try_into().unwrap_or(0),
-            role: SearchRole::from_str(&role).unwrap_or(SearchRole::Tool),
-        })
-    })?;
-
-    let mut meta = Vec::new();
-    for row in rows {
-        meta.push(row?);
     }
     Ok(meta)
 }
@@ -1029,9 +1007,19 @@ fn search_sqlite_messages(
     };
 
     let conn = Connection::open_with_flags(&index.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // Resolve hits to conversations through the joined meta row instead of a
+    // preloaded rowid map: the index can hold ~1M message rows and loading
+    // them up front dominated search startup.
+    let path_to_index: HashMap<String, usize> = conversations
+        .iter()
+        .enumerate()
+        .map(|(idx, conv)| (conv.path.to_string_lossy().to_string(), idx))
+        .collect();
+
     let mut stmt = conn.prepare(&format!(
         "
-        SELECT message_fts.rowid, {rank_expr} AS rank,
+        SELECT message_meta.path, message_meta.message_index, message_meta.role,
+            {rank_expr} AS rank,
             snippet(message_fts, 0, '[', ']', '...', 16) AS snippet
         FROM message_fts
         JOIN message_meta ON message_meta.rowid = message_fts.rowid
@@ -1040,23 +1028,26 @@ fn search_sqlite_messages(
         "
     ))?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args.drain(..)), |row| {
+        let role: String = row.get(2)?;
         Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, f64>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            role,
+            row.get::<_, f64>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
 
     let mut hits = Vec::new();
     for row in rows {
-        let (rowid, score, snippet) = row?;
-        let Some(hit_ref) = index.message_rowid_to_ref.get(&rowid) else {
+        let (path, message_index, role, score, snippet) = row?;
+        let Some(&conversation_index) = path_to_index.get(&path) else {
             continue;
         };
         hits.push(MessageSearchHit {
-            conversation_index: hit_ref.conversation_index,
-            message_index: hit_ref.message_index,
-            role: hit_ref.role,
+            conversation_index,
+            message_index: message_index.try_into().unwrap_or(0),
+            role: SearchRole::from_str(&role).unwrap_or(SearchRole::Tool),
             snippet: clean_snippet(&snippet),
             score,
         });

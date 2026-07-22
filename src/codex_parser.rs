@@ -67,6 +67,15 @@ pub fn process_codex_file(
     path: PathBuf,
     modified: Option<SystemTime>,
 ) -> Result<Option<Conversation>> {
+    Ok(process_codex_file_with_items(path, modified)?.map(|(conversation, _)| conversation))
+}
+
+/// Like [`process_codex_file`], but also returns the parsed transcript items
+/// so callers that need both (e.g. search indexing) parse the file only once.
+pub(crate) fn process_codex_file_with_items(
+    path: PathBuf,
+    modified: Option<SystemTime>,
+) -> Result<Option<(Conversation, Vec<CodexItem>)>> {
     let file = File::open(&path)?;
     let reader = BufReader::new(file);
 
@@ -99,7 +108,7 @@ pub fn process_codex_file(
 
         match codex_line.line_type.as_str() {
             "session_meta" => {
-                if let Ok(meta) = serde_json::from_value::<SessionMeta>(codex_line.payload) {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(codex_line.payload.get()) {
                     session_id = Some(meta.id);
                     session_timestamp = Some(codex_line.timestamp);
                     if let Some(c) = meta.cwd {
@@ -111,14 +120,14 @@ pub fn process_codex_file(
                 }
             }
             "turn_context" if model.is_none() => {
-                if let Ok(tc) = serde_json::from_value::<TurnContext>(codex_line.payload) {
+                if let Ok(tc) = serde_json::from_str::<TurnContext>(codex_line.payload.get()) {
                     if tc.model.is_some() {
                         model = tc.model;
                     }
                 }
             }
             "event_msg" => {
-                if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
+                if let Ok(evt) = serde_json::from_str::<EventMsg>(codex_line.payload.get()) {
                     if evt.event_type.as_str() == "token_count" {
                         if let Some(info) = evt.info {
                             if let Some(usage) = info.total_token_usage {
@@ -132,7 +141,8 @@ pub fn process_codex_file(
         }
     }
 
-    for item in codex_items(&lines) {
+    let items = codex_items(&lines);
+    for item in &items {
         match item {
             CodexItem::Message { role, text } => {
                 message_count += 1;
@@ -145,7 +155,7 @@ pub fn process_codex_file(
                     }
                     CodexRole::Assistant => {
                         if preview.is_empty() {
-                            if let Some(content) = subagent_dispatch_content(&text) {
+                            if let Some(content) = subagent_dispatch_content(text) {
                                 preview = content.chars().take(200).collect();
                             }
                         }
@@ -153,7 +163,7 @@ pub fn process_codex_file(
                     }
                 };
                 append_text(&mut full_text, label);
-                append_text(&mut full_text, &text);
+                append_text(&mut full_text, text);
                 append_text(&mut full_text, "\n\n");
             }
             CodexItem::ToolCall { name } => {
@@ -210,7 +220,7 @@ pub fn process_codex_file(
         .as_ref()
         .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(String::from));
 
-    Ok(Some(Conversation {
+    let conversation = Conversation {
         path,
         source: SessionSource::Codex,
         session_id,
@@ -234,7 +244,9 @@ pub fn process_codex_file(
         hierarchy_depth: 0,
         hierarchy_order: 0,
         hierarchy_sort_timestamp: timestamp,
-    }))
+    };
+
+    Ok(Some((conversation, items)))
 }
 
 #[cfg(test)]

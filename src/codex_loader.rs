@@ -145,7 +145,7 @@ fn collect_file_index(
 
         match codex_line.line_type.as_str() {
             "session_meta" => {
-                if let Ok(meta) = serde_json::from_value::<SessionMeta>(codex_line.payload) {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(codex_line.payload.get()) {
                     if session_id.is_none() {
                         session_id = Some(meta.id);
                     }
@@ -196,7 +196,7 @@ fn collect_file_index(
                 }
             }
             "event_msg" => {
-                if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
+                if let Ok(evt) = serde_json::from_str::<EventMsg>(codex_line.payload.get()) {
                     record_latest_activity_timestamp(
                         &mut latest_activity_timestamp,
                         &codex_line.timestamp,
@@ -229,7 +229,7 @@ fn collect_file_index(
                 }
             }
             "turn_context" => {
-                if let Ok(tc) = serde_json::from_value::<TurnContext>(codex_line.payload) {
+                if let Ok(tc) = serde_json::from_str::<TurnContext>(codex_line.payload.get()) {
                     if cwd.is_none() {
                         cwd = tc.cwd.clone();
                     }
@@ -242,7 +242,7 @@ fn collect_file_index(
                 }
             }
             "response_item" => {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(codex_line.payload) {
+                if let Ok(item) = serde_json::from_str::<ResponseItem>(codex_line.payload.get()) {
                     if let Some((is_user, text)) = response_item_message_text(&item) {
                         record_latest_activity_timestamp(
                             &mut latest_activity_timestamp,

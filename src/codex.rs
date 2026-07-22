@@ -1,12 +1,16 @@
 use serde::Deserialize;
 
-/// Top-level line in a Codex JSONL file
+/// Top-level line in a Codex JSONL file.
+///
+/// The payload stays a `RawValue`: rollout lines carrying multi-megabyte tool
+/// outputs are only structurally scanned unless a consumer actually
+/// deserializes the payload for that line type.
 #[derive(Debug, Deserialize)]
 pub struct CodexLine {
     pub timestamp: String,
     #[serde(rename = "type")]
     pub line_type: String,
-    pub payload: serde_json::Value,
+    pub payload: Box<serde_json::value::RawValue>,
 }
 
 #[derive(Debug, Deserialize)]

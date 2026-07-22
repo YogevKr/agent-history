@@ -35,14 +35,14 @@ pub fn codex_items(lines: &[String]) -> Vec<CodexItem> {
 
         match codex_line.line_type.as_str() {
             "event_msg" => {
-                if let Ok(evt) = serde_json::from_value::<EventMsg>(codex_line.payload) {
+                if let Ok(evt) = serde_json::from_str::<EventMsg>(codex_line.payload.get()) {
                     if let Some((role, text)) = event_message(&evt) {
                         items.push(CodexItem::Message { role, text });
                     }
                 }
             }
             "response_item" => {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(codex_line.payload) {
+                if let Ok(item) = serde_json::from_str::<ResponseItem>(codex_line.payload.get()) {
                     match item.item_type.as_str() {
                         "message" => {
                             if let Some((role, text)) = response_message(&item) {
@@ -92,7 +92,7 @@ fn event_message_counts(lines: &[String]) -> HashMap<(CodexRole, String), usize>
             continue;
         }
 
-        let evt: EventMsg = match serde_json::from_value(codex_line.payload) {
+        let evt: EventMsg = match serde_json::from_str(codex_line.payload.get()) {
             Ok(evt) => evt,
             Err(_) => continue,
         };
