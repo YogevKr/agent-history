@@ -4,6 +4,14 @@ Unified search and viewer for [Claude Code](https://docs.anthropic.com/en/docs/c
 
 Browse, search, and review your AI coding sessions from one place — with syntax-highlighted code blocks, a ledger-style conversation layout, and an interactive TUI picker.
 
+## Install with Homebrew
+
+```sh
+brew install YogevKr/tap/agent-history
+```
+
+For other install methods, see [Install](#install).
+
 ## Features
 
 - **Unified search** across Claude Code and Codex CLI sessions
