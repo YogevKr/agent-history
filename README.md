@@ -58,6 +58,11 @@ agent-history --resume <session-id-or-prefix>
 agent-history --local
 ```
 
+Sessions saved with the `teamcodex` provider resume through `tcx run`.
+These sessions require TeamCodex and Codex CLI 0.157.0 or newer.
+The launcher uses `--no-daemon` so the resumed process receives the proxy settings and token from TeamCodex.
+Other Codex sessions continue to use `codex resume`.
+
 ### TUI Keys
 
 | Key | Action |
